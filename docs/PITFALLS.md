@@ -101,3 +101,18 @@ prefix.
 Read `decode_tps` / `prefill_tps` / `acceptance_pct` / `cache=` from the HTTP
 request-completion log lines. Wall-clock division by assumption (e.g. flat
 prefill rate) produced numbers off by 5–10× for us at depth.
+
+## 11. Bare-metal ranks need the rocBLAS kernel dir (vision requests crash lazily)
+
+If you run the TP2 ranks bare (not in the fork's container image) with a
+hand-assembled `LD_LIBRARY_PATH` lib dir, a missing `rocblas/library/`
+(Kernels.so per arch) kills the rank **only when the first vision request
+arrives** — rocBLAS initializes lazily on the vision tower's GEMM, hours after
+text-only traffic looked healthy, and a dead rank takes down its peer too.
+Symptom: `rocBLAS error: Cannot read .../rocblas/library/TensileLibrary.dat`.
+
+Fix (Ubuntu + AMD ROCm apt repo): `apt-get download rocblas7.2.4` (runtime
+matches gufo's ROCm 7.2 family; internal soname `librocblas.so.5`), then
+`dpkg-deb -x` and copy `opt/rocm-7.2.4/lib/rocblas/` + `librocblas.so.5*`
+into your lib dir on **both** hosts. Verify with a request that carries an
+image — text-only benchmarks will never catch it.
