@@ -1,0 +1,16 @@
+[Unit]
+Description=Integration thunderbolt core (v7.2-rc1 + local.nix series)
+DefaultDependencies=no
+After=systemd-modules-load.service
+Before=tbv-roce.service
+Wants=tbv-roce.service
+ConditionPathExists=/var/lib/tbv/ws/thunderbolt-ws.ko
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/bash -c 'if insmod /var/lib/tbv/ws/thunderbolt-ws.ko; then echo "ws-core loaded"; else echo "ws-core FAILED - falling back to stock (RDMA degraded)"; modprobe -i thunderbolt; fi; true'
+ExecStop=/bin/true
+
+[Install]
+WantedBy=multi-user.target

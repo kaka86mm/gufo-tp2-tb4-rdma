@@ -1,0 +1,13 @@
+[Unit]
+Description=USB4 RDMA write-striping stack (stock core + neuhaus ibverbs + tbv0)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/bash /var/lib/tbv/ws-roce-boot.sh
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
