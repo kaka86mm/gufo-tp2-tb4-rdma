@@ -10,6 +10,7 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen38_flash_next/distributed/tp_partition.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
@@ -81,6 +82,16 @@ struct DeviceLayer {
   /// qkv and gate rows stacked ([hidden -> conv channels + value dim]) when
   /// both are Q8_0; then ssm_qkv/ssm_gate are empty.
   DeviceTensor ssm_in;
+  /// NPU buffer ids of the six 1024-row slices of the z half of ssm_in (rows
+  /// 10240..16383) in block-float tile layout; empty when the NPU is off.
+  std::vector<int> npu_z;
+  /// NPU buffer ids of the 1024-row slices of the attention gate rows (four
+  /// heads each) of attn_qkv; empty when unused.
+  std::vector<int> npu_gate;
+  /// NPU buffer ids of the shared expert gate and up weights (640 rows each,
+  /// in 1024-row slices with the unused rows left unwritten); empty when
+  /// unused.
+  std::vector<int> npu_shexp;
   /// alpha and beta rows stacked: [hidden -> 2 * v_heads] F16.
   DeviceTensor ssm_alpha_beta;
   DeviceTensor attn_q, attn_k, attn_v, attn_out, attn_q_norm, attn_k_norm,
@@ -145,6 +156,8 @@ public:
                                    std::string* error_msg);
   const DeviceMixer& hc_head() const noexcept { return hc_head_; }
   const std::vector<DeviceLayer>& layers() const noexcept { return layers_; }
+  /// The NPU GEMM engine, or null when the NPU is not in use.
+  NpuGemm* npu() const noexcept { return npu_.get(); }
   [[nodiscard]] bool has_mtp() const noexcept { return has_mtp_; }
   const DeviceLayer& mtp() const noexcept { return mtp_; }
   /// The heads of every trunk layer on this rank; the session state of the
@@ -181,6 +194,7 @@ private:
   MixerHeads trunk_heads_;
   bool trunk_split_{false};
   std::vector<void*> allocations_;
+  std::unique_ptr<NpuGemm> npu_;
   std::size_t bytes_{0};
   std::uint32_t tp_rank_{0};
   std::uint32_t tp_world_size_{1};
