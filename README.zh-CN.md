@@ -60,6 +60,16 @@ docs/     BENCHMARKS.md        完整数据表（含失败的配置）
 - MTP `--draft-tokens` 上限 7（Flash-Next 边车硬限制）
 - 磁盘缓存：`--cache-disk-staging-bytes` 必须 ≥ 最大快照（262K 会话约 4G），否则深上下文追问会静默重新 prefill；`--cache-disk-bytes` 对齐 GPU KV 余量
 
+
+## TP2 + NPU merge branch
+
+[`npu-tp2-merge`](https://github.com/kaka86mm/gufo-tp2-tb4-rdma/tree/npu-tp2-merge)
+carries the next step: the NPU offload PR (dense prefill projections to the
+XDNA2 NPU) cherry-picked onto the TP2 RDMA branch — one binary, two modes.
+The NPU path is gated off under TP2 (`tp_world_size > 1`) until the NPU column
+budgets become rank-aware and the deferred-epilogue ordering is audited against
+the exchanges; single-host NPU mode is verified at 91.8 t/s decode.
+
 ## 致谢与许可
 
 - 传输层：[hellas-ai/thunderbolt-ibverbs](https://github.com/hellas-ai/thunderbolt-ibverbs)（含 write-striping 分支）— GPL-2.0

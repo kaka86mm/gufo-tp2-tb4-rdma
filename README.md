@@ -61,6 +61,16 @@ docs/     BENCHMARKS.md        full data tables incl. losing configurations
 - MTP `--draft-tokens` is capped at 7 by the Flash-Next sidecar
 - Disk cache: set `--cache-disk-staging-bytes` ≥ your largest snapshot (~4 GB for a 262K session) or deep-context follow-ups silently re-prefill; match `--cache-disk-bytes` to your GPU KV headroom
 
+
+## TP2 + NPU merge branch
+
+[`npu-tp2-merge`](https://github.com/kaka86mm/gufo-tp2-tb4-rdma/tree/npu-tp2-merge)
+carries the next step: the NPU offload PR (dense prefill projections to the
+XDNA2 NPU) cherry-picked onto the TP2 RDMA branch — one binary, two modes.
+The NPU path is gated off under TP2 (`tp_world_size > 1`) until the NPU column
+budgets become rank-aware and the deferred-epilogue ordering is audited against
+the exchanges; single-host NPU mode is verified at 91.8 t/s decode.
+
 ## Credits & licenses
 
 - Transport: [hellas-ai/thunderbolt-ibverbs](https://github.com/hellas-ai/thunderbolt-ibverbs) (and the `feat/write-striping` branch it grew) — GPL-2.0
