@@ -4,6 +4,15 @@
 #   headers untouched), CONFIG gates force-enabled in the tree Makefile.
 # westeri v7.2-rc1 + local.nix series (skip-if-upstream) -> core+net+ibverbs.
 # Output: /var/lib/tbv/ws/ . Run ON EACH HOST (kernels differ).
+#
+# Inputs expected on each host:
+#   $HOME/westeri-tb        kernel tree at tag v7.2-rc1 — no clone needed:
+#                           fetch drivers/thunderbolt, drivers/net/thunderbolt
+#                           and include/linux from any GitHub kernel mirror at
+#                           the tag (a few dozen files, ~6 MB)
+#   $HOME/ws-tbv-src        thunderbolt-ibverbs source; its kernel-workflow/
+#                           patches hold the local.nix series, and its kernel/
+#                           is the ibverbs module rebuilt against the new core
 set -euo pipefail
 WESTERI=${WESTERI:-$HOME/westeri-tb}
 PATCHDIR=${PATCHDIR:-$HOME/ws-tbv-src/kernel-workflow/patches}
