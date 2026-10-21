@@ -72,3 +72,30 @@ gufo fork for the design).
 - Disk cache 64G + staging 6G per host: 258K follow-up after restart = **5.3 s**
   (vs 240 s cold re-prefill); restore requires exact prefix continuation —
   feed back the model's actual generated text.
+
+## NPU hybrid addendum (2026-10-22)
+
+A newer gufo NPU build (gufo-npu:20261020 image, XRT 2.25) offloads 48 layers'
+shared experts, 12 layers' attention query/gate and 36 layers' z-projection to
+the Strix Halo XDNA2 NPU (3.26 GiB staged) and runs the rest on the GPU — one
+host, no RDMA. Same model/MTP/context as the tables above:
+
+| Workload | TP2 (2 hosts) | NPU hybrid (1 host) |
+|---|---:|---:|
+| decode 1 user, repetitive | 66–70 | **92–102** |
+| decode 1 user, prose | ~24.5 | **36** |
+| decode at 37K depth | 70.1 | **96.3** |
+| decode at 75K | 67.0 | **94.5** |
+| decode at 151K | 56.7–64 | **92.1** |
+| decode at 258K | 53.0 | **90.0** |
+| prefill 16–26K fresh | ~1610 | 1571–1701 |
+| prefill at 258K | 1159 | **1461** |
+| aggregate 4 users | — | 109.6 (sessions=4, ctx 64K) |
+| APU Tctl under load | 91–94°C (throttling) | **67–70°C** |
+
+Requirements learned the hard way: IOMMU must be enabled (SVA); the firmware
+file must be `npu_7.sbin` (an older `npu.sbin` firmware caused an amdxdna
+mailbox EINVAL that later panicked the host); per-session state is ~4G KV +
+7.5G scratch, so sessions x context is capacity-bound on a single host
+(262144x1 fits, 65536x4 fits); the disk-cache dir must be owned by the server
+user with 0700; after an OOM kill, leaked GTT memory only clears on reboot.
