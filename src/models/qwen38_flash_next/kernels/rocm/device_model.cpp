@@ -1071,6 +1071,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       std::uint32_t shexp_layers = 0;
       for (auto& l : m->layers_) {
         if ((shexp_env != nullptr && shexp_env[0] == '0') ||
+            m->tp_world_size_ > 1 ||
             l.shexp_gate.data == nullptr || l.shexp_up.data == nullptr ||
             l.shexp_gate.type != core::GgmlType::kQ8_0 ||
             l.shexp_up.type != core::GgmlType::kQ8_0 ||
