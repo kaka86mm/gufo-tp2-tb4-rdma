@@ -6,11 +6,28 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <span>
 
 #include "src/models/qwen38_flash_next/mtp_costs.hpp"
 
 namespace gufo::models::qwen38_flash_next {
+
+// GUFO_MTP_WIDTH pins the draft width for both controllers (greedy batch and
+// per-request), overriding the measured-cost search: an operator knob for
+// topologies whose cycle costs the 2026-09 single-host table prices wrong
+// (TP2's verification is far flatter). 0 or unset keeps the adaptive choice.
+inline std::uint32_t ForcedMtpWidth(std::uint32_t cap) noexcept {
+  const char* raw = std::getenv("GUFO_MTP_WIDTH");
+  if (raw == nullptr || raw[0] == '\0') {
+    return 0;
+  }
+  const long value = std::strtol(raw, nullptr, 10);
+  if (value < 0 || value > cap) {
+    return cap;
+  }
+  return static_cast<std::uint32_t>(value);
+}
 
 inline constexpr std::uint32_t kMaxMtpDraftTokens = 7;
 
@@ -43,6 +60,9 @@ public:
       std::uint32_t budget, std::uint32_t context = 0,
       std::uint32_t concurrency = 0) const noexcept {
     const auto cap = std::min(budget, limit_);
+    if (const std::uint32_t forced = ForcedMtpWidth(cap); forced != 0) {
+      return forced;
+    }
     if (cap == 0 || state_.retry_tokens != 0) {
       return 0;
     }
@@ -188,6 +208,9 @@ public:
       cap = std::min(cap, row.budget);
     if (cap == 0)
       return 0;
+    if (const std::uint32_t forced = ForcedMtpWidth(cap); forced != 0) {
+      return forced;
+    }
     // Periodic headless cycles measure the actual AR alternative, including
     // predictor catch-up. The next cycle can then resume speculation.
     const bool stable = last_concurrency_ == rows.size() &&
