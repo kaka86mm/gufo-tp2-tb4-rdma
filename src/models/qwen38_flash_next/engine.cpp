@@ -1321,11 +1321,13 @@ bool Session::DecodeStep(std::size_t max_tokens,
   valid_ = false;
   const DecodeRequest request{this,        max_tokens, &sampler,     result,
                               stop_at_eos, nullptr,    forced_drafts};
+  const auto t0 = std::chrono::steady_clock::now();
   PendingDecode pending;
   if (!PrepareDecode(request, &pending, error_msg, false, std::nullopt,
                      occupancy)) {
     return false;
   }
+  const auto t1 = std::chrono::steady_clock::now();
   if (pending.chain.empty()) {
     valid_ = true;
     return true;
@@ -1342,7 +1344,29 @@ bool Session::DecodeStep(std::size_t max_tokens,
           error_msg)) {
     return false;
   }
+  const auto t2 = std::chrono::steady_clock::now();
   const bool ok = FinishDecode(request, pending, error_msg);
+  // GUFO_ROUND_US=1: per-round phase split every 128 rounds. prepare builds
+  // the draft chain (catch-up + head + draft forwards), forward verifies,
+  // finish holds logits selection, acceptance and sampling.
+  static thread_local bool round_timed =
+      std::getenv("GUFO_ROUND_US") != nullptr;
+  static thread_local std::uint64_t round_count = 0;
+  if (round_timed) {
+    static thread_local double p_us = 0, f_us = 0, n_us = 0;
+    ++round_count;
+    p_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
+    f_us += std::chrono::duration<double, std::micro>(t2 - t1).count();
+    n_us += std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - t2)
+                .count();
+    if (round_count % 128 == 0) {
+      std::fprintf(stderr, "round_us n=%llu prepare=%.0f forward=%.0f finish=%.0f\n",
+                   static_cast<unsigned long long>(round_count),
+                   p_us / 128.0, f_us / 128.0, n_us / 128.0);
+      p_us = f_us = n_us = 0;
+    }
+  }
   valid_ = ok;
   return ok;
 }
