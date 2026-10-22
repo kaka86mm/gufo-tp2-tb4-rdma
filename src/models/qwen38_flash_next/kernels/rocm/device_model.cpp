@@ -994,19 +994,25 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
         if (layers_on >= layer_limit) {
           break;
         }
+        // Full model or a TP rank's share of heads: stage as many trailing
+        // slices as the rank's rows hold (the executor derives the split the
+        // same way from the staged slice count).
         if (l.ssm_in.data == nullptr ||
             l.ssm_in.type != core::GgmlType::kQ8_0 ||
-            l.ssm_in.rows != kZRow0 + kSlices * npu->n() ||
-            l.ssm_in.cols != npu->k()) {
+            l.ssm_in.cols != npu->k() ||
+            l.ssm_in.rows < kSlices * npu->n() ||
+            l.ssm_in.rows % npu->n() != 0) {
           continue;
         }
+        const std::uint32_t z_row0 =
+            l.ssm_in.rows - kSlices * npu->n();
         std::vector<int> ids;
         for (std::uint32_t i = 0; i < kSlices; ++i) {
           const int id = npu->NewBuffer(npu->BBytes(), &npu_error);
           if (id < 0) {
             break;
           }
-          NpuEncodeWeights(l.ssm_in.data, l.ssm_in.cols, kZRow0 + i * npu->n(),
+          NpuEncodeWeights(l.ssm_in.data, l.ssm_in.cols, z_row0 + i * npu->n(),
                            npu->n(), npu->k(), 0, npu->k(), npu->Device(id),
                            nullptr);
           ids.push_back(id);
@@ -1032,14 +1038,23 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       }
       std::uint32_t gate_layers = 0;
       for (auto& l : m->layers_) {
-        if (gate_slices == 0 || l.attn_qkv.empty() ||
+        // Full model (13312 rows) or a TP rank's share: at most as many
+        // slices as the rank's rows hold.
+        const std::uint32_t rank_gate_slices =
+            l.attn_qkv.data == nullptr
+                ? 0U
+                : std::min(gate_slices,
+                           static_cast<std::uint32_t>(l.attn_qkv.rows) /
+                               npu->n());
+        if (rank_gate_slices == 0 || l.attn_qkv.empty() ||
             l.attn_qkv.data == nullptr ||
             l.attn_qkv.type != core::GgmlType::kQ8_0 ||
-            l.attn_qkv.rows != 13312 || l.attn_qkv.cols != npu->k()) {
+            l.attn_qkv.rows % npu->n() != 0 ||
+            l.attn_qkv.cols != npu->k()) {
           continue;
         }
         std::vector<int> ids;
-        for (std::uint32_t i = 0; i < gate_slices; ++i) {
+        for (std::uint32_t i = 0; i < rank_gate_slices; ++i) {
           const int id = npu->NewBuffer(npu->BBytes(), &npu_error);
           if (id < 0) {
             break;
@@ -1056,7 +1071,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
         for (int id : ids) {
           npu->FinalizeWeights(id);
         }
-        if (ids.size() == gate_slices) {
+        if (!ids.empty() && ids.size() == rank_gate_slices) {
           l.npu_gate = std::move(ids);
           ++gate_layers;
         }
