@@ -1588,6 +1588,7 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
   }
   if (!DraftCatchUpBatch(catchup, error_msg, propose))
     return false;
+  const auto draft_t0 = std::chrono::steady_clock::now();
   // Each round shares predictor projections across ready sessions.
   // Attention state, proposal distributions and RNG streams stay private.
   for (;;) {
@@ -1628,6 +1629,7 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
     if (!bodies.empty() && !exec.MtpForwardBatch(bodies, error_msg))
       return false;
   }
+  const auto draft_t1 = std::chrono::steady_clock::now();
   // In an all-greedy cohort, full copies can widen verification far beyond
   // the neural planner's chosen shape and delay peers producing new text.
   // Keep full width when every active row copies. In a mixed cohort, bound
@@ -1658,8 +1660,10 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
                        pending[i].speculative});
     }
   }
+  const auto verify_t0 = std::chrono::steady_clock::now();
   if (!items.empty() && !exec.ForwardBatch(items, error_msg))
     return false;
+  const auto verify_t1 = std::chrono::steady_clock::now();
   std::uint32_t offset = 0;
   for (std::size_t i = 0; i < requests.size(); ++i) {
     const auto& p = pending[i];
@@ -1701,10 +1705,36 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
   if (!used_lookup && batch_drafts && items.size() == requests.size() &&
       std::ranges::all_of(requests,
                           [](const auto& r) { return r.outcome->completed; })) {
-    const auto ms = std::chrono::duration<float, std::milli>(
-                        std::chrono::steady_clock::now() - cycle_start)
+    const auto finish_t1 = std::chrono::steady_clock::now();
+    const auto ms = std::chrono::duration<float, std::milli>(finish_t1 - cycle_start)
                         .count();
     policy.Observe(requests.size(), batch_context, *batch_drafts, ms);
+    // GUFO_ROUND_US=1: per-phase engine cycle breakdown every 128 cycles.
+    // draft = MTP heads + draft forwards, verify = the target forward,
+    // finish = logits select + accept + sampling; total adds prepare and
+    // the cache work around the phases.
+    static thread_local bool round_timed =
+        std::getenv("GUFO_ROUND_US") != nullptr;
+    static thread_local std::uint64_t round_count = 0;
+    if (round_timed) {
+      static thread_local double d_us = 0, v_us = 0, f_us = 0, t_us = 0;
+      ++round_count;
+      d_us += std::chrono::duration<double, std::micro>(draft_t1 - draft_t0)
+                  .count();
+      v_us += std::chrono::duration<double, std::micro>(verify_t1 - verify_t0)
+                  .count();
+      f_us += std::chrono::duration<double, std::micro>(finish_t1 - verify_t1)
+                  .count();
+      t_us += ms * 1000.0;
+      if (round_count % 128 == 0) {
+        std::fprintf(stderr,
+                     "round_us n=%llu draft=%.0f verify=%.0f finish=%.0f "
+                     "total=%.0f\n",
+                     static_cast<unsigned long long>(round_count), d_us / 128.0,
+                     v_us / 128.0, f_us / 128.0, t_us / 128.0);
+        d_us = v_us = f_us = t_us = 0;
+      }
+    }
   }
   return true;
 }
