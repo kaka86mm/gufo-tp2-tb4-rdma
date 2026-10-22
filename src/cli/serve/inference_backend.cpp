@@ -815,13 +815,44 @@ public:
       std::size_t max_tokens, sampling::SamplerState& sampler) {
     TextDecodeStep result;
     sampling::SamplerState working_sampler = sampler;
+    // GUFO_ROUND_US=1 prints per-phase decode round timings every 128 rounds:
+    // verify is the engine cycle the cost probe measures; the rest is the
+    // serving-side overhead outside the probe's reach.
+    static thread_local bool round_timed =
+        std::getenv("GUFO_ROUND_US") != nullptr;
+    static thread_local std::uint64_t round_count = 0;
+    static thread_local double sum_prepare_us = 0, sum_verify_us = 0,
+                               sum_finish_us = 0;
+    const auto t0 = std::chrono::steady_clock::now();
     if (PrepareSpeculativeDecode(max_tokens, working_sampler, result)) {
+      const auto t1 = std::chrono::steady_clock::now();
       const auto request = VerificationRequest(
           max_tokens - result.selections.size(), working_sampler);
       auto verification = verifier_->VerifyStep(
           sequence_, request.position, request.current_token, request.eos_id,
           request.max_emitted_tokens, working_sampler);
+      const auto t2 = std::chrono::steady_clock::now();
       FinishSpeculativeDecode(std::move(verification), working_sampler, result);
+      const auto t3 = std::chrono::steady_clock::now();
+      if (round_timed) {
+        ++round_count;
+        sum_prepare_us +=
+            std::chrono::duration<double, std::micro>(t1 - t0).count();
+        sum_verify_us +=
+            std::chrono::duration<double, std::micro>(t2 - t1).count();
+        sum_finish_us +=
+            std::chrono::duration<double, std::micro>(t3 - t2).count();
+        if (round_count % 128 == 0) {
+          std::fprintf(stderr,
+                       "round_us n=%llu prepare=%.0f verify=%.0f finish=%.0f\n",
+                       static_cast<unsigned long long>(round_count),
+                       sum_prepare_us / 128.0, sum_verify_us / 128.0,
+                       sum_finish_us / 128.0);
+          sum_prepare_us = sum_verify_us = sum_finish_us = 0;
+        }
+      }
+    } else if (round_timed) {
+      ++round_count;
     }
     sampler.SetRngState(working_sampler.rng_state());
     return result;
