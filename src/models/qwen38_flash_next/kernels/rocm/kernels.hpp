@@ -295,6 +295,9 @@ void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
                    std::uint32_t n_tokens, std::uint32_t k,
                    std::uint32_t n_experts, hipStream_t stream);
 
+/// Re-encodes `blocks` Q8_0 blocks as Q5_1 (24 bytes each) for the decode GEMV.
+bool RequantQ8_0ToQ5_1(const void* src, void* dst, std::size_t blocks,
+                       hipStream_t stream);
 /// Routed expert GEMM on the F16 WMMA cores over F16 activation rows
 /// `x` ([rows][k]): the weights are dequantized to F16 after the LDS read
 /// and the whole K extent accumulates in F32. `tiles` (n_tiles entries)
@@ -355,6 +358,9 @@ void PleConv(const float* in, const float* w, float* history,
 void PleInject(float* res, const float* gated, const float* conv,
                std::size_t count, hipStream_t stream);
 
+/// Re-encodes `blocks` Q8_0 blocks as Q4_1 (20 bytes each) for the decode GEMV.
+bool RequantQ8_0ToQ4_1(const void* src, void* dst, std::size_t blocks,
+                       hipStream_t stream);
 /// Copies rolling history at a prefix without advancing the live history.
 void HistoryPrefix(const float* in, std::uint32_t stride, const float* history,
                    float* destination, std::uint32_t tokens,

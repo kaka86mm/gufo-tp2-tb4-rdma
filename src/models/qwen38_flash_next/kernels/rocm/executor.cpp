@@ -1694,6 +1694,34 @@ bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
 
 bool Executor::Dense(const DeviceTensor& w, const Q8Input& q, float* out,
                      std::string* error_msg) const {
+  if (w.decode_data != nullptr && w.decode_type == GgmlType::kQ4_1 &&
+      q.data != nullptr && q.n <= kVecBatch) {
+    if (w.cols != q.k) {
+      AssignError(error_msg, "quantized input width mismatch");
+      return false;
+    }
+    if (qfn_mmq_q4_1_dense_vec_preq(
+            w.decode_data, q.data, out, static_cast<int>(w.rows),
+            static_cast<int>(q.n), static_cast<int>(w.cols), stream_) != 0) {
+      AssignError(error_msg, "Q4_1 decode GEMV failed");
+      return false;
+    }
+    return true;
+  }
+  if (w.decode_data != nullptr && q.x != nullptr && q.n <= kVecBatch) {
+    if (w.cols != q.k) {
+      AssignError(error_msg, "quantized input width mismatch");
+      return false;
+    }
+    if (qfn_mmq_dense_vec(static_cast<int>(w.decode_type), w.decode_data, q.x,
+                          out, static_cast<int>(w.rows),
+                          static_cast<int>(w.cols), static_cast<int>(q.n),
+                          stream_) != 0) {
+      AssignError(error_msg, "decode GEMV failed");
+      return false;
+    }
+    return true;
+  }
   if (w.type == GgmlType::kQ8_0 && q.data != nullptr) {
     if (w.cols != q.k) {
       AssignError(error_msg, "quantized input width mismatch");
@@ -1714,6 +1742,26 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
                           const float* x, float* out, std::uint32_t n_tokens,
                           const DeviceTensor* down,
                           std::string* error_msg) const {
+  if (!MatrixRows(n_tokens) && n_tokens <= kVecBatch &&
+      up.decode_data != nullptr && gate.decode_data != nullptr &&
+      up.decode_type == GgmlType::kQ4_1 &&
+      gate.decode_type == GgmlType::kQ4_1 && up.rows == gate.rows &&
+      up.cols == gate.cols) {
+    Q8Input xq;
+    if (!Quantize(x, n_tokens, up.cols, &xq, error_msg)) {
+      return false;
+    }
+    if (xq.data != nullptr) {
+      if (qfn_mmq_q4_1_gated_vec_preq(
+              up.decode_data, gate.decode_data, xq.data, out,
+              static_cast<int>(up.rows), static_cast<int>(n_tokens),
+              static_cast<int>(up.cols), stream_) != 0) {
+        AssignError(error_msg, "gated Q4_1 GEMV failed");
+        return false;
+      }
+      return true;
+    }
+  }
   // Decode and verification use the same fused projections and activation.
   // A different SwiGLU rounding can change later activation quantization.
   if (!MatrixRows(n_tokens) && up.type == GgmlType::kQ8_0 &&

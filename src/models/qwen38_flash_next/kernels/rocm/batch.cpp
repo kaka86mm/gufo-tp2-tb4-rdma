@@ -686,6 +686,15 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
                           std::uint32_t rows, std::string* error) const {
   if (rows <= kDecodeRows)
     return Dense(w, x, out, rows, error);
+  if (w.decode_data != nullptr) {
+    for (std::uint32_t r = 0; r < rows; r += kDecodeRows) {
+      const auto count = std::min(kDecodeRows, rows - r);
+      if (!Dense(w, x + std::size_t{r} * w.cols, out + std::size_t{r} * w.rows,
+                 count, error))
+        return false;
+    }
+    return true;
+  }
   if (w.type != core::GgmlType::kQ8_0) {
     SmallGemm(w.data, EmbeddingType(w.type), x, out, rows, w.rows, w.cols,
               stream_);
