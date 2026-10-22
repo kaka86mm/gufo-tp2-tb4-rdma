@@ -1578,11 +1578,34 @@ public:
         indices.push_back(index);
       }
     }
+    const auto engine_t0 = std::chrono::steady_clock::now();
     auto verified = speculative::SpeculativeVerifier::VerifyBatch(requests);
+    static thread_local bool batch_timed =
+        std::getenv("GUFO_ROUND_US") != nullptr;
+    static thread_local std::uint64_t batch_count = 0;
+    static thread_local double sum_engine_us = 0, sum_batch_us = 0;
+    const auto engine_t1 = std::chrono::steady_clock::now();
+    const auto batch_t0 = engine_t1;
     for (std::size_t item = 0; item < indices.size(); ++item) {
       const std::size_t index = indices[item];
       states[index]->FinishSpeculativeDecode(std::move(verified[item]),
                                              samplers[index], steps[index]);
+    }
+    if (batch_timed) {
+      const auto batch_t1 = std::chrono::steady_clock::now();
+      ++batch_count;
+      sum_engine_us +=
+          std::chrono::duration<double, std::micro>(engine_t1 - engine_t0)
+              .count();
+      sum_batch_us +=
+          std::chrono::duration<double, std::micro>(batch_t1 - batch_t0)
+              .count();
+      if (batch_count % 128 == 0) {
+        std::fprintf(stderr, "round_us batch n=%llu engine=%.0f finish=%.0f\n",
+                     static_cast<unsigned long long>(batch_count),
+                     sum_engine_us / 128.0, sum_batch_us / 128.0);
+        sum_engine_us = sum_batch_us = 0;
+      }
     }
     for (std::size_t index = 0; index < decodes.size(); ++index)
       decodes[index].sampler.get().SetRngState(samplers[index].rng_state());
