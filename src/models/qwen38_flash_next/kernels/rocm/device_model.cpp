@@ -849,11 +849,15 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   // Wake the NPU before any heavy GPU work starts: resuming it re-initializes
   // the SMU and PSP, which the GPU shares. A heartbeat then keeps it awake.
   std::unique_ptr<NpuGemm> early_npu;
-  // Under TP2 the NPU stages are not rank-aware yet: keep the NPU off.
+  // v2: NPU runs under TP2 too. The staged column slices are taken from the
+  // already-halved weights, so z-projection and attention q/gate stages are
+  // rank-local by construction; the shared-expert NPU stage (whose epilogue
+  // is deferred past the exchange) stays single-host — see the executor.
   if (m->tp_world_size_ > 1) {
-    std::fprintf(stderr, "NPU off: disabled under TP2 (rank %u of %u)\n",
+    std::fprintf(stderr, "NPU on under TP2 (rank %u of %u; shared expert stage off)\n",
                  m->tp_rank_, m->tp_world_size_);
-  } else if (const char* dir = std::getenv("GUFO_NPU_DIR");
+  }
+  if (const char* dir = std::getenv("GUFO_NPU_DIR");
       dir != nullptr && dir[0] != '\0') {
     NpuGemm::Config cfg;
     cfg.xclbin = std::string(dir) + "/final_4096x2560x1024_128x64x128.xclbin";

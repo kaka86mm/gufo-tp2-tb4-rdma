@@ -2707,6 +2707,9 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
               static_cast<int>(l.npu_gate.size()));
         }
         skip_gate_heads = static_cast<std::uint32_t>(l.npu_gate.size()) * 2;
+        // TP2 halves the head count after staging sized the skip: never let
+        // the NPU's share exceed what this rank actually owns.
+        skip_gate_heads = std::min(skip_gate_heads, heads.attn);
       }
       prepared = AttentionF16Gemm(
           l.attn_qkv.data, static_cast<const __half*>(s_.x_half),
@@ -3045,6 +3048,7 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   NpuGemm* npu = model_->npu();
   std::uint32_t npu_shexp_groups = 0;
   if (npu != nullptr && npu->Healthy() && !npu_a_.empty() &&
+      model_->tp_world_size() == 1 &&
       l.npu_shexp.size() == 2 && !last_only && n_tokens >= 1024 &&
       n_tokens <= options_.max_batch && n_tokens % npu->tokens() == 0 &&
       n_tokens / npu->tokens() <= npu_a_.size() &&
