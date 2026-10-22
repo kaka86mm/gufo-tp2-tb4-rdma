@@ -228,6 +228,7 @@ typedef float (*vec_dot_q_hip_t)(const void * __restrict__ vbq, const block_q8_1
 
 static constexpr __device__ vec_dot_q_hip_t get_vec_dot_q_hip(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_Q4_1:    return vec_dot_q4_1_q8_1;
         case GGML_TYPE_Q5_1:    return vec_dot_q5_1_q8_1;
         case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
         case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
@@ -238,6 +239,7 @@ static constexpr __device__ vec_dot_q_hip_t get_vec_dot_q_hip(ggml_type type) {
 
 static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_Q4_1:    return VDR_Q4_1_Q8_1_MMVQ;
         case GGML_TYPE_Q5_1:    return VDR_Q5_1_Q8_1_MMVQ;
         case GGML_TYPE_Q8_0:    return VDR_Q8_0_Q8_1_MMVQ;
         case GGML_TYPE_Q4_K:    return VDR_Q4_K_Q8_1_MMVQ;
@@ -763,6 +765,179 @@ void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
       break;
     default:
       GGML_ABORT("invalid vector batch width");
+  }
+}
+
+// Dense vector projection over any quant type: one row per block across
+// `row_waves` warps, Q8_1 activations. The lane split, per-type vec_dot,
+// warp reduction and non-finite guard match mul_mat_vec_q_moe, so the result
+// equals one expert-0 slot per token.
+template<ggml_type type, int ncols_dst, int row_waves>
+__launch_bounds__(32 * row_waves, 1) static __global__
+    void mul_mat_vec_q_dense(const void* __restrict__ weights,
+                             const block_q8_1* __restrict__ input,
+                             float* __restrict__ output, const uint32_t ncols_x,
+                             const uint32_t nrows_x,
+                             const uint32_t stride_col_y) {
+  constexpr int qk = ggml_hip_type_traits<type>::qk;
+  constexpr int qi = ggml_hip_type_traits<type>::qi;
+  constexpr int vdr = get_vdr_mmvq(type);
+  constexpr int warp_size = 32;
+  constexpr vec_dot_q_hip_t vec_dot_q_hip = get_vec_dot_q_hip(type);
+  constexpr int blocks_per_iter = vdr * warp_size / qi;
+
+  const int lane = static_cast<int>(threadIdx.x) % warp_size;
+  const uint32_t row =
+      blockIdx.x * row_waves + static_cast<uint32_t>(threadIdx.x) / warp_size;
+  if (row >= nrows_x) {
+    return;
+  }
+  const int blocks_per_row_x = ncols_x / qk;
+  const uint32_t row_offset = row * blocks_per_row_x;
+  const int kqs = vdr * (lane % (qi / vdr));
+
+  float tmp[ncols_dst] = {};
+  for (int kbx = lane / (qi / vdr); kbx < blocks_per_row_x;
+       kbx += blocks_per_iter) {
+    const int kby = kbx * (qk / QK8_1);
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+      tmp[j] += vec_dot_q_hip(weights, &input[j * stride_col_y + kby],
+                              row_offset + kbx, kqs);
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < ncols_dst; ++j) {
+    const float value = warp_reduce_sum<warp_size>(tmp[j]);
+    if (lane == 0) {
+      output[j * nrows_x + row] = isfinite(value) ? value : 0.0f;
+    }
+  }
+}
+
+template<ggml_type type, int ncols_dst>
+static void launch_dense(const void* weights, const block_q8_1* input,
+                         float* output, int k, int rows, int input_stride,
+                         hipStream_t stream) {
+  constexpr int row_waves = 8;
+  mul_mat_vec_q_dense<type, ncols_dst, row_waves>
+      <<<(rows + row_waves - 1) / row_waves, 32 * row_waves, 0, stream>>>(
+          weights, input, output, k, rows, input_stride);
+}
+
+template<ggml_type type>
+static void dispatch_dense(const void* weights, const block_q8_1* input,
+                           float* output, int k, int rows, int tokens,
+                           int input_stride, hipStream_t stream) {
+  switch (tokens) {
+#define DENSE_LAUNCH(N)                                                       \
+  case N:                                                                     \
+    launch_dense<type, N>(weights, input, output, k, rows, input_stride,      \
+                          stream);                                            \
+    break;
+    DENSE_LAUNCH(1)
+    DENSE_LAUNCH(2)
+    DENSE_LAUNCH(3)
+    DENSE_LAUNCH(4)
+    DENSE_LAUNCH(5)
+    DENSE_LAUNCH(6)
+    DENSE_LAUNCH(7)
+    DENSE_LAUNCH(8)
+#undef DENSE_LAUNCH
+    default:
+      GGML_ABORT("invalid dense vector batch width");
+  }
+}
+
+// Shared-expert gate/up pair from Q4_1 weights: one 32-lane block per row,
+// silu(gate) * up, as mul_mat_vec_q8<ncols_dst, true> does for Q8_0.
+template<int ncols_dst>
+__launch_bounds__(32, 1) static __global__
+    void mul_mat_vec_q4_1_gated(const void* __restrict__ weights,
+                                const void* __restrict__ gate,
+                                const block_q8_1* __restrict__ input,
+                                float* __restrict__ output,
+                                const uint32_t ncols_x, const uint32_t nrows_x,
+                                const uint32_t stride_col_y) {
+  constexpr int qi = QI4_1;
+  constexpr int vdr = VDR_Q4_1_Q8_1_MMVQ;
+  constexpr int blocks_per_iter = vdr * 32 / qi;
+  const int lane = threadIdx.x;
+  const int row = blockIdx.x;
+  const int blocks_per_row = ncols_x / QK4_1;
+  const int row_offset = row * blocks_per_row;
+  const int kqs = vdr * (lane % (qi / vdr));
+  float sum[ncols_dst] = {};
+  float gate_sum[ncols_dst] = {};
+  for (int kbx = lane / (qi / vdr); kbx < blocks_per_row;
+       kbx += blocks_per_iter) {
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+      sum[j] += vec_dot_q4_1_q8_1(weights, &input[j * stride_col_y + kbx],
+                                  row_offset + kbx, kqs);
+      gate_sum[j] += vec_dot_q4_1_q8_1(gate, &input[j * stride_col_y + kbx],
+                                       row_offset + kbx, kqs);
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < ncols_dst; ++j) {
+    sum[j] = warp_reduce_sum<32>(sum[j]);
+    gate_sum[j] = warp_reduce_sum<32>(gate_sum[j]);
+    if (lane == 0) {
+      output[j * nrows_x + row] = sum[j] * ggml_hip_op_silu_single(gate_sum[j]);
+    }
+  }
+}
+
+void mul_mat_vec_q4_1_gated_dispatch(const void* weights, const void* gate,
+                                     const block_q8_1* input, float* output,
+                                     int k, int rows, int tokens,
+                                     int input_stride, hipStream_t stream) {
+  GGML_ASSERT(k % QK4_1 == 0 && rows > 0);
+  switch (tokens) {
+#define Q4_1_GATED_LAUNCH(N)                                  \
+  case N:                                                     \
+    mul_mat_vec_q4_1_gated<N><<<rows, 32, 0, stream>>>(       \
+        weights, gate, input, output, k, rows, input_stride); \
+    break;
+    Q4_1_GATED_LAUNCH(1)
+    Q4_1_GATED_LAUNCH(2)
+    Q4_1_GATED_LAUNCH(3)
+    Q4_1_GATED_LAUNCH(4)
+    Q4_1_GATED_LAUNCH(5)
+    Q4_1_GATED_LAUNCH(6)
+    Q4_1_GATED_LAUNCH(7)
+    Q4_1_GATED_LAUNCH(8)
+#undef Q4_1_GATED_LAUNCH
+    default:
+      GGML_ABORT("unsupported gated Q4_1 token count");
+  }
+}
+
+void mul_mat_vec_dense_dispatch(const void* weights, ggml_type type,
+                                const block_q8_1* input, float* output, int k,
+                                int rows, int tokens, int input_stride,
+                                hipStream_t stream) {
+  GGML_ASSERT(k % ggml_blck_size(type) == 0 && rows > 0);
+  switch (type) {
+    case GGML_TYPE_Q4_1:
+      dispatch_dense<GGML_TYPE_Q4_1>(weights, input, output, k, rows, tokens,
+                                     input_stride, stream);
+      break;
+    case GGML_TYPE_Q5_1:
+      dispatch_dense<GGML_TYPE_Q5_1>(weights, input, output, k, rows, tokens,
+                                     input_stride, stream);
+      break;
+    case GGML_TYPE_Q4_K:
+      dispatch_dense<GGML_TYPE_Q4_K>(weights, input, output, k, rows, tokens,
+                                     input_stride, stream);
+      break;
+    case GGML_TYPE_Q5_K:
+      dispatch_dense<GGML_TYPE_Q5_K>(weights, input, output, k, rows, tokens,
+                                     input_stride, stream);
+      break;
+    default:
+      GGML_ABORT("unsupported dense vector weight format");
   }
 }
 

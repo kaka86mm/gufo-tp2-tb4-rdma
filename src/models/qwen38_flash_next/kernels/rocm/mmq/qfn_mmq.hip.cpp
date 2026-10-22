@@ -797,6 +797,53 @@ extern "C" int qfn_mmq_q4_1_dense_vec_preq(const void* W, const void* X_q8,
   return hipGetLastError() == hipSuccess ? 0 : -3;
 }
 
+// Dense Q4_1/Q5_1 (and Q4_K/Q5_K) projection of 1-8 float token rows: the
+// rows are quantized to Q8_1 first, then the per-type vector kernel runs.
+extern "C" int qfn_mmq_dense_vec(int weight_type, const void* W,
+                                 const float* X_f32, float* out_f32, int M,
+                                 int K, int n_tokens, hipStream_t stream) {
+  constexpr const char* tag = "qfn_mmq_dense_vec";
+  const auto type = static_cast<ggml_type>(weight_type);
+  if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K &&
+      type != GGML_TYPE_Q5_1 && type != GGML_TYPE_Q4_1) {
+    fprintf(stderr, "%s: unsupported weight type %d\n", tag, weight_type);
+    return -1;
+  }
+  if (!W || !X_f32 || !out_f32) {
+    fprintf(stderr, "%s: null pointer\n", tag);
+    return -1;
+  }
+  if (M <= 0 || K <= 0 || n_tokens <= 0 || n_tokens > MMVQ_MAX_BATCH_SIZE ||
+      K % ggml_blck_size(type) != 0) {
+    fprintf(stderr, "%s: bad shape M=%d K=%d ntok=%d\n", tag, M, K, n_tokens);
+    return -1;
+  }
+  const int dev = ggml_hip_get_device();
+  ggml_backend_hip_context* ctx = get_ctx_for_device(dev);
+  if (!ctx) {
+    fprintf(stderr, "%s: failed to get HIP context for device %d\n", tag, dev);
+    return -1;
+  }
+  const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+  ggml_hip_pool_alloc<char> src1_q8_1_pool;
+  src1_q8_1_pool.alloc(ctx->pool(), (size_t)n_tokens * ne10_padded *
+                                        sizeof(block_q8_1) / QK8_1);
+  char* src1_q8_1_ptr = src1_q8_1_pool.get();
+  quantize_row_q8_1_hip(X_f32, nullptr, (void*)src1_q8_1_ptr, type, K,
+                        (int64_t)K, (int64_t)K, (int64_t)K * n_tokens,
+                        ne10_padded, 1, n_tokens, 1, stream);
+  mul_mat_vec_dense_dispatch(W, type,
+                             reinterpret_cast<const block_q8_1*>(src1_q8_1_ptr),
+                             out_f32, K, M, n_tokens,
+                             static_cast<int>(ne10_padded / QK8_1), stream);
+  const hipError_t err = hipGetLastError();
+  if (err != hipSuccess) {
+    fprintf(stderr, "%s: launch failed: %s\n", tag, hipGetErrorString(err));
+    return -3;
+  }
+  return 0;
+}
+
 extern "C" int qfn_mmq_q8_0_dense_vec_preq(const void* W, const void* W_gate,
                                            const void* X_q8, float* out_f32,
                                            int M, int N, int K,

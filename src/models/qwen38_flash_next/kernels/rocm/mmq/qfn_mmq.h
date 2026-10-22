@@ -73,6 +73,12 @@ int qfn_mmq_q4_1_gated_vec_preq(const void* W_up, const void* W_gate,
 int qfn_mmq_q4_1_dense_vec_preq(const void* W, const void* X_q8, float* out_f32,
                                 int M, int N, int K, hipStream_t stream);
 
+// Q4_1/Q5_1 (or Q4_K/Q5_K) projection of 1-8 float token rows: quantizes to
+// Q8_1 in place, then the per-type vector kernel. out is [n_tokens][M].
+int qfn_mmq_dense_vec(int weight_type, const void* W, const float* X_f32,
+                      float* out_f32, int M, int K, int n_tokens,
+                      hipStream_t stream);
+
 int qfn_mmq_build_ids_maps(
         const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst, int32_t * expert_bounds,
         int n_experts, int n_tokens, int n_expert_used, int nchannels_y, int si1, int sis1, hipStream_t stream);
