@@ -1,36 +1,10 @@
 # Qwen3.8 Flash-Next benchmarks
 
-AMD Strix Halo `gfx1151`, 128 GB unified memory. Unsloth `UD-Q4_K_XL` target and
-shared-Q8_0 MTP sidecar; Gufo uses adaptive MTP. HTTP, greedy, thinking off.
-All Gufo tables measured October 18, 2026, with `fec4759d` and the
-validated host-memory and cache-stall fixes.
-Reference results remain unchanged from September 22–23.
-llama.cpp uses `b11069` for AR and `6fcaa16f` for MTP.
-
-Positive gain favors Gufo.
+AMD Strix Halo `gfx1151`, 128 GB unified memory. Unsloth `UD-Q4_K_XL` target
+with shared-Q8_0 MTP; adaptive drafting. HTTP, greedy, thinking off.
+Gufo `fec4759d` (October 18, 2026); llama.cpp `b11069` AR and `6fcaa16f` MTP
+(September 22–23). Positive gain favors Gufo.
 [Quality and measurement details](QUALITY.md#benchmark-method) · [Model identities](artifacts/model-identities.json)
-
-- [Single Strix Halo](#single-strix-halo): Gufo against llama.cpp.
-- [Two Strix Halos over RDMA](#two-strix-halos-over-rdma): Gufo RDMA against
-  Gufo on one host, deeper contexts, and the full Q8 model.
-
-## Single Strix Halo
-
-### Single user, autoregressive
-Gufo numerical regression checks pass; individual functional timing limits
-remain documented in [QUALITY.md](QUALITY.md). Historical llama.cpp MTP values are retained as requested:
-a separate check of that pin did not match its own AR output, so this review
-does not requalify those comparisons. [Review evidence](artifacts/decode-kernels-review.json).
-
-At 128K, Gufo reaches 1557.18 tok/s AR prefill and 1481.19 tok/s MTP prefill.
-All 24 single-user rows match the previous qualified capture in completion
-hashes and prompt/cache counts.
-All 63 concurrent tg128 completions match the corresponding C1 AR control.
-Repetitive MTP through 64K reports mean ± sample standard deviation across
-the sweep and one focused repeat. Initial PP dips at 16K/32K/64K did not
-repeat against current main; both observations remain included.
-Prior mixed MTP C2 repeats show two draft-controller trajectories (about 54
-and 60 tok/s, identical text), so its gain is not entirely attributable to lookup.
 
 ## Single user, autoregressive
 
@@ -52,7 +26,7 @@ Context capacities differ between engines; see the measurement details.
 
 ![Single user, autoregressive](artifacts/charts/single-ar.svg)
 
-### Single user, MTP
+## Single user, MTP
 
 pp is the highest measured rate per engine and depth across mixed/repetitive
 text, including Gufo predictor catch-up.
@@ -72,7 +46,7 @@ text, including Gufo predictor catch-up.
 
 ![Single user, MTP](artifacts/charts/single-mtp.svg)
 
-### Multiple users, autoregressive
+## Multiple users, autoregressive
 
 Same pp2048 prose prompt as single-user d0, tg128, context 4096 per user.
 All sessions prefilled before timed decoding; throughput sums individual rates.
@@ -90,7 +64,7 @@ llama.cpp re-evaluates its four-token checkpoint tail.
 
 ![Multiple users, autoregressive](artifacts/charts/multi-ar.svg)
 
-### Multiple users, MTP
+## Multiple users, MTP
 
 Same pp2048 mixed/repetitive prompts as single-user d0, tg128, context 4096
 per user. All sessions prefilled before timed decoding; rates sum individual
@@ -108,7 +82,7 @@ request decode rates. C1 cross-checks the single-user table.
 
 ![Multiple users, MTP](artifacts/charts/multi-mtp.svg)
 
-### Loading time
+## Loading time
 
 C1, context capacity 262144, MTP. Cold target/sidecar files to HTTP readiness.
 
@@ -120,7 +94,7 @@ C1, context capacity 262144, MTP. Cold target/sidecar files to HTTP readiness.
 
 ![Loading time](artifacts/charts/loading.svg)
 
-### Memory occupation
+## Memory occupation
 
 C1, context capacity 133121, AR. Peak memory reported by HIP.
 
@@ -132,118 +106,3 @@ C1, context capacity 133121, AR. Peak memory reported by HIP.
 <!-- /bench -->
 
 ![Memory occupation](artifacts/charts/memory.svg)
-
-## Two Strix Halos over RDMA
-
-Gufo RDMA runs one model on two such hosts: every layer is split between them,
-and they exchange partial sums over RDMA ([how it works](TP2.md)).
-The workloads are those of the one-host tables; "Gufo" is the same build on
-one host, and gain is Gufo RDMA over it. With twice the memory, single users
-also reach depths one host cannot (context capacity 262144). Every RDMA table
-was measured on October 9, 2026 (`c85349b5`) over USB4 RoCE v2, with the
-same-build one-host runs beside them, in the balanced power mode (85 W
-sustained), so prefill is lower than in the one-host tables above; decode is
-not power-bound. Over USB4 a fresh 2K prompt prefills more slowly than on one
-host; with a cached prefix, prefill gains 3–15%.
-
-### Single user, autoregressive
-
-<!-- bench:single-ar-tp2 -->
-| Flash-Next Q4 AR<br>Depth (tokens) | Gufo pp (tok/s) | Gufo RDMA pp (tok/s) | Gain | Gufo tg (tok/s) | Gufo RDMA tg (tok/s) | Gain |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1492.22 | 1299.73 | -12.9% | 26.71 | 32.91 | +23.2% |
-| 4,096 | 1342.09 | 1412.63 | +5.3% | 26.69 | 32.81 | +22.9% |
-| 32,768 | 1270.29 | 1456.89 | +14.7% | 26.08 | 32.53 | +24.7% |
-| 65,536 | 1255.97 | 1431.71 | +14.0% | 26.23 | 32.23 | +22.9% |
-| 131,072 | 1216.31 | 1317.83 | +8.3% | 25.71 | 31.31 | +21.8% |
-| 258,048 | — | 1221.33 | — | — | 30.10 | — |
-<!-- /bench -->
-
-![Single user, autoregressive, one host and RDMA](artifacts/charts/single-ar-tp2.svg)
-
-### Single user, MTP
-
-<!-- bench:single-mtp-tp2 -->
-| Flash-Next Q4 MTP<br>Depth (tokens) | Gufo pp (tok/s) | Gufo RDMA pp (tok/s) | Gain pp | Gufo tg mixed (tok/s) | Gufo RDMA tg mixed (tok/s) | Gain mixed | Gufo tg repetitive (tok/s) | Gufo RDMA tg repetitive (tok/s) | Gain repetitive |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1420.72 | 1346.32 | -5.2% | 32.03 | 37.88 | +18.3% | 60.11 | 79.33 | +32.0% |
-| 4,096 | 1301.51 | 1333.77 | +2.5% | 33.25 | 47.46 | +42.7% | 56.03 | 60.82 | +8.5% |
-| 32,768 | 1231.99 | 1389.59 | +12.8% | 33.11 | 38.62 | +16.6% | 40.61 | 65.63 | +61.6% |
-| 65,536 | 1216.20 | 1314.17 | +8.1% | 33.78 | 47.55 | +40.8% | 43.33 | 57.69 | +33.1% |
-| 131,072 | 1208.61 | 1275.75 | +5.6% | 34.21 | 41.46 | +21.2% | 39.90 | 55.62 | +39.4% |
-| 258,048 | — | 1169.31 | — | — | 38.02 | — | — | 57.38 | — |
-<!-- /bench -->
-
-![Single user, MTP, one host and RDMA](artifacts/charts/single-mtp-tp2.svg)
-
-### Multiple users, autoregressive
-
-Same pp2048 prose prompt, tg128, context 4096 per user; every session
-prefills before timed decoding. Rates sum individual decode rates.
-
-<!-- bench:multi-ar-tp2 -->
-| Flash-Next Q4 AR<br>Users | Gufo AR (tok/s) | Gufo RDMA AR (tok/s) | Gain |
-| ---: | ---: | ---: | ---: |
-| 1 | 25.09 | 32.89 | +31.1% |
-| 2 | 46.95 | 56.77 | +20.9% |
-| 4 | 77.27 | 92.79 | +20.1% |
-| 6 | 96.79 | 115.69 | +19.5% |
-| 8 | 109.03 | 137.86 | +26.4% |
-<!-- /bench -->
-
-![Multiple users, autoregressive, one host and RDMA](artifacts/charts/multi-ar-tp2.svg)
-
-### Multiple users, MTP
-
-Same configuration and preparation as the AR table, with mixed/repetitive
-prompts. Every prepared completion, on both topologies and in all modes, matches
-its fresh one-user AR control.
-
-<!-- bench:multi-mtp-tp2 -->
-| Flash-Next Q4 MTP<br>Users | Gufo mixed (tok/s) | Gufo RDMA mixed (tok/s) | Gain | Gufo repetitive (tok/s) | Gufo RDMA repetitive (tok/s) | Gain |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 32.04 | 37.75 | +17.8% | 60.16 | 74.16 | +23.3% |
-| 2 | 53.57 | 66.98 | +25.0% | 84.28 | 113.63 | +34.8% |
-| 4 | 77.13 | 92.34 | +19.7% | 124.27 | 160.23 | +28.9% |
-| 6 | 96.19 | 108.78 | +13.1% | 134.85 | 176.43 | +30.8% |
-| 8 | 106.50 | 127.06 | +19.3% | 149.87 | 191.36 | +27.7% |
-<!-- /bench -->
-
-![Multiple users, MTP, one host and RDMA](artifacts/charts/multi-mtp-tp2.svg)
-
-### Full Q8 model
-
-The full Q8_0 target does not fit one host. Single user, pp2048/tg128 by depth
-as above; prefill on the left axis, generation on the right.
-
-<!-- bench:tp2-q8 -->
-| Flash-Next Q8 RDMA<br>Depth (tokens) | pp (tok/s) | tg AR (tok/s) | tg MTP mixed (tok/s) | tg MTP repetitive (tok/s) |
-| ---: | ---: | ---: | ---: | ---: |
-| 0 | 1193.06 | 29.80 | 41.15 | 65.99 |
-| 4,096 | 1169.94 | 29.52 | 37.83 | 55.31 |
-| 32,768 | 1176.27 | 29.64 | 42.44 | 60.15 |
-| 65,536 | 1140.63 | 28.91 | 44.19 | 52.40 |
-| 131,072 | 1120.59 | 28.50 | 36.88 | 56.22 |
-| 258,048 | 1041.67 | 27.60 | 39.34 | 50.64 |
-<!-- /bench -->
-
-![Flash-Next Q8 RDMA](artifacts/charts/tp2-q8.svg)
-
-Multiple users with the configuration and preparation of the Q4 tables:
-
-<!-- bench:tp2-q8-multi -->
-| Flash-Next Q8 RDMA<br>Users | AR (tok/s) | MTP mixed (tok/s) | MTP repetitive (tok/s) |
-| ---: | ---: | ---: | ---: |
-| 1 | 29.97 | 41.33 | 65.99 |
-| 2 | 52.82 | 66.48 | 80.25 |
-| 4 | 87.52 | 105.45 | 115.17 |
-| 6 | 110.17 | 92.40 | 124.27 |
-| 8 | 131.79 | 117.69 | 146.72 |
-<!-- /bench -->
-
-![Flash-Next Q8 RDMA, multiple users](artifacts/charts/tp2-q8-multi.svg)
-
-Q8 MTP rates vary more between server starts than between cohorts of one
-start: a second start with three cohorts per point gave mixed 90.06 (C4) and
-105.40 (C6), repetitive 115.74 (C4) and 118.65 (C6) tok/s, each cohort within
-3% of its point's rate.

@@ -5,8 +5,7 @@ Supported target: `unsloth/Qwen3.8-Flash-Next-GGUF`, **UD-Q4_K_XL** (four shards
 Optional shared-Q8 MTP predictor; optional BF16 vision projector.
 Original unquantized-model and GGUF-conversion parity remain unqualified.
 
-[Benchmarks](BENCHMARKS.md) · [Quality](QUALITY.md) · [Experiments](EXPERIMENTS.md) ·
-[TP2](TP2.md)
+[Benchmarks](BENCHMARKS.md) · [Quality](QUALITY.md) · [Experiments](EXPERIMENTS.md) · [ROCm 10.1 status](ROCM.md)
 
 ## Load and run
 
@@ -23,7 +22,6 @@ MTP=/path/to/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf
   --mtp-model "$MTP" --sessions 2 --context 32768
 ```
 
-To run across two hosts over InfiniBand, RoCE v2 or USB4, see [TP2](TP2.md).
 The loader discovers the remaining shards. Omit the speculative options for AR;
 AR sessions allocate no predictor state even if a shared model has MTP loaded.
 Adaptive MTP is default, with `--draft-tokens` capping 1–7 proposals. Eligible
@@ -34,9 +32,11 @@ fall outside this vocabulary.
 
 Single-session sampling, including the default thinking-on and thinking-off
 presets, can use this smaller head with the existing acceptance/length
-controller and AR backoff. Greedy requests without penalties or constraints
-can use it in C1 and jointly planned batches. Greedy penalties/constraints and
-unplanned C>1 requests retain the full head.
+controller and AR backoff. Greedy requests, including penalties and
+constraints, can use it in C1, when decoding alone and in jointly planned
+batches; drafts ignore both, and verification applies them over the full
+vocabulary. Greedy requests in unplanned multi-request batches retain the full
+head.
 
 The existing length controller and AR backoff apply to every request. The
 target always verifies with its full vocabulary, including
@@ -85,28 +85,27 @@ Timings report
 
 The official template defaults to thinking on, `xhigh` effort and preserving
 prior reasoning. Use the [reasoning controls](../../SERVER.md#reasoning-controls)
-for explicit effort/thinking overrides. Native context is 262144; YaRN extension
-is unsupported. Memory grows with used context and selected rollback depth;
-admission reserves the configured capacity before creating sessions.
-
-## Full Q8
-
-The loader also reads the `Q8_0` checkpoint (six shards, about 188 GB), whose
-per-layer token embedding table is `Q8_0` rather than IQ4_NL or BF16; the
-table stays host-side and is decoded row by row as before. The checkpoint does
-not fit one 128 GB host, so it needs two-host tensor parallelism (TP2).
-SHA-256 of the files it was qualified with:
-
-| Artifact | SHA-256 |
-|---|---|
-| `Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf` | `2dabcbb53ca537a7947bc7d20414fd464eeaf4d66d43021b5b2556cc87544ad2` |
-| `Qwen3.8-Flash-Next-Q8_0-00002-of-00006.gguf` | `494ca4ed3dbf97bc28da88af3890b8877b9032f909812d00c0526a9ca5e91d2e` |
-| `Qwen3.8-Flash-Next-Q8_0-00003-of-00006.gguf` | `34efd79a80a1ce540a517a5d56171924b66ce1c38b04c904f17ad6d8ef17cf20` |
-| `Qwen3.8-Flash-Next-Q8_0-00004-of-00006.gguf` | `bfa634025fabbd2658bf7694bc80b90e571699c768723f844c934c7ef06c691a` |
-| `Qwen3.8-Flash-Next-Q8_0-00005-of-00006.gguf` | `232a8f14cc0fa4262e7efe8593774b136fe40909e39c7a020342ddaa27259a97` |
-| `Qwen3.8-Flash-Next-Q8_0-00006-of-00006.gguf` | `538a93bca918064983409a41187ad4c68640f9aced6f29564da8f551bf86d7a5` |
-
-See [Quality](QUALITY.md#full-q8) for how it compares with Q4 and llama.cpp.
+for explicit effort/thinking overrides. Native context is 262144. A larger
+context needs static YaRN and `--enable-yarn`: `gufo serve llm` refuses to
+start with `--context` above 262144 without it, and `gufo bench` refuses a
+workload whose depth plus prompt or generation tokens exceeds 262144. With
+the flag, the factor is context / 262144 (`--context 409600` gives 1.5625).
+The flag is an error at or below 262144, where it would have no effect.
+Static YaRN applies to every request on that server, including short ones,
+and changes the output distribution more as the factor grows; in the first
+measurements, multiple-choice accuracy moved within noise at factors 1.5625
+to 3.875. See the
+[measurements](https://github.com/gufo-org/gufo/pull/350#issuecomment-6323981940),
+the
+[opt-in proposal](https://github.com/gufo-org/gufo/pull/350#issuecomment-6323982386)
+and the
+[accuracy check](https://github.com/gufo-org/gufo/pull/350#issuecomment-6234093998).
+No GGUF key enables YaRN.
+Prefill chunks whose visible context exceeds 262144 tokens use the per-token
+attention kernel rather than the fused WMMA kernel. Memory grows with used
+context and selected rollback depth (about 27.5 KiB per context token with
+MTP, measured on gfx1151); admission reserves the configured capacity before
+creating sessions.
 
 ## Images
 
@@ -126,5 +125,3 @@ Build a microbenchmark with
 `dense_blaslt_sweep.hip` times hipBLASLt on the dense prefill shapes.
 No historical logit dump is required. New retained result summaries belong in
 `artifacts/`; generated traces stay in the ignored top-level `artifacts/` tree.
-
-The optional XDNA2 NPU prefill offload is described in [NPU.md](NPU.md).
