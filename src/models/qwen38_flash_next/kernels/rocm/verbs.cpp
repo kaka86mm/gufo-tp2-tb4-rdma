@@ -564,6 +564,11 @@ public:
       return false;
     }
     wait_ticks_ = static_cast<std::uint64_t>(clock_khz) * 1000 * kWaitSeconds;
+    // GUFO_TP2_GRAPHS pins the exchange protocol for graph replay: one
+    // fixed window, flag value 1, and consumer resets (see Work and the
+    // reset after the add). Both ranks must agree; the environment is set
+    // on both by the launcher.
+    graph_mode_ = std::getenv("GUFO_TP2_GRAPHS") != nullptr;
 
     // Device windows when the RDMA device can register DMA-BUF memory, on both
     // ranks; otherwise mapped host windows. The choice needs no option: a
@@ -750,6 +755,9 @@ public:
   [[nodiscard]] int device_index() const noexcept override {
     return static_cast<int>(config_.device_index);
   }
+  [[nodiscard]] bool replay_safe() const noexcept override {
+    return graph_mode_;
+  }
   [[nodiscard]] std::size_t MaxPartialBytes() const noexcept override {
     return kWindowBytes - data_offset_;
   }
@@ -921,7 +929,8 @@ public:
       return false;
     }
     const std::uint64_t operation_id = next_operation_;
-    const std::size_t window = (operation_id % kWindows) * kWindowBytes;
+    const std::size_t window =
+        graph_mode_ ? 0 : (operation_id % kWindows) * kWindowBytes;
     auto* flags = static_cast<std::uint8_t*>(flags_device_);
     *partial = {
         .send = reinterpret_cast<float*>(
@@ -931,8 +940,9 @@ public:
         .ready = reinterpret_cast<std::uint64_t*>(flags + kReadyOffset),
         .arrived =
             reinterpret_cast<const std::uint64_t*>(flags + kArrivedOffset),
-        // Flags start at zero, so exchange k publishes k + 1.
-        .value = operation_id + 1,
+        // Flags start at zero, so exchange k publishes k + 1; graph
+        // replay pins the value at 1 with consumer resets instead.
+        .value = graph_mode_ ? 1 : (operation_id + 1),
         .arrivals = static_cast<std::uint32_t*>(arrivals_),
         .timed_out = reinterpret_cast<std::uint32_t*>(flags + kTimedOutOffset),
         .wait_ticks = wait_ticks_,
@@ -1216,7 +1226,8 @@ private:
   [[nodiscard]] const float* Transfer(std::uint64_t scope_id,
                                       std::uint64_t operation_id,
                                       std::size_t bytes, std::string* error) {
-    const std::size_t window = (operation_id % kWindows) * kWindowBytes;
+    const std::size_t window =
+        graph_mode_ ? 0 : (operation_id % kWindows) * kWindowBytes;
     if (gpu_windows_) {
       return TransferWindow(scope_id, operation_id, bytes, error);
     }
@@ -1379,7 +1390,14 @@ private:
       if (!poisoned.empty()) {
         finished.error = std::move(poisoned);
       } else if (job.queued) {
-        if (WaitReady(job.operation_id + 1, &finished.error)) {
+        if (WaitReady(graph_mode_ ? 1 : (job.operation_id + 1),
+                      &finished.error)) {
+          if (graph_mode_) {
+            // Re-arm for the next replay: the GPU stage of the next round
+            // only runs after this round's add, so the store cannot race it.
+            Flag<std::uint64_t>(kReadyOffset)
+                .store(0, std::memory_order_release);
+          }
           finished.peer = Transfer(job.scope_id, job.operation_id, job.bytes,
                                    &finished.error);
         }
@@ -1415,7 +1433,7 @@ private:
         // caller learns of the failure from CheckQueued.
         Flag<std::uint64_t>(kArrivedOffset)
             .store(failed ? std::numeric_limits<std::uint64_t>::max()
-                          : job.operation_id + 1,
+                          : (graph_mode_ ? 1 : (job.operation_id + 1)),
                    std::memory_order_release);
         continue;
       }
@@ -1759,6 +1777,7 @@ private:
   GpuWindows send_gpu_;
   GpuWindows recv_gpu_;
   bool gpu_windows_{false};
+  bool graph_mode_{false};
   std::string gpu_unavailable_;
   std::size_t data_offset_{kDataOffset};
   // The next exchange whose device receive window is not yet posted.

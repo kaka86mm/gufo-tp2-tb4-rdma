@@ -28,6 +28,9 @@ public:
   [[nodiscard]] virtual int device_index() const noexcept { return 0; }
   /// The transport's settings, for the log; empty when there is none.
   [[nodiscard]] virtual std::string Describe() const { return {}; }
+  /// True when every exchange uses one fixed window and a constant flag
+  /// value with consumer resets, so a captured graph replays correctly.
+  [[nodiscard]] virtual bool replay_safe() const noexcept { return false; }
   /// The largest partial one exchange carries.
   [[nodiscard]] virtual std::size_t MaxPartialBytes() const noexcept {
     return static_cast<std::size_t>(-1);

@@ -3637,6 +3637,15 @@ __global__ void StagePartialKernel(const float* __restrict__ partial,
   }
 }
 
+/// Re-arms a graph-replay exchange flag: the next round's stage or worker
+/// publishes the same constant value again, so the flag must read zero then.
+__global__ void ResetFlagKernel(std::uint64_t* flag) {
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    __hip_atomic_store(flag, std::uint64_t{0}, __ATOMIC_RELEASE,
+                       __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+}
+
 __global__ void WaitValueKernel(const std::uint64_t* flag, std::uint64_t value,
                                 std::uint64_t ticks, std::uint32_t* timed_out) {
   const std::uint64_t start = wall_clock64();
@@ -8555,6 +8564,10 @@ void WaitValue(const std::uint64_t* flag, std::uint64_t value,
                hipStream_t stream) {
   hipLaunchKernelGGL(WaitValueKernel, dim3(1), dim3(1), 0, stream, flag, value,
                      ticks, timed_out);
+}
+
+void ResetFlag(std::uint64_t* flag, hipStream_t stream) {
+  hipLaunchKernelGGL(ResetFlagKernel, dim3(1), dim3(1), 0, stream, flag);
 }
 
 void AddRowsBroadcast(const float* embedding, float* residual,

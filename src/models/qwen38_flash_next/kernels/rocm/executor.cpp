@@ -2980,6 +2980,24 @@ Executor::TwoRankAllReduce(std::shared_ptr<Communicator> communicator,
   return [communicator = std::move(communicator), hidden](
              float* data, std::size_t bytes, hipStream_t stream,
              std::string* error) {
+    // GUFO_ROUND_US also times each all-reduce with lazily-read events: the
+    // pair recorded last exchange is complete once this one is enqueued.
+    static thread_local bool ar_timed =
+        std::getenv("GUFO_ROUND_US") != nullptr;
+    static thread_local hipEvent_t before = nullptr, after = nullptr;
+    static thread_local std::uint64_t ar_count = 0;
+    static thread_local double ar_us = 0;
+    if (ar_timed) {
+      if (before == nullptr) {
+        (void)hipEventCreate(&before);
+        (void)hipEventCreate(&after);
+      } else if (hipEventQuery(after) == hipSuccess) {
+        float ms = 0.0F;
+        (void)hipEventElapsedTime(&ms, before, after);
+        ar_us += ms * 1000.0;
+      }
+      (void)hipEventRecord(before, stream);
+    }
     Communicator::QueuedPartial queued;
     if (!communicator->QueuePartial(bytes, &queued, error)) {
       return false;
@@ -2992,6 +3010,19 @@ Executor::TwoRankAllReduce(std::shared_ptr<Communicator> communicator,
     if (rows != 0) {
       AddRowsBroadcast(queued.peer, data, static_cast<std::uint32_t>(rows),
                        hidden, 1, stream);
+    }
+    // A replay-safe transport publishes a constant flag value; re-arm it
+    // after the add so the next round's wait observes the fresh arrival.
+    if (communicator->replay_safe()) {
+      ResetFlag(const_cast<std::uint64_t*>(queued.arrived), stream);
+    }
+    if (ar_timed) {
+      (void)hipEventRecord(after, stream);
+      if (++ar_count % 128 == 0) {
+        std::fprintf(stderr, "ar_us n=%llu avg=%.0f\n",
+                     static_cast<unsigned long long>(ar_count), ar_us / 128.0);
+        ar_us = 0;
+      }
     }
     return true;
   };
@@ -3450,9 +3481,11 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
 bool Executor::Run(Session& session, std::uint64_t key, bool graph,
                    const std::function<bool()>& body, std::string* error_msg,
                    bool synchronize) const {
-  // Host-driven communication is not graph-safe yet. Keep the distributed
-  // path eager until the communicator has an explicit capture protocol.
-  if (model_->tp_world_size() > 1) {
+  // Host-driven communication is graph-safe only with a replay-safe
+  // transport (fixed window, constant flag values, consumer resets; see
+  // GUFO_TP2_GRAPHS in verbs.cpp). Otherwise keep the distributed path eager.
+  static const bool tp2_graphs = std::getenv("GUFO_TP2_GRAPHS") != nullptr;
+  if (model_->tp_world_size() > 1 && !tp2_graphs) {
     graph = false;
   }
   // A batch shape runs eagerly once before it is captured: the first pass

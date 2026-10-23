@@ -616,6 +616,8 @@ void StagePartial(const float* partial, float* send, std::size_t count,
 void WaitValue(const std::uint64_t* flag, std::uint64_t value,
                std::uint64_t ticks, std::uint32_t* timed_out,
                hipStream_t stream);
+/// Re-arms a graph-replay exchange flag (see ResetFlagKernel).
+void ResetFlag(std::uint64_t* flag, hipStream_t stream);
 
 inline constexpr std::uint32_t kArgmaxParts = 64;
 struct ArgmaxCandidate {
