@@ -5,15 +5,18 @@
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "src/core/hip/host_allocations.hpp"
@@ -729,8 +732,15 @@ private:
   mutable std::uint64_t next_standing_owner_{1};
   /// Serializes graph launches' standing-fire windows across sessions:
   /// interleaved replays' exchanges can swap past the receiver's reorder
-  /// tolerance.
+  /// tolerance. Admission is ordered by the graph's standing owner (capture
+  /// order, identical on both ranks), so the fire order cannot invert
+  /// between them no matter how the local threads race.
   mutable std::mutex replay_mutex_;
+  mutable std::condition_variable replay_cv_;
+  mutable bool replay_active_{false};
+  mutable std::multiset<std::uint64_t> replay_waiters_;
+  void AcquireReplayTurn(std::uint64_t order) const;
+  void ReleaseReplayTurn() const noexcept;
   [[nodiscard]] std::shared_ptr<SnapshotAllocator> GetSnapshotAllocator() const;
   mutable std::once_flag snapshot_allocator_once_;
   mutable std::shared_ptr<SnapshotAllocator> snapshot_allocator_;

@@ -95,13 +95,13 @@ constexpr std::size_t kReadyOffset = 0;
 // must never satisfy a standing job's fire (the shared flag let a stale
 // standing fire mid-eager-round and poison the peer's op sequence).
 constexpr std::size_t kStandingFlagOffset = 256;
-constexpr std::size_t kMaxStandingSites = 2400;
+constexpr std::size_t kMaxStandingSites = 8192;
 constexpr std::size_t kArrivedOffset = 64;
 constexpr std::size_t kGraphArrivedOffset = 128;
 // Must not alias kGraphArrivedOffset: a standing fire stores 1 there, and
 // CheckQueued would read it as a GPU wait timeout and poison the transport.
 constexpr std::size_t kTimedOutOffset = 192;
-constexpr std::size_t kFlagBytes = 32768;
+constexpr std::size_t kFlagBytes = 131072;
 constexpr auto kCollectiveTimeout = std::chrono::seconds(30);
 // A living peer may fall far behind, e.g. while its n-gram reads wait on a
 // throttled SSD; a dead one closes the bootstrap socket, and a vanished host

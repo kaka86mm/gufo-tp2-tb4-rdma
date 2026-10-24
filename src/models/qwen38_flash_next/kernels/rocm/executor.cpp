@@ -712,6 +712,12 @@ Session::~Session() {
     (void)hipGraphExecDestroy(exec);
   }
   if (release_standing_) {
+    if (getenv("GUFO_TP2_DEBUG") != nullptr) {
+      for (const auto& [key, owner] : graph_standing_owners_) {
+        std::fprintf(stderr, "tp2dbg pool-release owner=%llu why=session-death\n",
+                     static_cast<unsigned long long>(owner));
+      }
+    }
     for (const auto& [key, owner] : graph_standing_owners_) {
       release_standing_(owner);
     }
@@ -910,13 +916,11 @@ void Session::TrimRollback(std::uint32_t depth) noexcept {
         std::fprintf(stderr, "tp2dbg trim-evict key=%llu depth=%u\n",
                      static_cast<unsigned long long>(it->first), depth);
       }
-      if (release_standing_) {
-        if (const auto owner = graph_standing_owners_.find(it->first);
-            owner != graph_standing_owners_.end()) {
-          release_standing_(owner->second);
-          graph_standing_owners_.erase(owner);
-        }
-      }
+      // The graph dies but its standing pool is NOT released here: the trim
+      // depth depends on rank-local acceptance accounting and the eviction
+      // set can transiently differ between the ranks, which would diverge
+      // their pool sets. The orphaned pool is reclaimed at this shape's
+      // next re-capture (owner reuse in Run) or at session teardown.
       it = graphs_.erase(it);
     } else {
       ++it;
@@ -3576,6 +3580,24 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
   return true;
 }
 
+void Executor::AcquireReplayTurn(std::uint64_t order) const {
+  std::unique_lock lock(replay_mutex_);
+  replay_waiters_.insert(order);
+  replay_cv_.wait(lock, [&] {
+    return !replay_active_ && *replay_waiters_.begin() == order;
+  });
+  replay_waiters_.erase(replay_waiters_.find(order));
+  replay_active_ = true;
+}
+
+void Executor::ReleaseReplayTurn() const noexcept {
+  {
+    std::lock_guard lock(replay_mutex_);
+    replay_active_ = false;
+  }
+  replay_cv_.notify_all();
+}
+
 bool Executor::Run(Session& session, std::uint64_t key, bool graph,
                    const std::function<bool()>& body, std::string* error_msg,
                    bool synchronize) const {
@@ -3597,14 +3619,22 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
     graph = false;
   }
   if (tp2_trace) {
-    std::fprintf(stderr, "tp2dbg run key=%llu graph=%d sync=%d warmed=%d\n",
-                 static_cast<unsigned long long>(key),
+    std::fprintf(stderr,
+                 "tp2dbg run key=%llu pos=%u graph=%d sync=%d warmed=%d\n",
+                 static_cast<unsigned long long>(key), session.position_,
                  static_cast<int>(graph), static_cast<int>(synchronize),
                  static_cast<int>(session.warmed_.contains(key)));
   }
   // Taken by the replay branch; held until Run returns so the launch's
   // standing fires and the drain stay serialized across sessions.
-  std::unique_lock<std::mutex> replay_lock;
+  struct ReplaySlot {
+    const Executor* owner{nullptr};
+    ~ReplaySlot() {
+      if (owner != nullptr) {
+        owner->ReleaseReplayTurn();
+      }
+    }
+  } replay_slot;
   // A batch shape runs eagerly once before it is captured: the first pass
   // grows the GEMM tier's arena, which capture forbids.
   // The producer/dispatch state the graph's kernel arguments were baked
@@ -3713,11 +3743,31 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
         return false;
       }
       ++capture_depth;
-      // Standing jobs carry a fresh owner id so the communicator can drop
-      // them when this graph (or the session holding it) is destroyed;
-      // unreleased pools would accumulate sites across sessions until
-      // registration exhausts the table.
-      const std::uint64_t standing_owner = next_standing_owner_++;
+      // Standing jobs carry an owner id so the communicator can drop them
+      // at lifetime points. Owners are minted in the run sequence, which is
+      // identical on both ranks; re-capturing a shape this session recorded
+      // before (its graph was trimmed away) reuses that owner and drops the
+      // orphaned pool HERE — a lockstep point — instead of at the
+      // rank-local trim, whose eviction set can transiently differ between
+      // the ranks.
+      std::uint64_t standing_owner;
+      if (const auto prev = session.graph_standing_owners_.find(key);
+          prev != session.graph_standing_owners_.end()) {
+        standing_owner = prev->second;
+        if (options_.release_standing) {
+          if (tp2_trace) {
+            std::fprintf(stderr, "tp2dbg pool-release owner=%llu why=recapture\n",
+                         static_cast<unsigned long long>(standing_owner));
+          }
+          options_.release_standing(standing_owner);
+        }
+      } else {
+        standing_owner = next_standing_owner_++;
+        if (tp2_trace) {
+          std::fprintf(stderr, "tp2dbg pool-mint owner=%llu\n",
+                       static_cast<unsigned long long>(standing_owner));
+        }
+      }
       if (options_.set_recording) {
         options_.set_recording(true, standing_owner);
       }
@@ -3781,9 +3831,10 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
         if (captured != nullptr) {
           (void)hipGraphDestroy(captured);
         }
-        if (options_.release_standing) {
-          options_.release_standing(standing_owner);
-        }
+        // The half-registered pool stays orphaned rather than being
+        // released here: capture failures can be rank-local, and a release
+        // the peer did not perform would diverge the pool sets. The orphan
+        // is reclaimed when this shape is next re-captured (owner reuse).
         return false;
       }
       const bool instantiated =
@@ -3797,9 +3848,7 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
       }
       (void)hipGraphDestroy(captured);
       if (!instantiated) {
-        if (options_.release_standing) {
-          options_.release_standing(standing_owner);
-        }
+        // As above: rank-local failures must not release the pool.
         return false;
       }
       session.graphs_.emplace(key, exec);
@@ -3814,10 +3863,17 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
     if (!enqueued) {
       // Same discipline at replay: the graph is self-contained, and the
       // eager epilogue after it must not trust stale producer caches.
-      // Hold the replay lock through this forward's drain: concurrent
-      // sessions' replays would interleave their standing fires past the
-      // receiver's reorder tolerance.
-      replay_lock = std::unique_lock<std::mutex>(replay_mutex_);
+      // Admission is ordered by the graph's standing owner (capture order,
+      // which the run sequence keeps identical on both ranks), so the fire
+      // order cannot invert between them no matter how the local threads
+      // race; the slot is held through this forward's drain.
+      std::uint64_t order = key;
+      if (const auto owner = session.graph_standing_owners_.find(key);
+          owner != session.graph_standing_owners_.end()) {
+        order = owner->second;
+      }
+      AcquireReplayTurn(order);
+      replay_slot.owner = this;
       UseScratch(s_);
       if (ple_pending_ && !WaitPle(error_msg)) {
         return false;
