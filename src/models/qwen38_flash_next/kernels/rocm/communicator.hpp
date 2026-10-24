@@ -28,6 +28,15 @@ public:
   [[nodiscard]] virtual int device_index() const noexcept { return 0; }
   /// The transport's settings, for the log; empty when there is none.
   [[nodiscard]] virtual std::string Describe() const { return {}; }
+  /// True when every exchange uses one fixed window and a constant flag
+  /// value with consumer resets, so a captured graph replays correctly.
+  [[nodiscard]] virtual bool replay_safe() const noexcept { return false; }
+  /// Marks the communicator as inside a graph recording pass, so queued
+  /// exchanges register as standing jobs deterministically. `owner` names the
+  /// graph being recorded: its standing jobs live exactly as long as it does.
+  virtual void set_recording(bool active, std::uint64_t owner) noexcept {}
+  /// Drops the standing jobs of a destroyed graph, freeing their site flags.
+  virtual void release_standing(std::uint64_t owner) noexcept {}
   /// The largest partial one exchange carries.
   [[nodiscard]] virtual std::size_t MaxPartialBytes() const noexcept {
     return static_cast<std::size_t>(-1);
@@ -80,7 +89,7 @@ public:
   /// caller keeps queuing work. Shares the sequence and rules above. A failed
   /// exchange releases every wait and is reported by CheckQueued; the stream
   /// then carries meaningless sums to the end of the operation.
-  [[nodiscard]] virtual bool QueuePartial(std::size_t bytes,
+  [[nodiscard]] virtual bool QueuePartial(std::size_t bytes, hipStream_t stream,
                                           QueuedPartial* partial,
                                           std::string* error) = 0;
   /// After the stream has drained: false with the first failure of a queued

@@ -295,6 +295,9 @@ void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
                    std::uint32_t n_tokens, std::uint32_t k,
                    std::uint32_t n_experts, hipStream_t stream);
 
+/// Re-encodes `blocks` Q8_0 blocks as Q5_1 (24 bytes each) for the decode GEMV.
+bool RequantQ8_0ToQ5_1(const void* src, void* dst, std::size_t blocks,
+                       hipStream_t stream);
 /// Routed expert GEMM on the F16 WMMA cores over F16 activation rows
 /// `x` ([rows][k]): the weights are dequantized to F16 after the LDS read
 /// and the whole K extent accumulates in F32. `tiles` (n_tiles entries)
@@ -355,6 +358,9 @@ void PleConv(const float* in, const float* w, float* history,
 void PleInject(float* res, const float* gated, const float* conv,
                std::size_t count, hipStream_t stream);
 
+/// Re-encodes `blocks` Q8_0 blocks as Q4_1 (20 bytes each) for the decode GEMV.
+bool RequantQ8_0ToQ4_1(const void* src, void* dst, std::size_t blocks,
+                       hipStream_t stream);
 /// Copies rolling history at a prefix without advancing the live history.
 void HistoryPrefix(const float* in, std::uint32_t stride, const float* history,
                    float* destination, std::uint32_t tokens,
@@ -610,6 +616,11 @@ void StagePartial(const float* partial, float* send, std::size_t count,
 void WaitValue(const std::uint64_t* flag, std::uint64_t value,
                std::uint64_t ticks, std::uint32_t* timed_out,
                hipStream_t stream);
+/// Re-arms a graph-replay exchange flag (see ResetFlagKernel).
+void ResetFlag(std::uint64_t* flag, hipStream_t stream);
+/// Sums `count` floats to a pinned host slot (per-exchange debug checksum).
+void DebugChecksum(const float* data, std::size_t count, double* out,
+                   hipStream_t stream);
 
 inline constexpr std::uint32_t kArgmaxParts = 64;
 struct ArgmaxCandidate {
@@ -655,6 +666,18 @@ void PenalizedArgmax(const float* logits, GreedyPenaltyRows penalties,
 
 void GatherArgmaxCandidates(const float* logits, const std::uint32_t* ids,
                             ArgmaxCandidate* out, std::uint32_t rows,
+                            std::uint32_t vocab, hipStream_t stream);
+
+/// Exact top-64 unpenalized tokens plus every penalized token, retaining
+/// original F32 logits. This union contains the target's complete top-k for
+/// k <= 64, even when penalties promote tokens. The CPU keeps its existing
+/// FP64 penalties, filtering, normalization and rejection sampler.
+/// Each ID workspace holds rows * MtpCandidateWorkspaceSize(vocab) entries.
+/// Output row r starts at r * 64 + penalties.offsets[r]; invalid IDs have
+/// -infinity logits.
+void VerificationCandidates(const float* logits, GreedyPenaltyRows penalties,
+                            std::uint32_t* ids, std::uint32_t* scratch_ids,
+                            sampling::LogitCandidate* out, std::uint32_t rows,
                             std::uint32_t vocab, hipStream_t stream);
 
 /// Draft logits of empty table slots (table[i] < 0) become -infinity.

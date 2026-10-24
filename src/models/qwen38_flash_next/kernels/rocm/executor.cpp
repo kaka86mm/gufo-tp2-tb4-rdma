@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <sstream>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -28,6 +29,20 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
+
+namespace {
+// Per-exchange all-reduce checksums under GUFO_TP2_DEBUG: pinned host
+// slots the checksum kernel writes to (graph-safe: the slot pointer is
+// baked per site at record time and written on every replay).
+double* ar_debug_slots = nullptr;
+std::size_t ar_debug_count = 0;
+
+// Depth of active stream capture on this thread. Querying hipStreamIsCapturing
+// from inside the recording is itself unreliable, and synchronizing a
+// capturing stream blocks forever, so Run brackets the capture and Drain
+// consults this counter instead of the HIP API.
+thread_local int capture_depth = 0;
+}  // namespace
 namespace {
 
 using core::GgmlType;
@@ -99,6 +114,12 @@ bool MatrixRows(std::uint32_t rows) {
 }
 bool ExpertMatrixRows(std::uint32_t rows) {
   return prefill_phase || rows > 4 * kVecBatch;
+}
+/// Prefill passes wider than a vector batch take the fused projections and
+/// the paired routed expert tiles: they win from 9 rows up to the full chunk.
+/// Decode and verification batches keep their single-token arithmetic.
+bool WidePrefill(std::uint32_t rows) {
+  return prefill_phase && rows > kVecBatch;
 }
 
 /// Whether mmq's Q8_1 rows of width k carry no padding, so a producer's
@@ -690,6 +711,11 @@ Session::~Session() {
   for (auto& [key, exec] : graphs_) {
     (void)hipGraphExecDestroy(exec);
   }
+  if (release_standing_) {
+    for (const auto& [key, owner] : graph_standing_owners_) {
+      release_standing_(owner);
+    }
+  }
   for (void* p : allocations_) {
     (void)hipFree(p);
   }
@@ -707,7 +733,19 @@ void Session::RestoreVisionLayout(const qwen::vision::RopeLayout& layout,
       (void)hipGraphExecDestroy(graph);
     graphs_.clear();
     warmed_.clear();
+    if (release_standing_) {
+      for (const auto& [key, owner] : graph_standing_owners_) {
+        release_standing_(owner);
+      }
+    }
+    graph_standing_owners_.clear();
   }
+}
+
+void Session::PrepareVision(hipStream_t stream) {
+  vision_input_.PrepareRope(stream);
+  for (auto& attention : attention_)
+    attention.rope = vision_input_.rope();
 }
 
 void Session::ConfigureVision(
@@ -724,6 +762,12 @@ void Session::ConfigureVision(
       (void)hipGraphExecDestroy(graph);
     graphs_.clear();
     warmed_.clear();
+    if (release_standing_) {
+      for (const auto& [key, owner] : graph_standing_owners_) {
+        release_standing_(owner);
+      }
+    }
+    graph_standing_owners_.clear();
   }
 }
 
@@ -852,6 +896,7 @@ std::unique_ptr<PrefillCheckpoint> Executor::MakePrefillCheckpoint(
 }
 
 void Session::TrimRollback(std::uint32_t depth) noexcept {
+  static const bool trim_trace = std::getenv("GUFO_TP2_DEBUG") != nullptr;
   if (depth >= rollback_depth_)
     return;
   // Keep graphs whose rows still exist. Deeper verifier graphs capture
@@ -861,6 +906,17 @@ void Session::TrimRollback(std::uint32_t depth) noexcept {
         (it->first & (std::uint64_t{1} << 40)) == 0 &&
         (it->first & 0xFFFFU) > depth + 1) {
       (void)hipGraphExecDestroy(it->second);
+      if (trim_trace) {
+        std::fprintf(stderr, "tp2dbg trim-evict key=%llu depth=%u\n",
+                     static_cast<unsigned long long>(it->first), depth);
+      }
+      if (release_standing_) {
+        if (const auto owner = graph_standing_owners_.find(it->first);
+            owner != graph_standing_owners_.end()) {
+          release_standing_(owner->second);
+          graph_standing_owners_.erase(owner);
+        }
+      }
       it = graphs_.erase(it);
     } else {
       ++it;
@@ -1304,6 +1360,27 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     std::construct_at(e->mtp_candidates_host_);
     e->mtp_candidates_host_->size =
         std::min<std::size_t>(c.vocab_size, kMtpCandidates);
+    const auto rows = std::min<std::size_t>(7, e->options_.max_speculative - 1);
+    if (rows != 0) {
+      e->verification_ids_ = Alloc<std::uint32_t>(
+          a, rows * MtpCandidateWorkspaceSize(c.vocab_size), error_msg);
+      e->verification_scratch_ids_ = Alloc<std::uint32_t>(
+          a, rows * MtpCandidateWorkspaceSize(c.vocab_size), error_msg);
+      const auto candidates = rows * (kMtpCandidates + kCompactPenaltyLimit);
+      e->verification_candidates_ =
+          Alloc<sampling::LogitCandidate>(a, candidates, error_msg);
+      if (!Check(e->host_allocations_.Allocate(
+                     &e->verification_candidates_host_,
+                     candidates * sizeof(sampling::LogitCandidate)),
+                 "pinned verification candidates", error_msg) ||
+          !Check(hip::AllocateDevice(&e->verification_penalties_,
+                                     rows * kCompactPenaltyLimit *
+                                         sizeof(sampling::TokenPenalty)),
+                 "verification penalties", error_msg))
+        return nullptr;
+      e->verification_penalty_capacity_ = rows * kCompactPenaltyLimit;
+      e->verification_penalty_host_.reserve(e->verification_penalty_capacity_);
+    }
   }
   for (void* p : a) {
     if (p == nullptr) {
@@ -1661,6 +1738,34 @@ bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
 
 bool Executor::Dense(const DeviceTensor& w, const Q8Input& q, float* out,
                      std::string* error_msg) const {
+  if (w.decode_data != nullptr && w.decode_type == GgmlType::kQ4_1 &&
+      q.data != nullptr && q.n <= kVecBatch) {
+    if (w.cols != q.k) {
+      AssignError(error_msg, "quantized input width mismatch");
+      return false;
+    }
+    if (qfn_mmq_q4_1_dense_vec_preq(
+            w.decode_data, q.data, out, static_cast<int>(w.rows),
+            static_cast<int>(q.n), static_cast<int>(w.cols), stream_) != 0) {
+      AssignError(error_msg, "Q4_1 decode GEMV failed");
+      return false;
+    }
+    return true;
+  }
+  if (w.decode_data != nullptr && q.x != nullptr && q.n <= kVecBatch) {
+    if (w.cols != q.k) {
+      AssignError(error_msg, "quantized input width mismatch");
+      return false;
+    }
+    if (qfn_mmq_dense_vec(static_cast<int>(w.decode_type), w.decode_data, q.x,
+                          out, static_cast<int>(w.rows),
+                          static_cast<int>(w.cols), static_cast<int>(q.n),
+                          stream_) != 0) {
+      AssignError(error_msg, "decode GEMV failed");
+      return false;
+    }
+    return true;
+  }
   if (w.type == GgmlType::kQ8_0 && q.data != nullptr) {
     if (w.cols != q.k) {
       AssignError(error_msg, "quantized input width mismatch");
@@ -1681,6 +1786,26 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
                           const float* x, float* out, std::uint32_t n_tokens,
                           const DeviceTensor* down,
                           std::string* error_msg) const {
+  if (!MatrixRows(n_tokens) && n_tokens <= kVecBatch &&
+      up.decode_data != nullptr && gate.decode_data != nullptr &&
+      up.decode_type == GgmlType::kQ4_1 &&
+      gate.decode_type == GgmlType::kQ4_1 && up.rows == gate.rows &&
+      up.cols == gate.cols) {
+    Q8Input xq;
+    if (!Quantize(x, n_tokens, up.cols, &xq, error_msg)) {
+      return false;
+    }
+    if (xq.data != nullptr) {
+      if (qfn_mmq_q4_1_gated_vec_preq(
+              up.decode_data, gate.decode_data, xq.data, out,
+              static_cast<int>(up.rows), static_cast<int>(n_tokens),
+              static_cast<int>(up.cols), stream_) != 0) {
+        AssignError(error_msg, "gated Q4_1 GEMV failed");
+        return false;
+      }
+      return true;
+    }
+  }
   // Decode and verification use the same fused projections and activation.
   // A different SwiGLU rounding can change later activation quantization.
   if (!MatrixRows(n_tokens) && up.type == GgmlType::kQ8_0 &&
@@ -1883,10 +2008,10 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   }
   routed_max_rows_ = std::max<std::uint32_t>(1, max_rows);
   routed_n_tiles_ = n_tiles;
-  // Append the 64-token map for gate/up and eligible down projections.
+  // Prefill appends the 64-token map for gate/up and the down projection.
   // Wide expert buckets also get a 128-token gate/up map: it amortizes
   // weight decoding, while short buckets retain the cheaper 64-token tile.
-  if (n_tokens >= 1024 && routed_tile_rows_ == kRoutedTileRowsWide) {
+  if (WidePrefill(n_tokens)) {
     for (std::uint32_t e = 0; e < c.num_experts; ++e) {
       const std::uint32_t padded = (counts_host_[e] + 15u) / 16u * 16u;
       for (std::uint32_t j = 0; j < (padded + 63u) / 64u; ++j)
@@ -2324,6 +2449,13 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
 }
 
 bool Executor::WaitPle(std::string* error_msg) const {
+  // While recording, the graph's memcpy node bakes the host_emb_ pointer;
+  // the rows are filled before each replay (see Run), not here. Waiting
+  // inside the recording would also block on I/O that the real pass may
+  // have already consumed.
+  if (capture_depth > 0) {
+    return true;
+  }
   bool ok = ple_pending_;
   if (ok && prefetch_.claimed != 0) {
     FinishPrefetch();
@@ -2471,7 +2603,7 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   if (!l.ssm_in.empty()) {
     // Wide prefill convolves QKV in the projection's LDS tile. The raw
     // boundary rows remain available for the rolling history update.
-    if (!projections_ready && !speculative && n_tokens >= 1024 &&
+    if (!projections_ready && !speculative && WidePrefill(n_tokens) &&
         n_tokens <= options_.max_batch && DenseF16Route(l.ssm_in, n_tokens)) {
       PrepareHalfInput(x, n_tokens, l.ssm_in.cols);
       NpuGemm* npu = model_->npu();
@@ -2645,7 +2777,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   std::uint32_t npu_gate_groups = 0;
   if (!l.attn_qkv.empty()) {
     const bool fused_projection =
-        !projections_ready && n_tokens >= 1024 &&
+        !projections_ready && WidePrefill(n_tokens) &&
         n_tokens <= options_.max_batch && DenseF16Route(l.attn_qkv, n_tokens) &&
         l.attn_qkv.rows == 2 * (heads.attn + heads.attn_kv) * 256 &&
         l.attn_qkv.cols == 2560 && heads.attn == 12 * heads.attn_kv &&
@@ -2899,8 +3031,29 @@ Executor::TwoRankAllReduce(std::shared_ptr<Communicator> communicator,
   return [communicator = std::move(communicator), hidden](
              float* data, std::size_t bytes, hipStream_t stream,
              std::string* error) {
+    // Per-exchange all-reduce checksum under GUFO_TP2_DEBUG: the pinned
+    // slots survive graph capture (the kernel and its slot pointer are
+    // baked per site), so both ranks can compare the sum each replay.
+    // GUFO_ROUND_US also times each all-reduce with lazily-read events: the
+    // pair recorded last exchange is complete once this one is enqueued.
+    static thread_local bool ar_timed =
+        std::getenv("GUFO_ROUND_US") != nullptr;
+    static thread_local hipEvent_t before = nullptr, after = nullptr;
+    static thread_local std::uint64_t ar_count = 0;
+    static thread_local double ar_us = 0;
+    if (ar_timed) {
+      if (before == nullptr) {
+        (void)hipEventCreate(&before);
+        (void)hipEventCreate(&after);
+      } else if (hipEventQuery(after) == hipSuccess) {
+        float ms = 0.0F;
+        (void)hipEventElapsedTime(&ms, before, after);
+        ar_us += ms * 1000.0;
+      }
+      (void)hipEventRecord(before, stream);
+    }
     Communicator::QueuedPartial queued;
-    if (!communicator->QueuePartial(bytes, &queued, error)) {
+    if (!communicator->QueuePartial(bytes, stream, &queued, error)) {
       return false;
     }
     StagePartial(data, queued.send, bytes / sizeof(float), queued.arrivals,
@@ -2911,6 +3064,34 @@ Executor::TwoRankAllReduce(std::shared_ptr<Communicator> communicator,
     if (rows != 0) {
       AddRowsBroadcast(queued.peer, data, static_cast<std::uint32_t>(rows),
                        hidden, 1, stream);
+    }
+    // A replay-safe transport publishes a constant flag value; re-arm it
+    // after the add so the next round's wait observes the fresh arrival.
+    if (communicator->replay_safe()) {
+      ResetFlag(const_cast<std::uint64_t*>(queued.arrived), stream);
+    }
+    if (ar_debug_slots == nullptr) {
+      if (hipHostMalloc(&ar_debug_slots, 256 * sizeof(double),
+                        hipHostMallocDefault) != hipSuccess) {
+        ar_debug_slots = nullptr;
+      }
+    }
+    const bool ar_trace = std::getenv("GUFO_TP2_DEBUG") != nullptr;
+    if (ar_trace && ar_debug_slots != nullptr) {
+      if (ar_debug_count >= 256) {
+        ar_debug_count = 0;
+      }
+      DebugChecksum(data, bytes / sizeof(float),
+                    ar_debug_slots + ar_debug_count, stream);
+      ++ar_debug_count;
+    }
+    if (ar_timed) {
+      (void)hipEventRecord(after, stream);
+      if (++ar_count % 128 == 0) {
+        std::fprintf(stderr, "ar_us n=%llu avg=%.0f\n",
+                     static_cast<unsigned long long>(ar_count), ar_us / 128.0);
+        ar_us = 0;
+      }
     }
     return true;
   };
@@ -2923,7 +3104,26 @@ std::function<bool(std::string*)> Executor::TwoRankReduceStatus(
   };
 }
 
+void Executor::PrintArChecksums() const {
+  if (ar_debug_slots == nullptr || ar_debug_count == 0) {
+    return;
+  }
+  std::fprintf(stderr, "tp2dbg archk n=%zu", ar_debug_count);
+  for (std::size_t i = 0; i < ar_debug_count && i < 16; ++i) {
+    std::fprintf(stderr, " [%.1f]", ar_debug_slots[i]);
+  }
+  std::fprintf(stderr, "\n");
+}
+
+void Executor::ResetArChecksums() const { ar_debug_count = 0; }
+
 bool Executor::Drain(const char* what, std::string* error_msg) const {
+  // A capturing stream never reaches the queued work; synchronizing it
+  // blocks forever. The recording pass only needs the transport's health
+  // check.
+  if (capture_depth > 0) {
+    return !options_.reduce_status || options_.reduce_status(error_msg);
+  }
   return Check(hipStreamSynchronize(stream_), what, error_msg) &&
          (!options_.reduce_status || options_.reduce_status(error_msg));
 }
@@ -2957,6 +3157,16 @@ bool Executor::AllReduce(float* data, std::size_t rows, std::string* error_msg,
   if (model_->tp_world_size() == 1) {
     return true;
   }
+  // GUFO_TP2_SKIP_AR_RECORD: skip exchanges during recording (diagnostic
+  // to separate the standing registration's effect from the compute
+  // kernels' recording).
+  if (capture_depth > 0 && std::getenv("GUFO_TP2_SKIP_AR_RECORD") != nullptr) {
+    return true;
+  }
+  // GUFO_TP2_EAGER_RECORD: during recording, exchanges take the ONE-SHOT
+  // (eager) path instead of the standing registration. The RDMA write
+  // actually happens, isolating the standing mechanism from the exchange
+  // data flow.
   const std::size_t hidden = config().hidden_size;
   if (rows > std::numeric_limits<std::size_t>::max() / hidden ||
       rows * hidden > std::numeric_limits<std::size_t>::max() / sizeof(float)) {
@@ -3185,15 +3395,15 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
       half_bf16_ = false;
     }
     const auto* x_half = static_cast<const __half*>(s_.x_half);
-    // Large batches pair the gate/up projections and apply SwiGLU without
-    // materializing the gate. Smaller buckets favor separate projections.
+    // Prefill pairs the gate/up projections and applies SwiGLU without
+    // materializing the gate; decode-time batches keep separate projections.
     auto* up_half = reinterpret_cast<__half*>(s_.up_e);
     const WeightType gate_type =
         l.ffn_gate_exps.type == GgmlType::kQ5_K   ? WeightType::kQ5_K
         : l.ffn_gate_exps.type == GgmlType::kQ8_0 ? WeightType::kQ8_0
                                                   : WeightType::kQ4_K;
     const bool gated_ok =
-        n_tokens >= 1024 && routed_tile_rows_ == 48
+        routed_64_tiles_ != 0
             ? RoutedGatedF16Gemm(
                   l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type, x_half,
                   s_.routed_tiles + routed_pair_offset_, routed_pair_tiles_,
@@ -3224,8 +3434,8 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     const WeightType down_type = l.ffn_down_exps.type == GgmlType::kQ8_0
                                      ? WeightType::kQ8_0
                                      : WeightType::kQ5_1;
-    // Wide batches take the 64-token down tiles: they decode each expert's
-    // weights over more rows, also where 48-token tiles would be fewer.
+    // Prefill takes the 64-token down tiles: they decode each expert's
+    // weights over more rows, also where narrower tiles would be fewer.
     const bool wide_down = routed_64_tiles_ != 0;
     // The down projection's rows are F16 too: the epilogue reads half the
     // bytes of the largest routed intermediate.
@@ -3369,25 +3579,80 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
 bool Executor::Run(Session& session, std::uint64_t key, bool graph,
                    const std::function<bool()>& body, std::string* error_msg,
                    bool synchronize) const {
-  // Host-driven communication is not graph-safe yet. Keep the distributed
-  // path eager until the communicator has an explicit capture protocol.
-  if (model_->tp_world_size() > 1) {
+  // Host-driven communication is graph-safe only with a replay-safe
+  // transport (fixed window, constant flag values, consumer resets; see
+  // GUFO_TP2_GRAPHS in verbs.cpp). Otherwise keep the distributed path eager.
+  static const bool tp2_graphs =
+      std::getenv("GUFO_TP2_CAPTURE") != nullptr;
+  static const bool tp2_trace =
+      std::getenv("GUFO_TP2_DEBUG") != nullptr;
+  if (model_->tp_world_size() > 1 && !tp2_graphs) {
     graph = false;
   }
+  // Draft graphs (bit 40) adapt their shapes to rank-local scheduling, so
+  // one rank can warm and capture a draft shape the other replays, desyncing
+  // the exchange sequence. They are tiny (~70 nodes, a handful of exchanges);
+  // capture only the rigid target shapes both ranks run identically.
+  if (graph && (key & (std::uint64_t{1} << 40)) != 0) {
+    graph = false;
+  }
+  if (tp2_trace) {
+    std::fprintf(stderr, "tp2dbg run key=%llu graph=%d sync=%d warmed=%d\n",
+                 static_cast<unsigned long long>(key),
+                 static_cast<int>(graph), static_cast<int>(synchronize),
+                 static_cast<int>(session.warmed_.contains(key)));
+  }
+  // Taken by the replay branch; held until Run returns so the launch's
+  // standing fires and the drain stay serialized across sessions.
+  std::unique_lock<std::mutex> replay_lock;
   // A batch shape runs eagerly once before it is captured: the first pass
   // grows the GEMM tier's arena, which capture forbids.
+  // The producer/dispatch state the graph's kernel arguments were baked
+  // against; a replay with a different state reads stale activations.
+  const auto dispatch_state = [&]() {
+    std::ostringstream out;
+    const void* q8 = q8t_src_;
+    const void* hf = half_src_;
+    out << std::hex << reinterpret_cast<std::uintptr_t>(q8) << ","
+        << reinterpret_cast<std::uintptr_t>(hf) << std::dec << ","
+        << q8t_rows_ << "," << q8t_cols_ << "," << half_rows_ << ","
+        << half_cols_ << "," << half_bf16_ << "," << xn_half_ << ","
+        << inject_parts_ << "," << inject_fused_ << "," << q8_slot_ << ","
+        << reinterpret_cast<std::uintptr_t>(xn_q8_ready_.src) << ","
+        << reinterpret_cast<std::uintptr_t>(mixed_q8_ready_.src) << ","
+        << moe_pending_
+        << "," << defer_residual_ << "," << res_deferred_ << ","
+        << shexp_half_ready_;
+    return out.str();
+  };
   if (graph && session.warmed_.contains(key)) {
     hipGraphExec_t exec = nullptr;
     bool enqueued = false;
+    if (tp2_trace) {
+      std::fprintf(stderr, "tp2dbg replay key=%llu\n",
+                   static_cast<unsigned long long>(key));
+    }
     if (const auto it = session.graphs_.find(key);
         it != session.graphs_.end()) {
       exec = it->second;
+      if (const auto state = session.graph_states_.find(key);
+          state != session.graph_states_.end() && tp2_trace &&
+          state->second != dispatch_state()) {
+        std::fprintf(stderr,
+                     "tp2dbg MISMATCH key=%llu baked=%s now=%s\n",
+                     static_cast<unsigned long long>(key),
+                     state->second.c_str(), dispatch_state().c_str());
+      }
     } else {
       // A warmed target shape may need its first graph or a replacement
       // after rollback storage was released. Queue this pass first, then
       // record identical commands while the GPU executes it. Short prefix
       // and draft graphs keep their existing route. No second pass is launched.
       if (synchronize && (key & (std::uint64_t{1} << 40)) == 0) {
+        if (tp2_trace) {
+          std::fprintf(stderr, "tp2dbg prepass-begin key=%llu\n",
+                       static_cast<unsigned long long>(key));
+        }
         auto dispatch = std::tie(
             moe_pending_, defer_residual_, res_deferred_, shexp_half_ready_,
             q8t_src_, q8t_rows_, q8t_cols_, half_src_, half_rows_, half_cols_,
@@ -3398,12 +3663,48 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
             dispatch);
         if (!body())
           return false;
+        // The POST-pass state is what the next round's real pass would see
+        // without capture; save it so the recording can be reverted to it.
+        const auto after = std::apply(
+            [](const auto&... fields) { return std::make_tuple(fields...); },
+            dispatch);
+        if (tp2_trace) {
+          std::fprintf(stderr, "tp2dbg prepass-end key=%llu\n",
+                       static_cast<unsigned long long>(key));
+        }
         // Producer readiness and alternating scratch addresses must match
         // the executed pass when the graph records its kernel arguments.
         dispatch = before;
         enqueued = true;
+        // Revert to the post-pass state once the recording is done (the
+        // recording body runs with cleared caches and can leave different
+        // producer state than the real pass did).
+        struct RevertDispatch {
+          decltype(dispatch)& d;
+          const decltype(after)& a;
+          ~RevertDispatch() { d = a; }
+        } revert{dispatch, after};
       }
       hipGraph_t captured = nullptr;
+      if (tp2_trace) {
+        std::fprintf(stderr, "tp2dbg cap-begin key=%llu\n",
+                     static_cast<unsigned long long>(key));
+      }
+      // A replay must not depend on producer-cache state left by the passes
+      // around it: recording with every cache invalidated bakes all staging
+      // kernels into the graph, making it self-contained (the addresses are
+      // the same; only skipped work differs from the executed pass).
+      // UseScratch covers the scratch-activation caches; the remaining
+      // dispatch fields must be cleared here as well.
+      UseScratch(s_);
+      defer_residual_ = false;
+      res_deferred_ = false;
+      shexp_half_ready_ = false;
+      inject_parts_ = 1;
+      inject_fused_ = nullptr;
+      q8_slot_ = 0;
+      xn_q8_ready_ = {};
+      mixed_q8_ready_ = {};
       // Frozen peer sessions can copy snapshots on independent nonblocking
       // streams while the scheduler records this session's decode graph.
       if (!Check(
@@ -3411,27 +3712,123 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
               "graph capture", error_msg)) {
         return false;
       }
-      const bool ok = body();
+      ++capture_depth;
+      // Standing jobs carry a fresh owner id so the communicator can drop
+      // them when this graph (or the session holding it) is destroyed;
+      // unreleased pools would accumulate sites across sessions until
+      // registration exhausts the table.
+      const std::uint64_t standing_owner = next_standing_owner_++;
+      if (options_.set_recording) {
+        options_.set_recording(true, standing_owner);
+      }
+      // GUFO_TP2_SKIP_RECORD: record an empty body to isolate the capture
+      // machinery from the recording body's host-side effects.
+      static const bool skip_record =
+          std::getenv("GUFO_TP2_SKIP_RECORD") != nullptr;
+      if (tp2_trace) {
+        std::fprintf(stderr, "tp2dbg rec-body-begin key=%llu\n",
+                     static_cast<unsigned long long>(key));
+      }
+      const bool ok = skip_record ? true : body();
+      if (tp2_trace) {
+        std::fprintf(stderr, "tp2dbg rec-body-end key=%llu ok=%d err=%s\n",
+                     static_cast<unsigned long long>(key),
+                     static_cast<int>(ok),
+                     (!ok && error_msg != nullptr && !error_msg->empty())
+                         ? error_msg->c_str()
+                         : "-");
+      }
+      if (tp2_trace) {
+        std::fprintf(stderr, "tp2dbg rec-unwind-a key=%llu\n",
+                     static_cast<unsigned long long>(key));
+      }
+      if (options_.set_recording) {
+        options_.set_recording(false, standing_owner);
+      }
+      if (tp2_trace) {
+        std::fprintf(stderr, "tp2dbg rec-unwind-b key=%llu\n",
+                     static_cast<unsigned long long>(key));
+      }
+      --capture_depth;
+      // The recording body ran with cleared producer caches and leaves
+      // different cache state than the real pass; clear again so the next
+      // round starts from the same state it would without capture.
+      UseScratch(s_);
+      defer_residual_ = false;
+      res_deferred_ = false;
+      shexp_half_ready_ = false;
+      inject_parts_ = 1;
+      inject_fused_ = nullptr;
+      q8_slot_ = 0;
+      xn_q8_ready_ = {};
+      mixed_q8_ready_ = {};
+      if (tp2_trace) {
+        std::fprintf(stderr, "tp2dbg rec-endcap key=%llu\n",
+                     static_cast<unsigned long long>(key));
+      }
       if (!Check(hipStreamEndCapture(stream_, &captured), "graph capture end",
                  error_msg) ||
           !ok) {
+        if (tp2_trace) {
+          std::fprintf(stderr,
+                       "tp2dbg cap-fail key=%llu ok=%d captured=%p err=%s\n",
+                       static_cast<unsigned long long>(key),
+                       static_cast<int>(ok), static_cast<void*>(captured),
+                       (error_msg != nullptr && !error_msg->empty())
+                           ? error_msg->c_str()
+                           : "-");
+        }
         if (captured != nullptr) {
           (void)hipGraphDestroy(captured);
+        }
+        if (options_.release_standing) {
+          options_.release_standing(standing_owner);
         }
         return false;
       }
       const bool instantiated =
           Check(hipGraphInstantiate(&exec, captured, nullptr, nullptr, 0),
                 "graph instantiate", error_msg);
+      if (tp2_trace) {
+        std::size_t nodes = 0;
+        (void)hipGraphGetNodes(captured, nullptr, &nodes);
+        std::fprintf(stderr, "tp2dbg cap-end nodes=%zu ok=%d\n", nodes,
+                     static_cast<int>(ok));
+      }
       (void)hipGraphDestroy(captured);
       if (!instantiated) {
+        if (options_.release_standing) {
+          options_.release_standing(standing_owner);
+        }
         return false;
       }
       session.graphs_.emplace(key, exec);
+      session.graph_standing_owners_.emplace(key, standing_owner);
+      if (!session.release_standing_) {
+        // The executor outlives the session; the copied closure keeps the
+        // destructor able to free this session's standing jobs.
+        session.release_standing_ = options_.release_standing;
+      }
+      session.graph_states_.emplace(key, dispatch_state());
     }
-    if (!enqueued &&
-        !Check(hipGraphLaunch(exec, stream_), "graph launch", error_msg)) {
-      return false;
+    if (!enqueued) {
+      // Same discipline at replay: the graph is self-contained, and the
+      // eager epilogue after it must not trust stale producer caches.
+      // Hold the replay lock through this forward's drain: concurrent
+      // sessions' replays would interleave their standing fires past the
+      // receiver's reorder tolerance.
+      replay_lock = std::unique_lock<std::mutex>(replay_mutex_);
+      UseScratch(s_);
+      if (ple_pending_ && !WaitPle(error_msg)) {
+        return false;
+      }
+      if (tp2_trace) {
+        std::fprintf(stderr, "tp2dbg replay-launch key=%llu\n",
+                     static_cast<unsigned long long>(key));
+      }
+      if (!Check(hipGraphLaunch(exec, stream_), "graph launch", error_msg)) {
+        return false;
+      }
     }
   } else {
     if (!body()) {
@@ -3682,9 +4079,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       // Both stacked SSM projections consume the same F16 input. Avoid writing
       // unused F32/Q8 copies when the wide mixer can supply that input
       // directly.
-      const bool half_only = prefill_phase && n >= 1024 &&
-                             n <= options_.max_batch && l.linear &&
-                             DenseF16Route(l.ssm_in, n) &&
+      const bool half_only = WidePrefill(n) && n <= options_.max_batch &&
+                             l.linear && DenseF16Route(l.ssm_in, n) &&
                              l.ssm_alpha_beta.type == GgmlType::kF16 &&
                              l.ssm_alpha_beta.cols == l.ssm_in.cols;
       if (!HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error_msg,
@@ -3693,9 +4089,9 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       }
       // The last target layer's query outputs have no later cache consumer.
       // Preserve all K/V/indexer rows and the final query's original tile.
-      const bool last_attention = prefill_phase && !session.mtp_enabled_ &&
-                                  il + 1 == c.num_layers && n >= 1024 &&
-                                  n_logits == 1 && checkpoint == nullptr;
+      const bool last_attention = WidePrefill(n) && !session.mtp_enabled_ &&
+                                  il + 1 == c.num_layers && n_logits == 1 &&
+                                  checkpoint == nullptr;
       if (l.linear) {
         const auto capture =
             checkpoint
@@ -3774,9 +4170,9 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     }
     // The last target layer's query outputs have no later cache consumer.
     // Preserve all K/V/indexer rows and the final query's original tile.
-    const bool last_attention = prefill_phase && !session.mtp_enabled_ &&
-                                il + 1 == c.num_layers && n >= 1024 &&
-                                n_logits == 1 && checkpoint == nullptr;
+    const bool last_attention = WidePrefill(n) && !session.mtp_enabled_ &&
+                                il + 1 == c.num_layers && n_logits == 1 &&
+                                checkpoint == nullptr;
     if (!MixerPart(session, il, batch, normed, true, error_msg, checkpoint,
                    last_attention)) {
       return false;
@@ -4185,10 +4581,10 @@ bool Executor::MixerPart(Session& session, std::uint32_t il,
   }
   // The rank's stacked SSM projections share the F16 mix, just as in the
   // single-host path. Neither consumes its F32 or tiled Q8 copies.
-  const bool half_only =
-      prefill_phase && n >= 1024 && n <= options_.max_batch && l.linear &&
-      DenseF16Route(l.ssm_in, n) && l.ssm_alpha_beta.type == GgmlType::kF16 &&
-      l.ssm_alpha_beta.cols == l.ssm_in.cols;
+  const bool half_only = WidePrefill(n) && n <= options_.max_batch &&
+                         l.linear && DenseF16Route(l.ssm_in, n) &&
+                         l.ssm_alpha_beta.type == GgmlType::kF16 &&
+                         l.ssm_alpha_beta.cols == l.ssm_in.cols;
   if (!HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error_msg,
              half_only)) {
     return false;
@@ -5086,6 +5482,66 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
   const bool completed = Check(hipStreamSynchronize(stream_),
                                "greedy MTP verification", error_msg);
   return copied && completed;
+}
+
+bool Executor::CanCompactMtpVerification(
+    const sampling::SamplerState& sampler) {
+  const auto& config = sampler.config();
+  return config.uses_random_sampling() && config.top_k > 0 &&
+         std::size_t(config.top_k) <= kMtpCandidates &&
+         config.min_keep <= kMtpCandidates &&
+         sampler.penalties().size() + 8 <= kCompactPenaltyLimit &&
+         !sampler.NeedsConstraintMask();
+}
+
+bool Executor::SampledMtpCandidates(
+    std::span<std::span<const sampling::LogitCandidate>> output,
+    const sampling::SamplerState& sampler, std::span<const std::int32_t> drafts,
+    std::string* error_msg) const {
+  const auto rows = output.size();
+  if (rows == 0 || rows > 7 || rows >= options_.max_speculative ||
+      rows != drafts.size() || verification_ids_ == nullptr ||
+      !CanCompactMtpVerification(sampler)) {
+    AssignError(error_msg, "invalid compact MTP verification request");
+    return false;
+  }
+  auto& penalties = verification_penalty_host_;
+  penalties.clear();
+  GreedyPenaltyRows batch{};
+  auto tentative = sampler.WithoutConstraint();
+  for (std::size_t row = 0; row < rows; ++row) {
+    const auto counts = tentative.penalties();
+    penalties.insert(penalties.end(), counts.begin(), counts.end());
+    batch.offsets[row + 1] = penalties.size();
+    if (row + 1 < rows)
+      tentative.Accept(static_cast<sampling::TokenId>(drafts[row]));
+  }
+  batch.penalties = verification_penalties_;
+  if (!penalties.empty() &&
+      !Check(hipMemcpyAsync(verification_penalties_, penalties.data(),
+                            penalties.size() * sizeof(penalties[0]),
+                            hipMemcpyHostToDevice, stream_),
+             "compact verification penalties", error_msg))
+    return false;
+  VerificationCandidates(VerificationLogits(), batch, verification_ids_,
+                         verification_scratch_ids_, verification_candidates_,
+                         rows, config().vocab_size, stream_);
+  const auto count = rows * kMtpCandidates + penalties.size();
+  const bool copied = Check(
+      hipMemcpyAsync(verification_candidates_host_, verification_candidates_,
+                     count * sizeof(sampling::LogitCandidate),
+                     hipMemcpyDeviceToHost, stream_),
+      "compact verification candidates", error_msg);
+  const bool completed =
+      Check(hipStreamSynchronize(stream_), "compact verification", error_msg);
+  if (!copied || !completed)
+    return false;
+  for (std::size_t row = 0; row < rows; ++row)
+    output[row] = {
+        verification_candidates_host_ + row * kMtpCandidates +
+            batch.offsets[row],
+        kMtpCandidates + batch.offsets[row + 1] - batch.offsets[row]};
+  return true;
 }
 
 bool Executor::MtpForward(Session& session,

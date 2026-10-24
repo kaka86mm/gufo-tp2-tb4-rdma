@@ -132,6 +132,7 @@ public:
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt,
                        std::shared_ptr<qwen::vision::Encoder> encoder,
                        hipStream_t stream);
+  void PrepareVision(hipStream_t stream);
   void RestoreVisionLayout(const qwen::vision::RopeLayout& layout,
                            hipStream_t stream);
   [[nodiscard]] const qwen::vision::RopeLayout& VisionLayout() const noexcept {
@@ -207,6 +208,16 @@ private:
   /// Captured decode graphs by batch shape, and the shapes that ran eagerly
   /// once (the GEMM tier's arena must be grown before capture).
   std::unordered_map<std::uint64_t, hipGraphExec_t> graphs_;
+  /// The standing-exchange owner each captured graph registered, so its
+  /// communicator jobs are released when the graph is destroyed.
+  std::unordered_map<std::uint64_t, std::uint64_t> graph_standing_owners_;
+  /// Releases a standing-exchange owner; null without a replay-safe
+  /// transport. Copied from the executor options at first capture, when the
+  /// executor (which outlives the session) is still at hand.
+  std::function<void(std::uint64_t)> release_standing_;
+  /// The producer/dispatch state each graph's kernel arguments were
+  /// recorded against; replays with a different state read stale data.
+  std::unordered_map<std::uint64_t, std::string> graph_states_;
   std::unordered_set<std::uint64_t> warmed_;
   std::vector<void*> allocations_;
   std::size_t allocated_bytes_{0};
@@ -238,6 +249,9 @@ struct PrefillCheckpoint {
 /// sized once for `max_batch` tokens; longer prompts are fed in chunks.
 class Executor {
 public:
+  /// Prints and resets the per-exchange all-reduce checksum slots.
+  void PrintArChecksums() const;
+  void ResetArChecksums() const;
   /// A two-rank sum split into its start and its finish, so the GPU computes
   /// other rows while a partial is in flight. `start` queues the exchange of
   /// the partial at `data`, pending on the stream; `finish` waits for the
@@ -268,6 +282,12 @@ public:
     /// Called once the stream has drained after sums were queued: false with
     /// the first failure among them. Required with all_reduce under TP.
     std::function<bool(std::string*)> reduce_status;
+    /// Marks the transport as inside a graph recording pass (queued
+    /// exchanges then register as replayable standing jobs), tagged with the
+    /// owner id the graph's standing jobs will carry.
+    std::function<void(bool, std::uint64_t)> set_recording;
+    /// Releases the standing jobs of a destroyed graph.
+    std::function<void(std::uint64_t)> release_standing;
     /// Diagnostic observer called with every MoE input and, under TP, every
     /// reduced MoE output, in forward order: a device buffer of rows x hidden
     /// floats pending on the given stream. Null in production; probes set it
@@ -367,7 +387,7 @@ public:
     std::int32_t* token{nullptr};
     MtpCandidateLogits* candidates{nullptr};
     MtpTrace* trace{nullptr};  ///< final-row diagnostic; disables graph capture
-    /// Prefill needs only persistent KV. A subsequent full forward with
+    /// Prefill and headless steps need only persistent KV. A full forward with
     /// known trunk hidden rows is required before heads/recursive proposals.
     bool kv_only{false};
     /// Draft through the small head (the output() prefix plus the
@@ -382,6 +402,7 @@ public:
     Session* session;
     std::span<const std::int32_t> tokens;
     std::int32_t hidden_row;
+    bool kv_only{false};
   };
   /// Copies output() rows `ids` into the session's draft table from slot
   /// `first` on. Enqueued on stream(); never during graph capture.
@@ -411,6 +432,14 @@ public:
   /// Greedy verification keeps full logit rows on the GPU, including penalties.
   [[nodiscard]] bool GreedyMtpPredictions(
       std::span<ArgmaxCandidate> predictions,
+      const sampling::SamplerState& sampler,
+      std::span<const std::int32_t> drafts, std::string* error_msg) const;
+  [[nodiscard]] static bool CanCompactMtpVerification(
+      const sampling::SamplerState& sampler);
+  /// Candidate spans remain valid until this executor next verifies a
+  /// request. One transfer serves all rows; no full CPU rows are reconstructed.
+  [[nodiscard]] bool SampledMtpCandidates(
+      std::span<std::span<const sampling::LogitCandidate>> rows,
       const sampling::SamplerState& sampler,
       std::span<const std::int32_t> drafts, std::string* error_msg) const;
 
@@ -695,6 +724,13 @@ private:
   const DeviceModel* model_{nullptr};
   NgramTable* ngram_{nullptr};
   Options options_;
+  /// Distinct owner id per graph capture, threading graph destruction to
+  /// the transport's standing-job release.
+  mutable std::uint64_t next_standing_owner_{1};
+  /// Serializes graph launches' standing-fire windows across sessions:
+  /// interleaved replays' exchanges can swap past the receiver's reorder
+  /// tolerance.
+  mutable std::mutex replay_mutex_;
   [[nodiscard]] std::shared_ptr<SnapshotAllocator> GetSnapshotAllocator() const;
   mutable std::once_flag snapshot_allocator_once_;
   mutable std::shared_ptr<SnapshotAllocator> snapshot_allocator_;
@@ -822,6 +858,12 @@ private:
   /// Shared transient storage, grown only for penalty-aware verification.
   mutable sampling::TokenPenalty* verification_penalties_{nullptr};
   mutable std::size_t verification_penalty_capacity_{0};
+  static constexpr std::size_t kCompactPenaltyLimit = 4096;
+  std::uint32_t* verification_ids_{nullptr};
+  std::uint32_t* verification_scratch_ids_{nullptr};
+  sampling::LogitCandidate* verification_candidates_{nullptr};
+  sampling::LogitCandidate* verification_candidates_host_{nullptr};
+  mutable std::vector<sampling::TokenPenalty> verification_penalty_host_;
   /// Allocated only when concurrent decoding is first requested.
   mutable float* batch_logits_{nullptr};
   mutable Session::Control* batch_controls_{nullptr};

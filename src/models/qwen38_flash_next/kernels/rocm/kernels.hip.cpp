@@ -1342,14 +1342,32 @@ __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
     for (unsigned st = 0; st < kSteps; ++st) {
       const std::uint32_t i0 = i_base + st * stride;
       if constexpr (kWhole) {
-        // F32 rows of whole passes (k a multiple of stride * kSteps): every
-        // step is in range, so the four elements arrive as one 16-byte load.
-        const float4 w4 = reinterpret_cast<const float4*>(
-            static_cast<const void*>(wrow))[i0 / 4];
-        wv[st][0] = w4.x;
-        wv[st][1] = w4.y;
-        wv[st][2] = w4.z;
-        wv[st][3] = w4.w;
+        // Rows of whole passes (k a multiple of stride * kSteps): every step
+        // is in range, so the four elements arrive as one load: 16 bytes for
+        // F32, 8 bytes for F16/BF16 (widened exactly, as RowElement does).
+        if constexpr (type == WeightType::kF32) {
+          const float4 w4 = reinterpret_cast<const float4*>(
+              static_cast<const void*>(wrow))[i0 / 4];
+          wv[st][0] = w4.x;
+          wv[st][1] = w4.y;
+          wv[st][2] = w4.z;
+          wv[st][3] = w4.w;
+        } else {
+          static_assert(type == WeightType::kF16 || type == WeightType::kBF16);
+          const ushort4 h4 = reinterpret_cast<const ushort4*>(
+              static_cast<const void*>(wrow))[i0 / 4];
+          if constexpr (type == WeightType::kBF16) {
+            wv[st][0] = Bf16ToF32(h4.x);
+            wv[st][1] = Bf16ToF32(h4.y);
+            wv[st][2] = Bf16ToF32(h4.z);
+            wv[st][3] = Bf16ToF32(h4.w);
+          } else {
+            wv[st][0] = __half2float(__ushort_as_half(h4.x));
+            wv[st][1] = __half2float(__ushort_as_half(h4.y));
+            wv[st][2] = __half2float(__ushort_as_half(h4.z));
+            wv[st][3] = __half2float(__ushort_as_half(h4.w));
+          }
+        }
 #pragma unroll
         for (unsigned j = 0; j < tokens; ++j) {
           const float4 x4 = reinterpret_cast<const float4*>(
@@ -3619,6 +3637,39 @@ __global__ void StagePartialKernel(const float* __restrict__ partial,
   }
 }
 
+/// Re-arms a graph-replay exchange flag: the next round's stage or worker
+/// publishes the same constant value again, so the flag must read zero then.
+/// Sums `count` floats into a single double-precision accumulator written
+/// to `out` (a pinned host slot): the per-exchange all-reduce checksum.
+__global__ void DebugChecksumKernel(const float* __restrict__ data,
+                                    std::size_t count, double* out) {
+  __shared__ double partial[kThreads];
+  const std::size_t stride =
+      static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  double sum = 0.0;
+  for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+       i < count; i += stride) {
+    sum += static_cast<double>(data[i]);
+  }
+  partial[threadIdx.x] = sum;
+  __syncthreads();
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    double total = 0.0;
+    for (int i = 0; i < blockDim.x; ++i) {
+      total += partial[i];
+    }
+    *out = total;
+  }
+}
+
+__global__ void ResetFlagKernel(std::uint64_t* flag) {
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    __hip_atomic_store(flag, std::uint64_t{0}, __ATOMIC_RELEASE,
+                       __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+}
+
 __global__ void WaitValueKernel(const std::uint64_t* flag, std::uint64_t value,
                                 std::uint64_t ticks, std::uint32_t* timed_out) {
   const std::uint64_t start = wall_clock64();
@@ -3894,6 +3945,93 @@ __global__ void CopyKernel(const float* src, float* dst, std::size_t count) {
       blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
   if (i < count) {
     dst[i] = src[i];
+  }
+}
+
+template<bool First>
+__global__ void VerificationCandidateTileKernel(
+    const float* logits, GreedyPenaltyRows penalties,
+    const std::uint32_t* input, std::uint32_t* output, std::uint32_t size,
+    std::uint32_t vocab, std::uint32_t stride) {
+  using Sort = hipcub::BlockRadixSort<float, kThreads, 4, std::uint32_t>;
+  __shared__ Sort::TempStorage scratch;
+  __shared__ unsigned excluded[kMtpCandidateTile / 32];
+  __shared__ unsigned first_penalty;
+  const unsigned row = blockIdx.y;
+  const auto begin = blockIdx.x * kMtpCandidateTile;
+  if constexpr (First) {
+    if (threadIdx.x < kMtpCandidateTile / 32)
+      excluded[threadIdx.x] = 0;
+    if (threadIdx.x == 0) {
+      auto lo = penalties.offsets[row];
+      auto hi = penalties.offsets[row + 1];
+      while (lo < hi) {
+        const auto mid = lo + (hi - lo) / 2;
+        if (penalties.penalties[mid].token < begin)
+          lo = mid + 1;
+        else
+          hi = mid;
+      }
+      first_penalty = lo;
+    }
+    __syncthreads();
+    for (auto i = first_penalty + threadIdx.x; i < penalties.offsets[row + 1];
+         i += blockDim.x) {
+      const auto token = penalties.penalties[i].token;
+      if (token >= begin + kMtpCandidateTile)
+        break;
+      const auto offset = token - begin;
+      atomicOr(&excluded[offset / 32], 1U << (offset % 32));
+    }
+    __syncthreads();
+  }
+  float keys[4];
+  std::uint32_t ids[4];
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
+    const auto offset = threadIdx.x * 4 + j;
+    const auto i = begin + offset;
+    auto id = i < size ? (First ? i : input[std::size_t(row) * stride + i])
+                       : UINT32_MAX;
+    if constexpr (First) {
+      if ((excluded[offset / 32] >> (offset % 32)) & 1U)
+        id = UINT32_MAX;
+    }
+    const float value =
+        id < vocab ? logits[std::size_t(row) * vocab + id] : -INFINITY;
+    // Drop the ID too: a subsequent pass must never resurrect an excluded
+    // or nonfinite entry by reading its original logit.
+    ids[j] = isfinite(value) ? id : UINT32_MAX;
+    keys[j] = isfinite(value) ? (value == 0.0F ? 0.0F : value) : -INFINITY;
+  }
+  Sort(scratch).SortDescending(keys, ids);
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
+    const auto rank = threadIdx.x * 4 + j;
+    if (rank < kMtpCandidates)
+      output[std::size_t(row) * stride + blockIdx.x * kMtpCandidates + rank] =
+          ids[j];
+  }
+}
+
+__global__ void GatherVerificationCandidatesKernel(
+    const float* logits, GreedyPenaltyRows penalties, const std::uint32_t* ids,
+    sampling::LogitCandidate* out, std::uint32_t vocab, std::uint32_t stride) {
+  const auto row = blockIdx.x;
+  const auto count =
+      kMtpCandidates + penalties.offsets[row + 1] - penalties.offsets[row];
+  auto* destination = out + row * kMtpCandidates + penalties.offsets[row];
+  for (unsigned i = threadIdx.x; i < count; i += blockDim.x) {
+    const auto id =
+        i < kMtpCandidates
+            ? ids[std::size_t(row) * stride + i]
+            : penalties.penalties[penalties.offsets[row] + i - kMtpCandidates]
+                  .token;
+    destination[i] =
+        id < vocab
+            ? sampling::LogitCandidate{id,
+                                       logits[std::size_t(row) * vocab + id]}
+            : sampling::LogitCandidate{UINT32_MAX, -INFINITY};
   }
 }
 
@@ -5870,6 +6008,150 @@ __global__ void RoutedScatterKernel(const std::int32_t* __restrict__ ids,
 
 }  // namespace
 
+struct Q4_1Block {
+  __half d;
+  __half m;
+  std::uint8_t qs[16];
+};
+static_assert(sizeof(Q4_1Block) == 20, "block_q4_1 must be 20 bytes");
+
+/// One thread re-encodes one Q8_0 block as Q5_1 with ggml's reference
+/// quantizer: 32 levels over the block's own [min, max].
+__global__ void RequantQ8ToQ5_1Kernel(const Q8_0Block* __restrict__ src,
+                                      Q5_1Block* __restrict__ dst,
+                                      std::size_t blocks) {
+  const std::size_t b = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+  if (b >= blocks) {
+    return;
+  }
+  const Q8_0Block in = src[b];
+  const float scale = __half2float(in.d);
+  float x[32];
+  float lo = INFINITY;
+  float hi = -INFINITY;
+#pragma unroll
+  for (int j = 0; j < 32; ++j) {
+    x[j] = scale * static_cast<float>(in.qs[j]);
+    lo = fminf(lo, x[j]);
+    hi = fmaxf(hi, x[j]);
+  }
+  const float d = (hi - lo) / 31.0F;
+  const float inv = d != 0.0F ? 1.0F / d : 0.0F;
+  Q5_1Block out;
+  out.d = __float2half(d);
+  out.m = __float2half(lo);
+  out.qh = 0;
+#pragma unroll
+  for (int j = 0; j < 16; ++j) {
+    const auto q0 = static_cast<std::uint32_t>((x[j] - lo) * inv + 0.5F);
+    const auto q1 = static_cast<std::uint32_t>((x[j + 16] - lo) * inv + 0.5F);
+    out.qs[j] = static_cast<std::uint8_t>((q0 & 0x0FU) | ((q1 & 0x0FU) << 4U));
+    out.qh |= ((q0 & 0x10U) >> 4U) << j;
+    out.qh |= ((q1 & 0x10U) >> 4U) << (j + 16);
+  }
+  dst[b] = out;
+}
+
+bool RequantQ8_0ToQ5_1(const void* src, void* dst, std::size_t blocks,
+                       hipStream_t stream) {
+  if (blocks == 0) {
+    return false;
+  }
+  hipLaunchKernelGGL(
+      RequantQ8ToQ5_1Kernel, dim3(Blocks(blocks)), dim3(kThreads), 0, stream,
+      static_cast<const Q8_0Block*>(src), static_cast<Q5_1Block*>(dst), blocks);
+  return hipGetLastError() == hipSuccess;
+}
+
+/// One thread re-encodes one Q8_0 block as Q4_1. The scale is searched: for
+/// each candidate step the levels are rounded, then the step and minimum are
+/// refitted by least squares and the lowest squared error wins, which is
+/// markedly closer to the source than the plain [min, max] mapping.
+__global__ void RequantQ8ToQ4_1Kernel(const Q8_0Block* __restrict__ src,
+                                      Q4_1Block* __restrict__ dst,
+                                      std::size_t blocks) {
+  constexpr int kCandidates = 24;
+  const std::size_t b = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+  if (b >= blocks) {
+    return;
+  }
+  const Q8_0Block in = src[b];
+  const float scale = __half2float(in.d);
+  float x[32];
+  float lo = INFINITY;
+  float hi = -INFINITY;
+#pragma unroll
+  for (int j = 0; j < 32; ++j) {
+    x[j] = scale * static_cast<float>(in.qs[j]);
+    lo = fminf(lo, x[j]);
+    hi = fmaxf(hi, x[j]);
+  }
+  float best_d = (hi - lo) / 15.0F;
+  float best_m = lo;
+  if (hi > lo) {
+    float best_err = INFINITY;
+    for (int c = 0; c < kCandidates; ++c) {
+      const float iscale =
+          (15.0F + 0.1F * static_cast<float>(c - 8)) / (hi - lo);
+      float sl = 0.0F, sl2 = 0.0F, sx = 0.0F, slx = 0.0F;
+#pragma unroll
+      for (int j = 0; j < 32; ++j) {
+        const float l =
+            fminf(15.0F, fmaxf(0.0F, floorf((x[j] - lo) * iscale + 0.5F)));
+        sl += l;
+        sl2 += l * l;
+        sx += x[j];
+        slx += l * x[j];
+      }
+      const float det = 32.0F * sl2 - sl * sl;
+      if (det <= 0.0F) {
+        continue;
+      }
+      float d = (32.0F * slx - sl * sx) / det;
+      float m = (sx - d * sl) / 32.0F;
+      d = __half2float(__float2half(d));
+      m = __half2float(__float2half(m));
+      float err = 0.0F;
+#pragma unroll
+      for (int j = 0; j < 32; ++j) {
+        const float l =
+            fminf(15.0F, fmaxf(0.0F, floorf((x[j] - lo) * iscale + 0.5F)));
+        const float r = x[j] - (d * l + m);
+        err += r * r;
+      }
+      if (err < best_err) {
+        best_err = err;
+        best_d = d;
+        best_m = m;
+      }
+    }
+  }
+  const float inv = best_d != 0.0F ? 1.0F / best_d : 0.0F;
+  Q4_1Block out;
+  out.d = __float2half(best_d);
+  out.m = __float2half(best_m);
+#pragma unroll
+  for (int j = 0; j < 16; ++j) {
+    const auto q0 = static_cast<std::uint32_t>(
+        fminf(15.0F, fmaxf(0.0F, floorf((x[j] - best_m) * inv + 0.5F))));
+    const auto q1 = static_cast<std::uint32_t>(
+        fminf(15.0F, fmaxf(0.0F, floorf((x[j + 16] - best_m) * inv + 0.5F))));
+    out.qs[j] = static_cast<std::uint8_t>((q0 & 0x0FU) | ((q1 & 0x0FU) << 4U));
+  }
+  dst[b] = out;
+}
+
+bool RequantQ8_0ToQ4_1(const void* src, void* dst, std::size_t blocks,
+                       hipStream_t stream) {
+  if (blocks == 0) {
+    return false;
+  }
+  hipLaunchKernelGGL(
+      RequantQ8ToQ4_1Kernel, dim3(Blocks(blocks)), dim3(kThreads), 0, stream,
+      static_cast<const Q8_0Block*>(src), static_cast<Q4_1Block*>(dst), blocks);
+  return hipGetLastError() == hipSuccess;
+}
+
 void EmbedTokens(const void* table, WeightType type, const std::int32_t* tokens,
                  float* res, std::uint32_t n_tokens, std::uint32_t hidden,
                  std::uint32_t streams, hipStream_t stream) {
@@ -7223,7 +7505,7 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope,
                       std::uint32_t skip_gate_heads) {
-  if (n_tokens < 1024 || weights == nullptr || input == nullptr ||
+  if (n_tokens == 0 || weights == nullptr || input == nullptr ||
       q_gamma == nullptr || k_gamma == nullptr || query == nullptr ||
       gate == nullptr || keys == nullptr || values == nullptr ||
       position == nullptr || heads == 0 || kv_heads == 0)
@@ -7668,7 +7950,7 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
   if (gpu_rows == 0) {
     gpu_rows = m;
   }
-  if (n_tokens < 1024 || k != 2560 || m % 512 != 0 || channels % 32 != 0 ||
+  if (n_tokens == 0 || k != 2560 || m % 512 != 0 || channels % 32 != 0 ||
       channels == 0 || channels >= m || kernel != kSsmConvTaps ||
       gpu_rows > m || gpu_rows % 256 != 0 || gpu_rows < channels) {
     return false;
@@ -7695,10 +7977,10 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
 template<WeightType type, unsigned tokens>
 void LaunchSmallGemm(const void* w, const float* x, float* out, std::uint32_t m,
                      std::uint32_t k, hipStream_t stream) {
-  if constexpr (type == WeightType::kF32) {
-    // Rows of whole four-step passes (K 2560: router, GDN alpha/beta,
-    // indexer) take the unchecked 16-byte loads, four steps at a time at
-    // any width: the same products in the same order.
+  if constexpr (type != WeightType::kQ8_0) {
+    // Rows of whole four-step passes (K 2560: router and GDN alpha/beta in
+    // F16, indexer in BF16) take the unchecked vector loads, four steps at a
+    // time at any width: the same products in the same order.
     const bool aligned = (reinterpret_cast<std::uintptr_t>(w) |
                           reinterpret_cast<std::uintptr_t>(x)) %
                              16 ==
@@ -8308,6 +8590,16 @@ void WaitValue(const std::uint64_t* flag, std::uint64_t value,
                      ticks, timed_out);
 }
 
+void ResetFlag(std::uint64_t* flag, hipStream_t stream) {
+  hipLaunchKernelGGL(ResetFlagKernel, dim3(1), dim3(1), 0, stream, flag);
+}
+
+void DebugChecksum(const float* data, std::size_t count, double* out,
+                   hipStream_t stream) {
+  hipLaunchKernelGGL(DebugChecksumKernel, dim3(1), dim3(kThreads), 0, stream,
+                     data, count, out);
+}
+
 void AddRowsBroadcast(const float* embedding, float* residual,
                       std::uint32_t n_tokens, std::uint32_t hidden,
                       std::uint32_t streams, hipStream_t stream) {
@@ -8454,6 +8746,33 @@ void SelectMtpCandidates(const float* logits, std::uint32_t* ids,
 std::uint32_t MtpCandidateWorkspaceSize(std::uint32_t vocab) {
   const auto tiles = (vocab + 1023) / 1024;
   return (tiles > 2 ? tiles : 2) * kMtpCandidates;
+}
+
+void VerificationCandidates(const float* logits, GreedyPenaltyRows penalties,
+                            std::uint32_t* ids, std::uint32_t* scratch_ids,
+                            sampling::LogitCandidate* out, std::uint32_t rows,
+                            std::uint32_t vocab, hipStream_t stream) {
+  if (!logits || !ids || !scratch_ids || !out || !vocab || !rows || rows > 7)
+    throw std::invalid_argument("invalid verification candidate shape");
+  const auto stride = MtpCandidateWorkspaceSize(vocab);
+  const auto tiles = [](std::uint32_t n) { return 1U + (n - 1U) / 1024; };
+  auto size = vocab;
+  auto blocks = tiles(size);
+  VerificationCandidateTileKernel<true>
+      <<<dim3(blocks, rows), kThreads, 0, stream>>>(logits, penalties, nullptr,
+                                                    ids, size, vocab, stride);
+  auto* source = ids;
+  auto* destination = scratch_ids;
+  while (blocks > 1) {
+    size = blocks * kMtpCandidates;
+    blocks = tiles(size);
+    VerificationCandidateTileKernel<false>
+        <<<dim3(blocks, rows), kThreads, 0, stream>>>(
+            logits, penalties, source, destination, size, vocab, stride);
+    std::swap(source, destination);
+  }
+  GatherVerificationCandidatesKernel<<<rows, kThreads, 0, stream>>>(
+      logits, penalties, source, out, vocab, stride);
 }
 
 void MtpTopCandidates(const float* logits, std::uint32_t* ids,

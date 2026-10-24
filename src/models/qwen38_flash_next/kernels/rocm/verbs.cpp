@@ -41,6 +41,11 @@
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
 
+inline bool Tp2Trace() noexcept {
+  static const bool on = std::getenv("GUFO_TP2_DEBUG") != nullptr;
+  return on;
+}
+
 constexpr std::uint32_t kWireMagic = 0x47554654U;  // "GUFT"
 constexpr std::uint32_t kWireVersion = 8;
 constexpr std::uint32_t kPlacementMagic = 0x4755504CU;   // "GUPL"
@@ -55,7 +60,14 @@ constexpr std::uint32_t kReadyMagic = 0x47555244U;  // "GURD"
 // window holds one prefill batch's partial: 4,224 rows of 2,560 floats.
 constexpr std::size_t kWindowBytes = 48U << 20;
 constexpr std::size_t kWindows = 3;
-constexpr std::size_t kBufferBytes = kWindows * kWindowBytes;
+// Eager exchanges rotate windows 0..kWindows by their operation id, which
+// both ranks advance identically; standing graph sites use the upper
+// kWindows windows by their index within the recorded body, which the two
+// ranks also agree on. Keeping the rings apart makes every window choice
+// independent of rank-local capture state: one rank replaying a shape the
+// other re-captures no longer skews any rotation.
+constexpr std::size_t kStandingWindowBase = kWindows;
+constexpr std::size_t kBufferBytes = 2 * kWindows * kWindowBytes;
 constexpr std::size_t kDataOffset = 64;
 constexpr std::uint32_t kPostedReceives = 4;
 constexpr std::uint64_t kWriteTag = 1ULL << 63;
@@ -79,9 +91,17 @@ constexpr std::uint64_t kWaitSeconds = 240;
 // Flag words, a cache line apart: written by the GPU, by the host, and by a
 // GPU wait that timed out.
 constexpr std::size_t kReadyOffset = 0;
+// Per-site ready flags for captured exchanges: an eager pass's stage pulse
+// must never satisfy a standing job's fire (the shared flag let a stale
+// standing fire mid-eager-round and poison the peer's op sequence).
+constexpr std::size_t kStandingFlagOffset = 256;
+constexpr std::size_t kMaxStandingSites = 2400;
 constexpr std::size_t kArrivedOffset = 64;
-constexpr std::size_t kTimedOutOffset = 128;
-constexpr std::size_t kFlagBytes = 4096;
+constexpr std::size_t kGraphArrivedOffset = 128;
+// Must not alias kGraphArrivedOffset: a standing fire stores 1 there, and
+// CheckQueued would read it as a GPU wait timeout and poison the transport.
+constexpr std::size_t kTimedOutOffset = 192;
+constexpr std::size_t kFlagBytes = 32768;
 constexpr auto kCollectiveTimeout = std::chrono::seconds(30);
 // A living peer may fall far behind, e.g. while its n-gram reads wait on a
 // throttled SSD; a dead one closes the bootstrap socket, and a vanished host
@@ -564,6 +584,13 @@ public:
       return false;
     }
     wait_ticks_ = static_cast<std::uint64_t>(clock_khz) * 1000 * kWaitSeconds;
+    // GUFO_TP2_GRAPHS pins the exchange protocol for graph replay: two
+    // alternating windows, flag value 1, and consumer resets (see Work and
+    // the reset after the add). Both ranks must agree; the environment is
+    // set on both by the launcher. GUFO_TP2_LEGACY_VALUES keeps the
+    // monotonic flag values and drops the resets (a bisect switch).
+    graph_mode_ = std::getenv("GUFO_TP2_GRAPHS") != nullptr;
+    legacy_values_ = std::getenv("GUFO_TP2_LEGACY_VALUES") != nullptr;
 
     // Device windows when the RDMA device can register DMA-BUF memory, on both
     // ranks; otherwise mapped host windows. The choice needs no option: a
@@ -750,6 +777,24 @@ public:
   [[nodiscard]] int device_index() const noexcept override {
     return static_cast<int>(config_.device_index);
   }
+  [[nodiscard]] bool replay_safe() const noexcept override {
+    return graph_mode_;
+  }
+  void set_recording(bool active, std::uint64_t owner) noexcept override {
+    recording_ = active;
+    if (active) {
+      std::lock_guard jobs(jobs_mutex_);
+      standing_pools_.push_back({.owner = owner});
+    }
+  }
+  void release_standing(std::uint64_t owner) noexcept override {
+    std::lock_guard jobs(jobs_mutex_);
+    // The graph that pulsed these sites is gone; its pools would otherwise
+    // accumulate sites until capture registration exhausts the table.
+    std::erase_if(standing_pools_, [owner](const StandingPool& pool) {
+      return pool.owner == owner;
+    });
+  }
   [[nodiscard]] std::size_t MaxPartialBytes() const noexcept override {
     return kWindowBytes - data_offset_;
   }
@@ -806,6 +851,9 @@ public:
       Poison(error, "verbs operation scope ended with exchanges in flight");
       return false;
     }
+    // Standing jobs are NOT purged here: a captured graph outlives the
+    // request scope that recorded it, and its exchanges must keep firing
+    // on every replay. They retire only with the worker itself.
     bound_scope_.reset();
     return true;
   }
@@ -831,8 +879,9 @@ public:
       return nullptr;
     }
     std::string transfer_error;
-    const float* peer =
-        Transfer(*bound_scope_, next_operation_, bytes, &transfer_error);
+    const float* peer = Transfer(
+        *bound_scope_, next_operation_, bytes,
+        (next_operation_ % kWindows) * kWindowBytes, &transfer_error);
     if (peer == nullptr) {
       Poison(error, std::move(transfer_error));
       return nullptr;
@@ -906,7 +955,8 @@ public:
     return finished.peer;
   }
 
-  [[nodiscard]] bool QueuePartial(std::size_t bytes, QueuedPartial* partial,
+  [[nodiscard]] bool QueuePartial(std::size_t bytes, hipStream_t stream,
+                                   QueuedPartial* partial,
                                   std::string* error) override {
     std::lock_guard lock(mutex_);
     if (!CheckExchange(static_cast<const float*>(send_device_), bytes, error)) {
@@ -921,7 +971,18 @@ public:
       return false;
     }
     const std::uint64_t operation_id = next_operation_;
-    const std::size_t window = (operation_id % kWindows) * kWindowBytes;
+    // Eager exchanges rotate by their operation id, which both ranks advance
+    // once per real exchange, so no rank-local state (graph capture or
+    // replay) can skew the choice. Three windows: the executor's deferred
+    // MoE epilogue may queue an add two exchanges behind (see Communicator),
+    // so the peer's write for the exchange after next may land before that
+    // add reads.
+    const std::size_t window =
+        (recording_
+             ? kStandingWindowBase +
+                   (standing_pools_.back().sites.size() % kWindows)
+             : operation_id % kWindows) *
+        kWindowBytes;
     auto* flags = static_cast<std::uint8_t*>(flags_device_);
     *partial = {
         .send = reinterpret_cast<float*>(
@@ -931,18 +992,75 @@ public:
         .ready = reinterpret_cast<std::uint64_t*>(flags + kReadyOffset),
         .arrived =
             reinterpret_cast<const std::uint64_t*>(flags + kArrivedOffset),
-        // Flags start at zero, so exchange k publishes k + 1.
+        // Flags start at zero, so exchange k publishes k + 1; graph
+        // replay pins the value at 1 with consumer resets instead.
         .value = operation_id + 1,
         .arrivals = static_cast<std::uint32_t*>(arrivals_),
         .timed_out = reinterpret_cast<std::uint32_t*>(flags + kTimedOutOffset),
         .wait_ticks = wait_ticks_,
     };
+    if (recording_ && std::getenv("GUFO_TP2_EAGER_RECORD") == nullptr) {
+      // The stream is recording this exchange for graph replay: the GPU
+      // kernels will only run when the graph does, so nothing can satisfy a
+      // one-shot job now. Register a standing job with its own ready flag;
+      // the worker waits for the replay's stage pulse on that flag and
+      // re-queues the job after each firing.
+      std::lock_guard jobs(jobs_mutex_);
+      std::size_t sites = 0;
+      for (const auto& pool : standing_pools_) {
+        sites += pool.sites.size();
+      }
+      if (sites >= kMaxStandingSites || standing_pools_.empty()) {
+        // A full site table aborts this capture but must not kill the
+        // transport: eager exchanges stay usable, and the caller can fall
+        // back or retry once released pools free their sites.
+        SetError(error, "graph capture registered too many exchanges");
+        return false;
+      }
+      auto* site_ready = reinterpret_cast<std::uint64_t*>(
+          static_cast<std::uint8_t*>(flags_) + kStandingFlagOffset +
+          sites * sizeof(std::uint64_t));
+      *site_ready = 0;
+      partial->ready = site_ready;
+      partial->arrived = reinterpret_cast<const std::uint64_t*>(
+          static_cast<std::uint8_t*>(flags_) + kGraphArrivedOffset);
+      // The graph's WaitValue bakes this value: the standing fire stores
+      // constant 1 at the graph arrived flag, so the wait must check >= 1.
+      partial->value = 1;
+      standing_pools_.back().sites.push_back(
+          {.bytes = bytes,
+           .scope_id = *bound_scope_,
+           .operation_id = operation_id,
+           .queued = true,
+           .window = window,
+           .standing = true,
+           .standing_ready = site_ready});
+      if (Tp2Trace()) {
+        std::size_t total = 0;
+        for (const auto& pool : standing_pools_) {
+          total += pool.sites.size();
+        }
+        std::fprintf(stderr,
+                     "tp2dbg standing+ scope=%llu bytes=%zu total=%zu\n",
+                     static_cast<unsigned long long>(*bound_scope_), bytes,
+                     total);
+      }
+      // Wake the worker into its standing-pulse spin; it may be parked in
+      // the empty-queue wait from before any capture existed.
+      jobs_ready_.notify_one();
+      return true;
+    }
     {
       std::lock_guard jobs(jobs_mutex_);
       jobs_.push_back({.bytes = bytes,
                        .scope_id = *bound_scope_,
                        .operation_id = operation_id,
-                       .queued = true});
+                       .queued = true,
+                       .window = window});
+      if (Tp2Trace()) {
+        std::fprintf(stderr, "tp2dbg oneshot op=%llu bytes=%zu\n",
+                     static_cast<unsigned long long>(operation_id), bytes);
+      }
     }
     ++next_operation_;
     ++queued_;
@@ -976,6 +1094,15 @@ private:
     std::uint64_t operation_id{0};
     /// A QueuePartial exchange: the GPU stages it and waits for it.
     bool queued{false};
+    /// The send window this exchange stages into and writes from: fixed at
+    /// zero for graph replay (single flight), rotating for overlapped use.
+    std::size_t window{0};
+    /// A graph-captured exchange: registered once during capture, the
+    /// worker re-queues it after each firing so every replay re-posts it.
+    bool standing{false};
+    /// This standing site's own ready flag, written by the replayed stage
+    /// kernel and re-armed by the worker after each firing.
+    std::uint64_t* standing_ready{nullptr};
   };
   struct Finished {
     const float* peer{nullptr};
@@ -1215,17 +1342,23 @@ private:
   /// Communicator). Returns the peer's partial on the GPU, or null.
   [[nodiscard]] const float* Transfer(std::uint64_t scope_id,
                                       std::uint64_t operation_id,
-                                      std::size_t bytes, std::string* error) {
-    const std::size_t window = (operation_id % kWindows) * kWindowBytes;
+                                      std::size_t bytes, std::size_t window,
+                                      std::string* error) {
     if (gpu_windows_) {
-      return TransferWindow(scope_id, operation_id, bytes, error);
+      return TransferWindow(scope_id, operation_id, bytes, window, error);
     }
     const CollectiveHeader outgoing{
         .scope_id = scope_id,
         .operation_id = operation_id,
         .bytes = bytes,
     };
-    std::uint8_t* send = SendWindow(operation_id);
+    // The staged partial lives at the window the caller assigned. Queued
+    // exchanges and standing graph sites stage into their rotation window,
+    // which drifts from operation_id % kWindows once graph registration and
+    // replay fires advance the two counters differently: reading from
+    // SendWindow(operation_id) sent stale window bytes while the identity
+    // header still matched, silently corrupting the peer's partial.
+    std::uint8_t* send = static_cast<std::uint8_t*>(send_buffer_) + window;
     std::memcpy(send, &outgoing, sizeof(outgoing));
     ibv_sge sge{};
     sge.addr = reinterpret_cast<std::uint64_t>(send);
@@ -1281,6 +1414,7 @@ private:
   [[nodiscard]] const float* TransferWindow(std::uint64_t scope_id,
                                             std::uint64_t operation_id,
                                             std::size_t bytes,
+                                            std::size_t window,
                                             std::string* error) {
     while (next_window_receive_ <= operation_id + 1) {
       if (!PostWindowReceive(next_window_receive_, error)) {
@@ -1291,7 +1425,10 @@ private:
     const std::size_t length =
         (bytes + kGpuLengthAlign - 1) / kGpuLengthAlign * kGpuLengthAlign;
     ibv_sge sge{};
-    sge.addr = reinterpret_cast<std::uint64_t>(SendWindow(operation_id));
+    // Same rule as the host path: read the staged partial from the caller's
+    // window, not operation_id's.
+    sge.addr = reinterpret_cast<std::uint64_t>(
+        static_cast<std::uint8_t*>(send_device_) + window);
     sge.length = static_cast<std::uint32_t>(length);
     sge.lkey = send_gpu_.mr->lkey;
     ibv_send_wr wr{};
@@ -1355,18 +1492,120 @@ private:
   void Work() {
     const bool device =
         hipSetDevice(static_cast<int>(config_.device_index)) == hipSuccess;
+    std::uint32_t spin = 0;
     for (;;) {
       Job job;
+      bool have = false;
       {
         std::unique_lock jobs(jobs_mutex_);
-        jobs_ready_.wait(jobs, [this] {
-          return stopping_.load(std::memory_order_relaxed) || !jobs_.empty();
-        });
-        if (stopping_.load(std::memory_order_relaxed)) {
+        if (!jobs_.empty()) {
+          job = jobs_.front();
+          jobs_.pop_front();
+          have = true;
+        } else if (standing_pools_.empty()) {
+          jobs_ready_.wait(jobs, [this] {
+            return stopping_.load(std::memory_order_relaxed) ||
+                   !jobs_.empty() || !standing_pools_.empty();
+          });
+        }
+        if (!have && stopping_.load(std::memory_order_relaxed)) {
           return;
         }
-        job = jobs_.front();
-        jobs_.pop_front();
+      }
+      if (!have) {
+        // Replay firings: only one graph replays at a time, so at most one
+        // pool's front site pulses. Check EVERY pool's front flag.
+        Job front;
+        bool pulsed = false;
+        {
+          std::lock_guard jobs(jobs_mutex_);
+          for (auto& pool : standing_pools_) {
+            if (pool.sites.empty() || pool.sites.front().standing_ready ==
+                                          nullptr) {
+              continue;
+            }
+            if (std::atomic_ref<std::uint64_t>(*pool.sites.front()
+                                                   .standing_ready)
+                    .load(std::memory_order_acquire) == 1) {
+              front = pool.sites.front();
+              pulsed = true;
+              break;
+            }
+          }
+        }
+        if (!pulsed) {
+          if (Tp2Trace() && (++spin & 0xFFFFF) == 0) {
+            std::size_t pools = 0;
+            std::size_t sites = 0;
+            for (const auto& pool : standing_pools_) {
+              ++pools;
+              sites += pool.sites.size();
+            }
+            std::fprintf(stderr, "tp2dbg wspin idle pools=%zu sites=%zu\n",
+                         pools, sites);
+          }
+          if ((spin & 0x3FF) == 0x3FF) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+          } else {
+            SpinPause(&spin);
+          }
+          continue;
+        }
+        std::string fire_error;
+        std::uint64_t fire_op = 0;
+        {
+          std::lock_guard lock(mutex_);
+          fire_op = next_operation_++;
+        }
+        if (Tp2Trace()) {
+          // The window holds host-mapped memory in the host-write mode, so
+          // the staged partial can be checksummed here directly.
+          double sum = 0.0;
+          const auto* staged = reinterpret_cast<const float*>(
+              static_cast<std::uint8_t*>(send_device_) + front.window +
+              kDataOffset);
+          const std::size_t floats = front.bytes / sizeof(float);
+          for (std::size_t i = 0; i < floats; ++i) {
+            sum += static_cast<double>(staged[i]);
+          }
+          std::fprintf(stderr, "tp2dbg fire op=%llu bytes=%zu sum=%.2f\n",
+                       static_cast<unsigned long long>(fire_op), front.bytes,
+                       sum);
+        }
+        const float* peer =
+            Transfer(front.scope_id, fire_op, front.bytes, front.window,
+                     &fire_error);
+        if (peer == nullptr) {
+          std::lock_guard lock(mutex_);
+          poisoned_ = true;
+          if (first_error_.empty()) {
+            first_error_ = fire_error;
+          }
+          return;
+        }
+        // Re-arm this site's flag before publishing the arrival: the
+        // stream's next stage of this site runs only after this round's add.
+        if (front.standing_ready != nullptr) {
+          std::atomic_ref<std::uint64_t>(*front.standing_ready)
+              .store(0, std::memory_order_release);
+        } else {
+          Flag<std::uint64_t>(kReadyOffset)
+              .store(0, std::memory_order_release);
+        }
+        Flag<std::uint64_t>(kGraphArrivedOffset)
+            .store(1, std::memory_order_release);
+        {
+          std::lock_guard jobs(jobs_mutex_);
+          for (auto& pool : standing_pools_) {
+            if (!pool.sites.empty() &&
+                pool.sites.front().standing_ready == front.standing_ready) {
+              pool.sites.pop_front();
+              pool.sites.push_back(front);
+              break;
+            }
+          }
+        }
+        continue;
       }
       Finished finished{.bytes = job.bytes};
       std::string poisoned;
@@ -1379,9 +1618,24 @@ private:
       if (!poisoned.empty()) {
         finished.error = std::move(poisoned);
       } else if (job.queued) {
+        if (Tp2Trace()) {
+          std::fprintf(stderr, "tp2dbg wproc op=%llu bytes=%zu\n",
+                       static_cast<unsigned long long>(job.operation_id),
+                       job.bytes);
+        }
         if (WaitReady(job.operation_id + 1, &finished.error)) {
+          if (Tp2Trace()) {
+            std::fprintf(stderr, "tp2dbg wxfer op=%llu\n",
+                         static_cast<unsigned long long>(job.operation_id));
+          }
           finished.peer = Transfer(job.scope_id, job.operation_id, job.bytes,
-                                   &finished.error);
+                                   job.window, &finished.error);
+          if (Tp2Trace()) {
+            std::fprintf(stderr,
+                         "tp2dbg wdone op=%llu ok=%d\n",
+                         static_cast<unsigned long long>(job.operation_id),
+                         finished.peer != nullptr);
+          }
         }
       } else if (!device ||
                  hipStreamWaitEvent(copy_stream_, job.ready, 0) != hipSuccess ||
@@ -1392,8 +1646,10 @@ private:
                  hipStreamSynchronize(copy_stream_) != hipSuccess) {
         finished.error = "HIP overlapped staging failed";
       } else {
-        finished.peer = Transfer(job.scope_id, job.operation_id, job.bytes,
-                                 &finished.error);
+        finished.peer =
+            Transfer(job.scope_id, job.operation_id, job.bytes,
+                     (job.operation_id % kWindows) * kWindowBytes,
+                     &finished.error);
       }
       const bool failed = finished.peer == nullptr;
       if (failed || job.queued) {
@@ -1413,9 +1669,14 @@ private:
       if (job.queued) {
         // A failure releases every wait: the stream runs to its end and the
         // caller learns of the failure from CheckQueued.
+        if (Tp2Trace()) {
+          std::fprintf(stderr, "tp2dbg warrive op=%llu failed=%d\n",
+                       static_cast<unsigned long long>(job.operation_id),
+                       failed);
+        }
         Flag<std::uint64_t>(kArrivedOffset)
             .store(failed ? std::numeric_limits<std::uint64_t>::max()
-                          : job.operation_id + 1,
+                          : (job.operation_id + 1),
                    std::memory_order_release);
         continue;
       }
@@ -1537,14 +1798,8 @@ private:
           return false;
         }
         *received = true;
-      } else if (completion.wr_id == (kRecvTag | (operation + 1)) &&
-                 !early_receive_) {
-        early_receive_ = true;
-        early_immediate_ = imm;
-        early_length_ = completion.byte_len;
       } else {
-        SetError(error, "verbs peer message is out of order");
-        return false;
+        early_receives_.push_back({imm, completion.byte_len});
       }
       return true;
     }
@@ -1559,12 +1814,11 @@ private:
     const std::uint32_t imm = ntohl(completion.imm_data);
     if (imm == static_cast<std::uint32_t>(operation)) {
       *received = true;
-    } else if (imm == static_cast<std::uint32_t>(operation + 1) &&
-               !early_receive_) {
-      early_receive_ = true;
     } else {
-      SetError(error, "verbs peer write is out of order");
-      return false;
+      // Concurrent sessions interleave their exchanges on this one queue;
+      // stash any completion that is not the one being waited for instead
+      // of failing (the old single early slot deadlocked past one swap).
+      early_receives_.push_back({imm, completion.byte_len});
     }
     return true;
   }
@@ -1579,15 +1833,26 @@ private:
   [[nodiscard]] bool WaitForExchange(std::uint64_t operation,
                                      const ExpectedReceive& expected,
                                      std::string* error) {
-    bool received = std::exchange(early_receive_, false);
-    if (received && expected.window &&
-        (early_immediate_ != expected.immediate ||
-         early_length_ != expected.length)) {
-      SetError(error, "verbs collective identity or size mismatch at " +
-                          std::to_string(operation) + ": length " +
-                          std::to_string(early_length_) + " expected " +
-                          std::to_string(expected.length));
-      return false;
+    // The window path tags completions with ExchangeImmediate; host-write
+    // transfers carry the raw operation id.
+    const std::uint32_t want =
+        expected.window ? expected.immediate
+                        : static_cast<std::uint32_t>(operation);
+    bool received = false;
+    for (auto it = early_receives_.begin(); it != early_receives_.end();
+         ++it) {
+      if (it->immediate == want) {
+        if (expected.window && it->length != expected.length) {
+          SetError(error, "verbs collective identity or size mismatch at " +
+                              std::to_string(operation) + ": length " +
+                              std::to_string(it->length) + " expected " +
+                              std::to_string(expected.length));
+          return false;
+        }
+        received = true;
+        early_receives_.erase(it);
+        break;
+      }
     }
     const auto start = std::chrono::steady_clock::now();
     const auto spin_deadline = start + kExchangeSpinWindow;
@@ -1759,6 +2024,12 @@ private:
   GpuWindows send_gpu_;
   GpuWindows recv_gpu_;
   bool gpu_windows_{false};
+  bool graph_mode_{false};
+  bool legacy_values_{false};
+  /// Set by the executor around a recording pass; routing exchanges by this
+  /// flag is deterministic where hipStreamIsCapturing can disagree with the
+  /// recording mid-body.
+  bool recording_{false};
   std::string gpu_unavailable_;
   std::size_t data_offset_{kDataOffset};
   // The next exchange whose device receive window is not yet posted.
@@ -1775,13 +2046,14 @@ private:
   // Monotonic for the communicator lifetime; scope_id supplies request
   // identity.
   std::uint64_t next_operation_{0};
-  // The peer's write for the next exchange, seen while this rank was still
-  // waiting for its own write of the current one.
-  bool early_receive_{false};
-  // With device windows: the early receive's immediate and length, checked
-  // once its exchange is current.
-  std::uint32_t early_immediate_{0};
-  std::uint32_t early_length_{0};
+  // Completions that arrived while their exchange was not the one being
+  // waited for: concurrent sessions interleave on this one queue, so the
+  // reorder buffer is a deque rather than a single slot.
+  struct EarlyReceive {
+    std::uint32_t immediate{0};
+    std::uint32_t length{0};
+  };
+  std::deque<EarlyReceive> early_receives_;
   // With device windows: sends whose completion has been seen, in order.
   std::uint64_t sends_done_{0};
   bool poisoned_{false};
@@ -1798,6 +2070,17 @@ private:
   hipStream_t copy_stream_{nullptr};
   std::array<hipEvent_t, kStartedExchanges> ready_events_{};
   std::deque<Job> jobs_;
+  /// Standing exchanges grouped by the graph that recorded them: only one
+  /// graph replays at a time, and its sites must not queue behind another
+  /// graph's idle sites.
+  struct StandingPool {
+    std::deque<Job> sites;
+    /// The graph this pool pulses for; zero only for pools pushed before
+    /// owners existed. Released when the graph is destroyed.
+    std::uint64_t owner{0};
+  };
+  std::deque<StandingPool> standing_pools_;
+  std::size_t active_pool_{0};
   std::deque<Finished> finished_;
   std::atomic<bool> stopping_{false};
   std::mutex jobs_mutex_;

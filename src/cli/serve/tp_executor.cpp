@@ -663,6 +663,9 @@ TextRunnerDescriptor TpMirroredRunner::Descriptor() const {
   // An in-pass checkpoint would capture inside a call rank 1 cannot mirror
   // yet; the scheduler then splits the pass at the boundary and snapshots.
   descriptor.capabilities.in_pass_checkpoint = false;
+  // Rolling back an interrupted prefill needs the call to stop mid-pass,
+  // where rank 1 would be left inside an exchange; calls here always finish.
+  descriptor.capabilities.prefill_rollback = false;
   if (descriptor.persistence.has_value()) {
     // Rank 0's files hold its half and name rank 1's: neither a one-host
     // server nor a lone rank can restore them.
