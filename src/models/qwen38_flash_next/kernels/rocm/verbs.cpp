@@ -1404,15 +1404,15 @@ private:
     if (Tp2Trace()) {
       // The peer's delivered partial, checksummed before the GPU adds it:
       // this must equal the peer's staged sum at the same operation.
-      double sum = 0.0;
+      std::uint64_t sum = 0;
       const auto* delivered = reinterpret_cast<const float*>(
           static_cast<const std::uint8_t*>(recv_buffer_) + window +
           kDataOffset);
       const std::size_t floats = bytes / sizeof(float);
       for (std::size_t i = 0; i < floats; ++i) {
-        sum += static_cast<double>(delivered[i]);
+        sum += reinterpret_cast<const std::uint32_t*>(delivered)[i];
       }
-      std::fprintf(stderr, "tp2dbg recv op=%llu bytes=%zu sum=%.17g\n",
+      std::fprintf(stderr, "tp2dbg recv op=%llu bytes=%zu sum=%llu\n",
                    static_cast<unsigned long long>(operation_id), bytes, sum);
     }
     return reinterpret_cast<const float*>(
@@ -1575,15 +1575,15 @@ private:
         if (Tp2Trace()) {
           // The window holds host-mapped memory in the host-write mode, so
           // the staged partial can be checksummed here directly.
-          double sum = 0.0;
+          std::uint64_t sum = 0;
           const auto* staged = reinterpret_cast<const float*>(
               static_cast<std::uint8_t*>(send_device_) + front.window +
               kDataOffset);
           const std::size_t floats = front.bytes / sizeof(float);
           for (std::size_t i = 0; i < floats; ++i) {
-            sum += static_cast<double>(staged[i]);
+            sum += reinterpret_cast<const std::uint32_t*>(staged)[i];
           }
-          std::fprintf(stderr, "tp2dbg fire op=%llu bytes=%zu sum=%.17g\n",
+          std::fprintf(stderr, "tp2dbg fire op=%llu bytes=%zu sum=%llu\n",
                        static_cast<unsigned long long>(fire_op), front.bytes,
                        sum);
         }
@@ -1640,16 +1640,16 @@ private:
         }
         if (WaitReady(job.operation_id + 1, &finished.error)) {
           if (Tp2Trace()) {
-            double sum = 0.0;
+            std::uint64_t sum = 0;
             const auto* staged = reinterpret_cast<const float*>(
                 static_cast<std::uint8_t*>(send_device_) + job.window +
                 kDataOffset);
             const std::size_t floats = job.bytes / sizeof(float);
             for (std::size_t i = 0; i < floats; ++i) {
-              sum += static_cast<double>(staged[i]);
+              sum += reinterpret_cast<const std::uint32_t*>(staged)[i];
             }
             std::fprintf(stderr,
-                         "tp2dbg wxfer op=%llu bytes=%zu sum=%.17g\n",
+                         "tp2dbg wxfer op=%llu bytes=%zu sum=%llu\n",
                          static_cast<unsigned long long>(job.operation_id),
                          job.bytes, sum);
           }

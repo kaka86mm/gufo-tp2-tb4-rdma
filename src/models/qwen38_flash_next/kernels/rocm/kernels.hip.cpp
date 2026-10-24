@@ -3646,13 +3646,15 @@ __global__ void DebugChecksumKernel(const float* __restrict__ data,
   __shared__ double partial[kThreads];
   const std::size_t stride =
       static_cast<std::size_t>(gridDim.x) * blockDim.x;
-  double sum = 0.0;
+  // A bit-pattern sum: any single flipped bit changes it, where a value
+  // sum can round a small element's difference away behind a large one.
+  std::uint64_t sum = 0;
   for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x +
                        threadIdx.x;
        i < count; i += stride) {
-    sum += static_cast<double>(data[i]);
+    sum += reinterpret_cast<const std::uint32_t*>(data)[i];
   }
-  partial[threadIdx.x] = sum;
+  partial[threadIdx.x] = static_cast<double>(sum);
   __syncthreads();
   if (threadIdx.x == 0 && blockIdx.x == 0) {
     double total = 0.0;
