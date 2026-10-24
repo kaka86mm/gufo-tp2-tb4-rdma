@@ -3010,6 +3010,33 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   // Narrow batches split each row's key tiles over kAttnSplits blocks so a
   // decode step at depth fills the device.
   const bool split = !MatrixRows(n_tokens);
+  if (std::getenv("GUFO_TP2_ATTNCHK") != nullptr && capture_depth == 0) {
+    // Cross-rank determinism probe: checksum this attention's query and the
+    // KV rows it reads (bit patterns as floats; only equality matters).
+    static thread_local double* attn_debug = nullptr;
+    if (attn_debug == nullptr &&
+        hipHostMalloc(&attn_debug, 3 * sizeof(double),
+                      hipHostMallocDefault) != hipSuccess) {
+      attn_debug = nullptr;
+    }
+    if (attn_debug != nullptr) {
+      const std::size_t kv_floats =
+          static_cast<std::size_t>(*pos + n_tokens) * heads.attn_kv *
+          heads.attn_dim / 2;
+      DebugChecksum(reinterpret_cast<const float*>(s_.q),
+                    heads.attn * heads.attn_dim / 2 * n_tokens, attn_debug,
+                    stream_);
+      DebugChecksum(reinterpret_cast<const float*>(s.k_cache), kv_floats,
+                    attn_debug + 1, stream_);
+      DebugChecksum(reinterpret_cast<const float*>(s.v_cache), kv_floats,
+                    attn_debug + 2, stream_);
+      if (hipStreamSynchronize(stream_) == hipSuccess) {
+        std::fprintf(stderr,
+                     "tp2dbg attnchk q=%.2f k=%.2f v=%.2f\n", attn_debug[0],
+                     attn_debug[1], attn_debug[2]);
+      }
+    }
+  }
   rocm::Attention(
       s_.q, s.k_cache, s.v_cache, mask, mask_words_, s_.ctx,
       split ? s_.attn_partials : nullptr, kAttnSplits, n_tokens, pos,
@@ -3113,7 +3140,7 @@ void Executor::PrintArChecksums() const {
     return;
   }
   std::fprintf(stderr, "tp2dbg archk n=%zu", ar_debug_count);
-  for (std::size_t i = 0; i < ar_debug_count && i < 16; ++i) {
+  for (std::size_t i = 0; i < ar_debug_count && i < 256; ++i) {
     std::fprintf(stderr, " [%.1f]", ar_debug_slots[i]);
   }
   std::fprintf(stderr, "\n");
