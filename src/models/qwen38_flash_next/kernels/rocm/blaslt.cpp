@@ -25,12 +25,6 @@ bool OwnBf16(hipDataType type, int m, int k) {
          (m == 512 || m == 256 || m == 128 || m == 64);
 }
 
-bool OwnBf16(hipDataType type, int m, int k) {
-  // The indexer query and key projections, and a TP2 rank's halves.
-  return type == HIP_R_16BF && k == 2560 &&
-         (m == 512 || m == 256 || m == 128 || m == 64);
-}
-
 }  // namespace
 
 struct BlasLt::Plan {
