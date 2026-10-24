@@ -1412,7 +1412,7 @@ private:
       for (std::size_t i = 0; i < floats; ++i) {
         sum += static_cast<double>(delivered[i]);
       }
-      std::fprintf(stderr, "tp2dbg recv op=%llu bytes=%zu sum=%.2f\n",
+      std::fprintf(stderr, "tp2dbg recv op=%llu bytes=%zu sum=%.17g\n",
                    static_cast<unsigned long long>(operation_id), bytes, sum);
     }
     return reinterpret_cast<const float*>(
@@ -1548,7 +1548,8 @@ private:
           }
         }
         if (!pulsed) {
-          if (Tp2Trace() && (++spin & 0xFFFFF) == 0) {
+          if (Tp2Trace() && std::getenv("GUFO_TP2_ATTNCHK") == nullptr &&
+              (++spin & 0xFFFFF) == 0) {
             std::size_t pools = 0;
             std::size_t sites = 0;
             for (const auto& pool : standing_pools_) {
@@ -1582,7 +1583,7 @@ private:
           for (std::size_t i = 0; i < floats; ++i) {
             sum += static_cast<double>(staged[i]);
           }
-          std::fprintf(stderr, "tp2dbg fire op=%llu bytes=%zu sum=%.2f\n",
+          std::fprintf(stderr, "tp2dbg fire op=%llu bytes=%zu sum=%.17g\n",
                        static_cast<unsigned long long>(fire_op), front.bytes,
                        sum);
         }
@@ -1648,7 +1649,7 @@ private:
               sum += static_cast<double>(staged[i]);
             }
             std::fprintf(stderr,
-                         "tp2dbg wxfer op=%llu bytes=%zu sum=%.2f\n",
+                         "tp2dbg wxfer op=%llu bytes=%zu sum=%.17g\n",
                          static_cast<unsigned long long>(job.operation_id),
                          job.bytes, sum);
           }

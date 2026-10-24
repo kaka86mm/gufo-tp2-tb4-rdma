@@ -3032,7 +3032,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                     attn_debug + 2, stream_);
       if (hipStreamSynchronize(stream_) == hipSuccess) {
         std::fprintf(stderr,
-                     "tp2dbg attnchk q=%.2f k=%.2f v=%.2f\n", attn_debug[0],
+                     "tp2dbg attnchk q=%.17g k=%.2f v=%.2f\n", attn_debug[0],
                      attn_debug[1], attn_debug[2]);
       }
     }
@@ -3139,11 +3139,16 @@ void Executor::PrintArChecksums() const {
   if (ar_debug_slots == nullptr || ar_debug_count == 0) {
     return;
   }
-  std::fprintf(stderr, "tp2dbg archk n=%zu", ar_debug_count);
+  // One write: per-slot fprintf interleaves with worker spin logs on
+  // stderr, tearing the line mid-stream.
+  std::string line = "tp2dbg archk n=" + std::to_string(ar_debug_count);
+  char slot[48];
   for (std::size_t i = 0; i < ar_debug_count && i < 256; ++i) {
-    std::fprintf(stderr, " [%.1f]", ar_debug_slots[i]);
+    std::snprintf(slot, sizeof(slot), " [%.17g]", ar_debug_slots[i]);
+    line += slot;
   }
-  std::fprintf(stderr, "\n");
+  line += "\n";
+  std::fwrite(line.data(), 1, line.size(), stderr);
 }
 
 void Executor::ResetArChecksums() const { ar_debug_count = 0; }
