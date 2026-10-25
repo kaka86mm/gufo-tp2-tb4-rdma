@@ -3083,9 +3083,27 @@ Executor::TwoRankAllReduce(std::shared_ptr<Communicator> communicator,
       }
       (void)hipEventRecord(before, stream);
     }
+    // One-shot forensic: dump actual float values around a chosen exchange
+    // so the two ranks' local partial, delivered partial and summed result
+    // can be compared element by element (checksums cannot decompose).
+    static thread_local const char* dump_op_env =
+        std::getenv("GUFO_TP2_DUMP_OP");
+    const bool want_dump =
+        dump_op_env != nullptr &&
+        communicator->NextOperationForDump() ==
+            static_cast<std::uint64_t>(std::atoll(dump_op_env));
     Communicator::QueuedPartial queued;
     if (!communicator->QueuePartial(bytes, stream, &queued, error)) {
       return false;
+    }
+    if (want_dump) {
+      std::fprintf(stderr, "tp2dbg dump-pre op bytes=%zu\n", bytes);
+      const float* local = static_cast<const float*>(data);
+      std::fprintf(stderr, "tp2dbg dump-local");
+      for (std::size_t i = 0; i < 64; ++i) {
+        std::fprintf(stderr, " %.9g", local[i]);
+      }
+      std::fprintf(stderr, "\n");
     }
     StagePartial(data, queued.send, bytes / sizeof(float), queued.arrivals,
                  queued.ready, queued.value, stream);
@@ -3115,6 +3133,22 @@ Executor::TwoRankAllReduce(std::shared_ptr<Communicator> communicator,
       DebugChecksum(data, bytes / sizeof(float),
                     ar_debug_slots + ar_debug_count, stream);
       ++ar_debug_count;
+    }
+    if (want_dump) {
+      if (hipStreamSynchronize(stream) == hipSuccess) {
+        const float* summed = static_cast<const float*>(data);
+        const float* remote = queued.peer;
+        std::fprintf(stderr, "tp2dbg dump-post");
+        for (std::size_t i = 0; i < 64; ++i) {
+          std::fprintf(stderr, " %.9g", summed[i]);
+        }
+        std::fprintf(stderr, "\n");
+        std::fprintf(stderr, "tp2dbg dump-remote");
+        for (std::size_t i = 0; i < 64; ++i) {
+          std::fprintf(stderr, " %.9g", remote[i]);
+        }
+        std::fprintf(stderr, "\n");
+      }
     }
     if (ar_timed) {
       (void)hipEventRecord(after, stream);

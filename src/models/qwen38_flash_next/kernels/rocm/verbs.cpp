@@ -780,6 +780,10 @@ public:
   [[nodiscard]] bool replay_safe() const noexcept override {
     return graph_mode_;
   }
+  [[nodiscard]] std::uint64_t NextOperationForDump() const noexcept override {
+    const std::lock_guard lock(mutex_);
+    return next_operation_;
+  }
   void set_recording(bool active, std::uint64_t owner) noexcept override {
     recording_ = active;
     if (active) {

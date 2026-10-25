@@ -35,6 +35,10 @@ public:
   /// exchanges register as standing jobs deterministically. `owner` names the
   /// graph being recorded: its standing jobs live exactly as long as it does.
   virtual void set_recording(bool active, std::uint64_t owner) noexcept {}
+  /// The operation id the next eager exchange will take (diagnostics).
+  [[nodiscard]] virtual std::uint64_t NextOperationForDump() const noexcept {
+    return 0;
+  }
   /// Drops the standing jobs of a destroyed graph, freeing their site flags.
   virtual void release_standing(std::uint64_t owner) noexcept {}
   /// The largest partial one exchange carries.
