@@ -3161,8 +3161,8 @@ Executor::TwoRankAllReduce(std::shared_ptr<Communicator> communicator,
         DebugChecksum(data, bytes / sizeof(float),
                       ar_local_slots + ar_debug_count, stream);
         if (ar_peer_slots != nullptr) {
-          DebugChecksum(queued.peer, bytes / sizeof(float),
-                        ar_peer_slots + ar_debug_count, stream);
+          DebugChecksumCoherent(queued.peer, bytes / sizeof(float),
+                                ar_peer_slots + ar_debug_count, stream);
         }
       }
     }

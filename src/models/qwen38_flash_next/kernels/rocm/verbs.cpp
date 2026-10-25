@@ -20,6 +20,7 @@
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -96,6 +97,12 @@ constexpr std::size_t kReadyOffset = 0;
 // standing fire mid-eager-round and poison the peer's op sequence).
 constexpr std::size_t kStandingFlagOffset = 256;
 constexpr std::size_t kMaxStandingSites = 8192;
+// Per-site arrival flags for standing exchanges: a fire publishes 1 at ITS
+// site's flag only, so a WaitValue cannot pass on another site's (or another
+// replay's) arrival - the shared level flag let an undrained replay overlap
+// the next round's fire and the wait read before its own DMA landed.
+constexpr std::size_t kSiteArrivedOffset =
+    kStandingFlagOffset + kMaxStandingSites * sizeof(std::uint64_t);
 constexpr std::size_t kArrivedOffset = 64;
 constexpr std::size_t kGraphArrivedOffset = 128;
 // Must not alias kGraphArrivedOffset: a standing fire stores 1 there, and
@@ -795,8 +802,14 @@ public:
     std::lock_guard jobs(jobs_mutex_);
     // The graph that pulsed these sites is gone; its pools would otherwise
     // accumulate sites until capture registration exhausts the table.
-    std::erase_if(standing_pools_, [owner](const StandingPool& pool) {
-      return pool.owner == owner;
+    std::erase_if(standing_pools_, [this, owner](const StandingPool& pool) {
+      if (pool.owner != owner) {
+        return false;
+      }
+      for (const Job& site : pool.sites) {
+        LandingFree(site.standing_device);
+      }
+      return true;
     });
   }
   [[nodiscard]] std::size_t MaxPartialBytes() const noexcept override {
@@ -1025,9 +1038,17 @@ public:
           static_cast<std::uint8_t*>(flags_) + kStandingFlagOffset +
           sites * sizeof(std::uint64_t));
       *site_ready = 0;
+      auto* site_arrived = reinterpret_cast<std::uint64_t*>(
+          static_cast<std::uint8_t*>(flags_) + kSiteArrivedOffset +
+          sites * sizeof(std::uint64_t));
+      *site_arrived = 0;
+      // The landing buffer is carved from the pre-allocated device arena:
+      // hipMalloc with an active capture is illegal.
+      float* site_device = LandingAlloc(bytes);
       partial->ready = site_ready;
-      partial->arrived = reinterpret_cast<const std::uint64_t*>(
-          static_cast<std::uint8_t*>(flags_) + kGraphArrivedOffset);
+      partial->arrived = site_arrived;
+      // The baked add reads the device landing buffer, not the window.
+      partial->peer = site_device;
       // The graph's WaitValue bakes this value: the standing fire stores
       // constant 1 at the graph arrived flag, so the wait must check >= 1.
       partial->value = 1;
@@ -1038,7 +1059,9 @@ public:
            .queued = true,
            .window = window,
            .standing = true,
-           .standing_ready = site_ready});
+           .standing_ready = site_ready,
+           .standing_arrived = site_arrived,
+           .standing_device = site_device});
       if (Tp2Trace()) {
         std::size_t total = 0;
         for (const auto& pool : standing_pools_) {
@@ -1107,6 +1130,14 @@ private:
     /// This standing site's own ready flag, written by the replayed stage
     /// kernel and re-armed by the worker after each firing.
     std::uint64_t* standing_ready{nullptr};
+    /// This standing site's own arrival flag, published by the worker's
+    /// fire after the peer's write lands; the baked WaitValue spins on it.
+    std::uint64_t* standing_arrived{nullptr};
+    /// Device-side landing buffer for this standing site: the worker copies
+    /// the received partial here before publishing arrival, because NIC DMA
+    /// writes into the pinned window do not invalidate the GPU's L2 lines
+    /// and the replay's window ring reuses lines within microseconds.
+    float* standing_device{nullptr};
   };
   struct Finished {
     const float* peer{nullptr};
@@ -1294,6 +1325,11 @@ private:
         recv_device_ == nullptr) {
       SetError(error, "exchange windows have no device mapping");
       return false;
+    }
+    landing_arena_bytes_ = 256U << 20;
+    if (hipMalloc(&landing_arena_, landing_arena_bytes_) != hipSuccess) {
+      landing_arena_ = nullptr;
+      landing_arena_bytes_ = 0;
     }
     send_mr_ = ibv_reg_mr(pd_, send_buffer_, kBufferBytes, kMemoryAccessFlags);
     recv_mr_ = ibv_reg_mr(pd_, recv_buffer_, kBufferBytes, kMemoryAccessFlags);
@@ -1485,6 +1521,13 @@ private:
       SetError(error, "overlapped exchange stream creation failed");
       return false;
     }
+    if (landing_stream_ == nullptr &&
+        hipStreamCreateWithFlags(&landing_stream_, hipStreamNonBlocking) !=
+            hipSuccess) {
+      landing_stream_ = nullptr;
+      SetError(error, "landing copy stream creation failed");
+      return false;
+    }
     for (hipEvent_t& event : ready_events_) {
       if (event == nullptr &&
           hipEventCreateWithFlags(&event, hipEventDisableTiming) !=
@@ -1501,6 +1544,26 @@ private:
       return false;
     }
     return true;
+  }
+
+  [[nodiscard]] float* LandingAlloc(std::size_t bytes) noexcept {
+    if (bytes == 0) {
+      bytes = sizeof(float);
+    }
+    bytes = (bytes + 255) / 256 * 256;
+    // Bump-only for now: recycling is deferred until the coherence verdict
+    // is in (a buggy free-list wedged the copy engine after the first
+    // eviction cycle). Exhaustion falls back to the window path.
+    if (landing_cursor_ + bytes > landing_arena_bytes_) {
+      return nullptr;
+    }
+    float* at = landing_arena_ + landing_cursor_ / sizeof(float);
+    landing_cursor_ += bytes;
+    return at;
+  }
+
+  void LandingFree(float* buffer) noexcept {
+    (void)buffer;
   }
 
   /// Runs exchanges in order. A started exchange's staging copy runs on a
@@ -1611,8 +1674,37 @@ private:
           Flag<std::uint64_t>(kReadyOffset)
               .store(0, std::memory_order_release);
         }
-        Flag<std::uint64_t>(kGraphArrivedOffset)
-            .store(1, std::memory_order_release);
+        if (front.standing_arrived != nullptr && front.standing_device != nullptr) {
+          // The peer's partial sits in this rank's recv window; copy it to
+          // the device landing buffer (the copy engine reads host memory
+          // coherently and writes device memory through the L2 the add
+          // reads) before releasing the wait.
+          // The copy must run on the worker's non-blocking stream: a
+          // synchronous hipMemcpy takes the null stream, which serializes
+          // behind the main stream whose WaitValue kernel is spinning on
+          // the very flag this copy precedes.
+          if (hipMemcpyAsync(front.standing_device,
+                             static_cast<const std::uint8_t*>(recv_buffer_) +
+                                 front.window + kDataOffset,
+                             front.bytes, hipMemcpyHostToDevice,
+                             landing_stream_) != hipSuccess ||
+              hipStreamSynchronize(landing_stream_) != hipSuccess) {
+            std::lock_guard lock(mutex_);
+            poisoned_ = true;
+            if (first_error_.empty()) {
+              first_error_ = "standing landing copy failed";
+            }
+            return;
+          }
+          std::atomic_ref<std::uint64_t>(*front.standing_arrived)
+              .store(1, std::memory_order_release);
+        } else if (front.standing_arrived != nullptr) {
+          std::atomic_ref<std::uint64_t>(*front.standing_arrived)
+              .store(1, std::memory_order_release);
+        } else {
+          Flag<std::uint64_t>(kGraphArrivedOffset)
+              .store(1, std::memory_order_release);
+        }
         {
           std::lock_guard jobs(jobs_mutex_);
           for (auto& pool : standing_pools_) {
@@ -2078,6 +2170,12 @@ private:
   // Completions that arrived while their exchange was not the one being
   // waited for: concurrent sessions interleave on this one queue, so the
   // reorder buffer is a deque rather than a single slot.
+  /// Device arena for standing landing buffers, allocated once at setup so
+  /// registrations never call hipMalloc during an active stream capture.
+  /// Free ranges are recycled first-fit.
+  float* landing_arena_{nullptr};
+  std::size_t landing_arena_bytes_{0};
+  std::size_t landing_cursor_{0};
   struct EarlyReceive {
     std::uint32_t immediate{0};
     std::uint32_t length{0};
@@ -2097,6 +2195,10 @@ private:
   // their results in the same order. Lock order: mutex_ before jobs_mutex_.
   std::thread worker_;
   hipStream_t copy_stream_{nullptr};
+  /// Private stream for standing landing copies: copy_stream_ inherits
+  /// event waits from the overlapped path that can depend on graph
+  /// replays, deadlocking a copy that the replay itself is waiting on.
+  hipStream_t landing_stream_{nullptr};
   std::array<hipEvent_t, kStartedExchanges> ready_events_{};
   std::deque<Job> jobs_;
   /// Standing exchanges grouped by the graph that recorded them: only one

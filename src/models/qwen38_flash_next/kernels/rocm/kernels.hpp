@@ -621,6 +621,8 @@ void ResetFlag(std::uint64_t* flag, hipStream_t stream);
 /// Sums `count` floats to a pinned host slot (per-exchange debug checksum).
 void DebugChecksum(const float* data, std::size_t count, double* out,
                    hipStream_t stream);
+void DebugChecksumCoherent(const float* data, std::size_t count, double* out,
+                           hipStream_t stream);
 
 inline constexpr std::uint32_t kArgmaxParts = 64;
 struct ArgmaxCandidate {

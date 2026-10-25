@@ -3600,14 +3600,19 @@ __global__ void AddRowsBroadcastKernel(const float* addend, float* residual,
                                        std::uint32_t hidden,
                                        std::uint32_t streams) {
   const std::uint32_t t = blockIdx.x;
-  // The addend arrives by NIC DMA into a pinned host window. The arrival
-  // flag ordering does not guarantee the GPU's cached view of the data
-  // lines is current (torn snoop visibility under load); volatile loads
-  // bypass the stale lines.
-  const volatile float* peer = addend;
+  // The addend arrives by NIC DMA into a pinned host window. DMA writes do
+  // not invalidate the GPU's L2 lines, and the standing window ring reuses
+  // a window within microseconds - plain loads hit lines cached by the
+  // add three sites ago (torn). Acquire atomics at system scope read
+  // coherently.
+  const std::uint32_t* peer =
+      reinterpret_cast<const std::uint32_t*>(addend);
   for (std::uint32_t i = threadIdx.x; i < streams * hidden; i += blockDim.x) {
+    const std::uint32_t bits = __hip_atomic_load(
+        peer + (static_cast<std::size_t>(t) * hidden + i % hidden),
+        __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
     residual[static_cast<std::size_t>(t) * streams * hidden + i] +=
-        peer[static_cast<std::size_t>(t) * hidden + i % hidden];
+        __uint_as_float(bits);
   }
 }
 
@@ -3646,6 +3651,33 @@ __global__ void StagePartialKernel(const float* __restrict__ partial,
 /// publishes the same constant value again, so the flag must read zero then.
 /// Sums `count` floats into a single double-precision accumulator written
 /// to `out` (a pinned host slot): the per-exchange all-reduce checksum.
+__global__ void DebugChecksumCoherentKernel(const float* __restrict__ data,
+                                            std::size_t count, double* out) {
+  __shared__ double partial[kThreads];
+  const std::size_t stride =
+      static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  // A bit-pattern sum through system-scope acquire atomics: immune to the
+  // stale L2 lines that NIC DMA writes leave behind.
+  std::uint64_t sum = 0;
+  const std::uint32_t* words =
+      reinterpret_cast<const std::uint32_t*>(data);
+  for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+       i < count; i += stride) {
+    sum += __hip_atomic_load(words + i, __ATOMIC_ACQUIRE,
+                             __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+  partial[threadIdx.x] = static_cast<double>(sum);
+  __syncthreads();
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    double total = 0.0;
+    for (int i = 0; i < blockDim.x; ++i) {
+      total += partial[i];
+    }
+    *out = total;
+  }
+}
+
 __global__ void DebugChecksumKernel(const float* __restrict__ data,
                                     std::size_t count, double* out) {
   __shared__ double partial[kThreads];
@@ -8599,6 +8631,12 @@ void WaitValue(const std::uint64_t* flag, std::uint64_t value,
 
 void ResetFlag(std::uint64_t* flag, hipStream_t stream) {
   hipLaunchKernelGGL(ResetFlagKernel, dim3(1), dim3(1), 0, stream, flag);
+}
+
+void DebugChecksumCoherent(const float* data, std::size_t count, double* out,
+                           hipStream_t stream) {
+  hipLaunchKernelGGL(DebugChecksumCoherentKernel, dim3(1), dim3(kThreads), 0,
+                     stream, data, count, out);
 }
 
 void DebugChecksum(const float* data, std::size_t count, double* out,
