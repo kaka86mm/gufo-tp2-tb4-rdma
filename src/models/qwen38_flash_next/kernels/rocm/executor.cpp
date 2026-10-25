@@ -35,6 +35,7 @@ namespace {
 // slots the checksum kernel writes to (graph-safe: the slot pointer is
 // baked per site at record time and written on every replay).
 double* ar_debug_slots = nullptr;
+double* ar_local_slots = nullptr;
 thread_local double* attn_debug_slots = nullptr;
 thread_local std::size_t attn_debug_count = 0;
 std::size_t ar_debug_count = 0;
@@ -3115,6 +3116,14 @@ Executor::TwoRankAllReduce(std::shared_ptr<Communicator> communicator,
     WaitValue(queued.arrived, queued.value, queued.wait_ticks, queued.timed_out,
               stream);
     const std::size_t rows = bytes / (sizeof(float) * hidden);
+    // The local partial before the add: decomposes a diverging post-add
+    // sum into a wrong local computation versus a wrong delivered one.
+    if (std::getenv("GUFO_TP2_DEBUG") != nullptr && ar_local_slots != nullptr) {
+      if (ar_debug_count < 256) {
+        DebugChecksum(data, bytes / sizeof(float),
+                      ar_local_slots + ar_debug_count, stream);
+      }
+    }
     if (rows != 0) {
       AddRowsBroadcast(queued.peer, data, static_cast<std::uint32_t>(rows),
                        hidden, 1, stream);
@@ -3128,6 +3137,13 @@ Executor::TwoRankAllReduce(std::shared_ptr<Communicator> communicator,
       if (hipHostMalloc(&ar_debug_slots, 256 * sizeof(double),
                         hipHostMallocDefault) != hipSuccess) {
         ar_debug_slots = nullptr;
+      }
+      if (ar_local_slots == nullptr &&
+          hipHostMalloc(&ar_local_slots, 256 * sizeof(double),
+                        hipHostMallocDefault) == hipSuccess) {
+        for (int i = 0; i < 256; ++i) {
+          ar_local_slots[i] = -1;
+        }
       }
     }
     const bool ar_trace = std::getenv("GUFO_TP2_DEBUG") != nullptr;
@@ -3211,6 +3227,13 @@ void Executor::PrintArChecksums() const {
   for (std::size_t i = 0; i < ar_debug_count && i < 256; ++i) {
     std::snprintf(slot, sizeof(slot), " [%.17g]", ar_debug_slots[i]);
     line += slot;
+  }
+  if (ar_local_slots != nullptr) {
+    line += " L";
+    for (std::size_t i = 0; i < ar_debug_count && i < 256; ++i) {
+      std::snprintf(slot, sizeof(slot), " [%.17g]", ar_local_slots[i]);
+      line += slot;
+    }
   }
   line += "\n";
   std::fwrite(line.data(), 1, line.size(), stderr);
