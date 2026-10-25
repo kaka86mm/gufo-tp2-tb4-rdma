@@ -3918,6 +3918,22 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
         return false;
       }
       session.graphs_.emplace(key, exec);
+      if (tp2_trace) {
+        // Pointers are rank-local; only their presence matters. The numeric
+        // fields must match the peer's recording of the same shape or the
+        // two graphs bake different producer state.
+        std::string normalized = dispatch_state();
+        std::size_t at = 0;
+        while ((at = normalized.find("x", at)) != std::string::npos) {
+          const std::size_t end = normalized.find(',', at);
+          const std::size_t stop = end == std::string::npos ? normalized.size() : end;
+          const bool nonzero = stop - at > 2;
+          normalized.replace(at, stop - at, nonzero ? "P" : "0");
+          ++at;
+        }
+        std::fprintf(stderr, "tp2dbg cap-state key=%llu %s\n",
+                     static_cast<unsigned long long>(key), normalized.c_str());
+      }
       session.graph_standing_owners_.emplace(key, standing_owner);
       if (!session.release_standing_) {
         // The executor outlives the session; the copied closure keeps the
