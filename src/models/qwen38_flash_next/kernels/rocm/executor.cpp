@@ -1429,23 +1429,30 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
       static_cast<std::size_t>(heads.ssm_v) * heads.ssm_dim * heads.ssm_dim;
   // Eviction-recycled allocations carry the dead session's bytes, and the
   // dead session's KV halves differ per rank - stale reads then diverge.
-  const bool zero_fresh = std::getenv("GUFO_TP2_ZEROKV") != nullptr;
-  const auto zeroing_alloc = [&](auto ptr, std::size_t count) {
-    if (zero_fresh) {
-      (void)hipMemsetAsync(ptr, 0, count * sizeof(*ptr), stream_);
-    }
-    return ptr;
-  };
+  const char* zerokv_env = std::getenv("GUFO_TP2_ZEROKV");
+  const bool zero_fresh = zerokv_env != nullptr;
+  // GUFO_TP2_ZEROKV=2 fills with a canary byte (0x3C) instead of zero: a
+  // value that differs from zero and is rank-symmetric, so any slot whose
+  // archk sum shifts between the zero and canary runs ingested unwritten
+  // rows - the reader's exact exchange - without needing cross-rank.
+  const int zerokv_fill = zero_fresh ? std::max(1, std::atoi(zerokv_env)) : 0;
+  const int fill_byte = zerokv_fill == 2 ? 0x3C : 0;
+  // Mode 3: no fill at all, only a device synchronization - separates a
+  // stale-content effect (falsified by the canary) from a timing race
+  // with the evicted session's in-flight GPU work.
+  if (zerokv_fill == 3) {
+    (void)hipDeviceSynchronize();
+  }
   for (std::uint32_t il = 0; il < c.num_layers; ++il) {
     if (c.IsLinearLayer(il)) {
       auto& l = s->linear_[il];
       l.conv_state =
           Alloc<float>(a, conv_elems, error_msg, &s->allocated_bytes_);
       l.state = Alloc<float>(a, state_elems, error_msg, &s->allocated_bytes_);
-      if (zero_fresh) {
-        (void)hipMemsetAsync(l.conv_state, 0,
+      if (zero_fresh && zerokv_fill != 3) {
+        (void)hipMemsetAsync(l.conv_state, fill_byte,
                              conv_elems * sizeof(float), stream_);
-        (void)hipMemsetAsync(l.state, 0, state_elems * sizeof(float),
+        (void)hipMemsetAsync(l.state, fill_byte, state_elems * sizeof(float),
                              stream_);
       }
     } else {
@@ -1453,18 +1460,18 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
       at.k_cache =
           Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
                         error_msg, &s->allocated_bytes_);
-      if (zero_fresh) {
+      if (zero_fresh && zerokv_fill != 3) {
         (void)hipMemsetAsync(
-            at.k_cache, 0,
+            at.k_cache, fill_byte,
             static_cast<std::size_t>(max_context) * kv_row * sizeof(__half),
             stream_);
       }
       at.v_cache =
           Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
                         error_msg, &s->allocated_bytes_);
-      if (zero_fresh) {
+      if (zero_fresh && zerokv_fill != 3) {
         (void)hipMemsetAsync(
-            at.v_cache, 0,
+            at.v_cache, fill_byte,
             static_cast<std::size_t>(max_context) * kv_row * sizeof(__half),
             stream_);
       }
