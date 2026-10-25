@@ -2610,14 +2610,7 @@ __global__ void SelectScoreKernel(const float* q, const __half* blocks,
     key[i] = reinterpret_cast<const std::uint32_t*>(
         blocks)[std::size_t{b} * kSelectDim / 2 + i];
   float total = 0.0F;
-#if __clang_major__ >= 23
-  // Newer LLVM versions hoist queries from all four unrolled heads,
-  // overflowing the scalar register file. LLVM 23 also spills into private
-  // memory. Keep one head live without changing the FMA or reduction order.
-#pragma unroll 1
-#else
 #pragma unroll
-#endif
   for (unsigned h = 0; h < kSelectHeads; ++h) {
     __builtin_amdgcn_sched_barrier(0);
     const auto* query = q + (std::size_t{t0} * kSelectHeads + h) * kSelectDim;
@@ -3607,9 +3600,14 @@ __global__ void AddRowsBroadcastKernel(const float* addend, float* residual,
                                        std::uint32_t hidden,
                                        std::uint32_t streams) {
   const std::uint32_t t = blockIdx.x;
+  // The addend arrives by NIC DMA into a pinned host window. The arrival
+  // flag ordering does not guarantee the GPU's cached view of the data
+  // lines is current (torn snoop visibility under load); volatile loads
+  // bypass the stale lines.
+  const volatile float* peer = addend;
   for (std::uint32_t i = threadIdx.x; i < streams * hidden; i += blockDim.x) {
     residual[static_cast<std::size_t>(t) * streams * hidden + i] +=
-        addend[static_cast<std::size_t>(t) * hidden + i % hidden];
+        peer[static_cast<std::size_t>(t) * hidden + i % hidden];
   }
 }
 

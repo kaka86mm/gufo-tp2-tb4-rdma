@@ -36,6 +36,7 @@ namespace {
 // baked per site at record time and written on every replay).
 double* ar_debug_slots = nullptr;
 double* ar_local_slots = nullptr;
+double* ar_peer_slots = nullptr;
 thread_local double* attn_debug_slots = nullptr;
 thread_local std::size_t attn_debug_count = 0;
 std::size_t ar_debug_count = 0;
@@ -3152,10 +3153,17 @@ Executor::TwoRankAllReduce(std::shared_ptr<Communicator> communicator,
     const std::size_t rows = bytes / (sizeof(float) * hidden);
     // The local partial before the add: decomposes a diverging post-add
     // sum into a wrong local computation versus a wrong delivered one.
+    // The peer window checksummed the same way forms the cross-rank
+    // invariant r0.R[i] == r1.L[i]: at a diverging slot the side whose R
+    // breaks against the peer's L read a bad peer window (snoop race).
     if (std::getenv("GUFO_TP2_DEBUG") != nullptr && ar_local_slots != nullptr) {
       if (ar_debug_count < 256) {
         DebugChecksum(data, bytes / sizeof(float),
                       ar_local_slots + ar_debug_count, stream);
+        if (ar_peer_slots != nullptr) {
+          DebugChecksum(queued.peer, bytes / sizeof(float),
+                        ar_peer_slots + ar_debug_count, stream);
+        }
       }
     }
     if (rows != 0) {
@@ -3177,6 +3185,13 @@ Executor::TwoRankAllReduce(std::shared_ptr<Communicator> communicator,
                         hipHostMallocDefault) == hipSuccess) {
         for (int i = 0; i < 256; ++i) {
           ar_local_slots[i] = -1;
+        }
+      }
+      if (ar_peer_slots == nullptr &&
+          hipHostMalloc(&ar_peer_slots, 256 * sizeof(double),
+                        hipHostMallocDefault) == hipSuccess) {
+        for (int i = 0; i < 256; ++i) {
+          ar_peer_slots[i] = -1;
         }
       }
     }
@@ -3266,6 +3281,13 @@ void Executor::PrintArChecksums() const {
     line += " L";
     for (std::size_t i = 0; i < ar_debug_count && i < 256; ++i) {
       std::snprintf(slot, sizeof(slot), " [%.17g]", ar_local_slots[i]);
+      line += slot;
+    }
+  }
+  if (ar_peer_slots != nullptr) {
+    line += " R";
+    for (std::size_t i = 0; i < ar_debug_count && i < 256; ++i) {
+      std::snprintf(slot, sizeof(slot), " [%.17g]", ar_peer_slots[i]);
       line += slot;
     }
   }
