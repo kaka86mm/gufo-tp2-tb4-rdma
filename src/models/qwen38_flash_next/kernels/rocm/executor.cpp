@@ -1427,20 +1427,47 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
       static_cast<std::size_t>(c.ssm_conv_kernel - 1) * heads.SsmConvChannels();
   const std::size_t state_elems =
       static_cast<std::size_t>(heads.ssm_v) * heads.ssm_dim * heads.ssm_dim;
+  // Eviction-recycled allocations carry the dead session's bytes, and the
+  // dead session's KV halves differ per rank - stale reads then diverge.
+  const bool zero_fresh = std::getenv("GUFO_TP2_ZEROKV") != nullptr;
+  const auto zeroing_alloc = [&](auto ptr, std::size_t count) {
+    if (zero_fresh) {
+      (void)hipMemsetAsync(ptr, 0, count * sizeof(*ptr), stream_);
+    }
+    return ptr;
+  };
   for (std::uint32_t il = 0; il < c.num_layers; ++il) {
     if (c.IsLinearLayer(il)) {
       auto& l = s->linear_[il];
       l.conv_state =
           Alloc<float>(a, conv_elems, error_msg, &s->allocated_bytes_);
       l.state = Alloc<float>(a, state_elems, error_msg, &s->allocated_bytes_);
+      if (zero_fresh) {
+        (void)hipMemsetAsync(l.conv_state, 0,
+                             conv_elems * sizeof(float), stream_);
+        (void)hipMemsetAsync(l.state, 0, state_elems * sizeof(float),
+                             stream_);
+      }
     } else {
       auto& at = s->attention_[il];
       at.k_cache =
           Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
                         error_msg, &s->allocated_bytes_);
+      if (zero_fresh) {
+        (void)hipMemsetAsync(
+            at.k_cache, 0,
+            static_cast<std::size_t>(max_context) * kv_row * sizeof(__half),
+            stream_);
+      }
       at.v_cache =
           Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
                         error_msg, &s->allocated_bytes_);
+      if (zero_fresh) {
+        (void)hipMemsetAsync(
+            at.v_cache, 0,
+            static_cast<std::size_t>(max_context) * kv_row * sizeof(__half),
+            stream_);
+      }
       at.index_k = Alloc<float>(
           a, static_cast<std::size_t>(s->index_capacity_) * c.indexer_head_dim,
           error_msg, &s->allocated_bytes_);
