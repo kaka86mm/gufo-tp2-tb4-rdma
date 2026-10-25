@@ -3912,6 +3912,42 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
         std::fprintf(stderr, "tp2dbg cap-end nodes=%zu ok=%d\n", nodes,
                      static_cast<int>(ok));
       }
+      if (std::getenv("GUFO_TP2_GRAPHDUMP") != nullptr) {
+        // The two ranks record the same halved shapes, so the node list
+        // must match; a differing type or launch dimension shows which
+        // kernel one side baked differently.
+        std::size_t node_count = 0;
+        (void)hipGraphGetNodes(captured, nullptr, &node_count);
+        std::vector<hipGraphNode_t> graph_nodes(node_count);
+        if (hipGraphGetNodes(captured, graph_nodes.data(), &node_count) ==
+            hipSuccess) {
+          std::string line = "tp2dbg graphnodes key=" +
+                             std::to_string(key) + " n=" +
+                             std::to_string(node_count);
+          char item[64];
+          for (hipGraphNode_t node : graph_nodes) {
+            hipGraphNodeType type = hipGraphNodeTypeKernel;
+            hipGraphNodeGetType(node, &type);
+            if (type == hipGraphNodeTypeKernel) {
+              hipKernelNodeParams params{};
+              if (hipGraphKernelNodeGetParams(node, &params) ==
+                  hipSuccess) {
+                std::snprintf(item, sizeof(item), " k%u.%u.%u/%u",
+                              params.gridDim.x, params.gridDim.y,
+                              params.gridDim.z, params.blockDim.x);
+              } else {
+                std::snprintf(item, sizeof(item), " k?");
+              }
+            } else {
+              std::snprintf(item, sizeof(item), " t%u",
+                            static_cast<unsigned>(type));
+            }
+            line += item;
+          }
+          line += "\n";
+          std::fwrite(line.data(), 1, line.size(), stderr);
+        }
+      }
       (void)hipGraphDestroy(captured);
       if (!instantiated) {
         // As above: rank-local failures must not release the pool.
