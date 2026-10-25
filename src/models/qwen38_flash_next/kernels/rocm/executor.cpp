@@ -3131,6 +3131,14 @@ Executor::TwoRankAllReduce(std::shared_ptr<Communicator> communicator,
       }
     }
     const bool ar_trace = std::getenv("GUFO_TP2_DEBUG") != nullptr;
+    if (std::getenv("GUFO_TP2_ARARGS") != nullptr) {
+      // Everything the add and its wait bake: sizes and the expected value.
+      const std::size_t rows_now = bytes / (sizeof(float) * hidden);
+      std::fprintf(stderr,
+                   "tp2dbg ar-args bytes=%zu rows=%zu hidden=%u value=%llu\n",
+                   bytes, rows_now, hidden,
+                   static_cast<unsigned long long>(queued.value));
+    }
     if (ar_trace && ar_debug_slots != nullptr) {
       if (ar_debug_count >= 256) {
         ar_debug_count = 0;
@@ -3763,11 +3771,28 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
                      state->second.c_str(), dispatch_state().c_str());
       }
     } else {
+      std::uint64_t standing_owner = 0;
       // A warmed target shape may need its first graph or a replacement
       // after rollback storage was released. Queue this pass first, then
       // record identical commands while the GPU executes it. Short prefix
       // and draft graphs keep their existing route. No second pass is launched.
       if (synchronize && (key & (std::uint64_t{1} << 40)) == 0) {
+        // hipBLASLt graphs captured with one shared handle corrupt GEMM
+        // nodes when a capture overlaps another graph's replay (ROCm
+        // rocm-libraries #13316). Serialize the whole capture - prepass,
+        // recording, instantiate - against replays through the same
+        // ordered admission.
+        if (const auto prev = session.graph_standing_owners_.find(key);
+            prev != session.graph_standing_owners_.end()) {
+          standing_owner = prev->second;
+          if (options_.release_standing) {
+            options_.release_standing(standing_owner);
+          }
+        } else {
+          standing_owner = next_standing_owner_++;
+        }
+        AcquireReplayTurn(standing_owner);
+        replay_slot.owner = this;
         if (tp2_trace) {
           std::fprintf(stderr, "tp2dbg prepass-begin key=%llu\n",
                        static_cast<unsigned long long>(key));
@@ -3832,30 +3857,9 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
         return false;
       }
       ++capture_depth;
-      // Standing jobs carry an owner id so the communicator can drop them
-      // at lifetime points. Owners are minted in the run sequence, which is
-      // identical on both ranks; re-capturing a shape this session recorded
-      // before (its graph was trimmed away) reuses that owner and drops the
-      // orphaned pool HERE — a lockstep point — instead of at the
-      // rank-local trim, whose eviction set can transiently differ between
-      // the ranks.
-      std::uint64_t standing_owner;
-      if (const auto prev = session.graph_standing_owners_.find(key);
-          prev != session.graph_standing_owners_.end()) {
-        standing_owner = prev->second;
-        if (options_.release_standing) {
-          if (tp2_trace) {
-            std::fprintf(stderr, "tp2dbg pool-release owner=%llu why=recapture\n",
-                         static_cast<unsigned long long>(standing_owner));
-          }
-          options_.release_standing(standing_owner);
-        }
-      } else {
+      if (standing_owner == 0) {
+        // A capture without a prepass minted nothing above.
         standing_owner = next_standing_owner_++;
-        if (tp2_trace) {
-          std::fprintf(stderr, "tp2dbg pool-mint owner=%llu\n",
-                       static_cast<unsigned long long>(standing_owner));
-        }
       }
       if (options_.set_recording) {
         options_.set_recording(true, standing_owner);
@@ -3944,6 +3948,11 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
         std::vector<hipGraphNode_t> graph_nodes(node_count);
         if (hipGraphGetNodes(captured, graph_nodes.data(), &node_count) ==
             hipSuccess) {
+          std::unordered_map<const void*, std::size_t> node_index;
+          node_index.reserve(node_count);
+          for (std::size_t ni = 0; ni < graph_nodes.size(); ++ni) {
+            node_index[graph_nodes[ni]] = ni;
+          }
           std::string line = "tp2dbg graphnodes key=" +
                              std::to_string(key) + " n=" +
                              std::to_string(node_count);
@@ -3958,6 +3967,9 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
                 std::snprintf(item, sizeof(item), " k%u.%u.%u/%u",
                               params.gridDim.x, params.gridDim.y,
                               params.gridDim.z, params.blockDim.x);
+                // Reading kernelParams blindly is unsafe (no public arg
+                // count); the enqueue-time ar-args print covers the
+                // exchange scalars instead.
               } else {
                 std::snprintf(item, sizeof(item), " k?");
               }
@@ -3969,6 +3981,32 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
           }
           line += "\n";
           std::fwrite(line.data(), 1, line.size(), stderr);
+          // Dependency edges: the node array order is not execution order,
+          // and equal node sets with different edges can order the checksum
+          // before the add on one rank and after it on the other.
+          std::size_t edge_count = 0;
+          if (hipGraphGetEdges(captured, nullptr, nullptr, &edge_count) ==
+              hipSuccess) {
+            std::vector<hipGraphNode_t> from(edge_count);
+            std::vector<hipGraphNode_t> to(edge_count);
+            if (hipGraphGetEdges(captured, from.data(), to.data(),
+                                 &edge_count) == hipSuccess) {
+              std::string edges = "tp2dbg graphedges key=" +
+                                  std::to_string(key) + " n=" +
+                                  std::to_string(edge_count);
+              char eitem[48];
+              for (std::size_t e = 0; e < edge_count; ++e) {
+                const auto fi = node_index.find(from[e]);
+                const auto ti = node_index.find(to[e]);
+                std::snprintf(eitem, sizeof(eitem), " %zu>%zu",
+                              fi != node_index.end() ? fi->second : node_count,
+                              ti != node_index.end() ? ti->second : node_count);
+                edges += eitem;
+              }
+              edges += "\n";
+              std::fwrite(edges.data(), 1, edges.size(), stderr);
+            }
+          }
         }
       }
       (void)hipGraphDestroy(captured);
