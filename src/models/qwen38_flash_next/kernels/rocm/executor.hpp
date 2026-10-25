@@ -254,6 +254,7 @@ class Executor {
 public:
   /// Prints and resets the per-exchange all-reduce checksum slots.
   void PrintArChecksums() const;
+  void PrintAttnChecksums() const;
   void ResetArChecksums() const;
   /// A two-rank sum split into its start and its finish, so the GPU computes
   /// other rows while a partial is in flight. `start` queues the exchange of

@@ -35,6 +35,8 @@ namespace {
 // slots the checksum kernel writes to (graph-safe: the slot pointer is
 // baked per site at record time and written on every replay).
 double* ar_debug_slots = nullptr;
+thread_local double* attn_debug_slots = nullptr;
+thread_local std::size_t attn_debug_count = 0;
 std::size_t ar_debug_count = 0;
 
 // Depth of active stream capture on this thread. Querying hipStreamIsCapturing
@@ -3010,30 +3012,33 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   // Narrow batches split each row's key tiles over kAttnSplits blocks so a
   // decode step at depth fills the device.
   const bool split = !MatrixRows(n_tokens);
-  if (std::getenv("GUFO_TP2_ATTNCHK") != nullptr && capture_depth == 0) {
+  if (std::getenv("GUFO_TP2_ATTNCHK") != nullptr) {
     // Cross-rank determinism probe: checksum this attention's query and the
     // KV rows it reads (bit patterns as floats; only equality matters).
-    static thread_local double* attn_debug = nullptr;
-    if (attn_debug == nullptr &&
-        hipHostMalloc(&attn_debug, 3 * sizeof(double),
+    // The launches are baked into captured graphs, so replayed rounds
+    // refresh the same slots and stay comparable; eager rounds also fill
+    // slots live. Round prints come from PrintArChecksums.
+    if (attn_debug_slots == nullptr &&
+        hipHostMalloc(&attn_debug_slots, 3 * 4096 * sizeof(double),
                       hipHostMallocDefault) != hipSuccess) {
-      attn_debug = nullptr;
+      attn_debug_slots = nullptr;
     }
-    if (attn_debug != nullptr) {
+    if (attn_debug_slots != nullptr) {
+      // start_pos is the host-side value; *pos is device memory racing
+      // its own update, and a host read of it measures timing, not state.
       const std::size_t kv_floats =
-          static_cast<std::size_t>(*pos + n_tokens) * heads.attn_kv *
+          static_cast<std::size_t>(start_pos + n_tokens) * heads.attn_kv *
           heads.attn_dim / 2;
-      DebugChecksum(reinterpret_cast<const float*>(s_.q),
-                    heads.attn * heads.attn_dim / 2 * n_tokens, attn_debug,
-                    stream_);
-      DebugChecksum(reinterpret_cast<const float*>(s.k_cache), kv_floats,
-                    attn_debug + 1, stream_);
-      DebugChecksum(reinterpret_cast<const float*>(s.v_cache), kv_floats,
-                    attn_debug + 2, stream_);
-      if (hipStreamSynchronize(stream_) == hipSuccess) {
-        std::fprintf(stderr,
-                     "tp2dbg attnchk q=%.17g k=%.2f v=%.2f\n", attn_debug[0],
-                     attn_debug[1], attn_debug[2]);
+      if (attn_debug_count < 4096) {
+        double* slot = attn_debug_slots + 3 * attn_debug_count;
+        DebugChecksum(reinterpret_cast<const float*>(s_.q),
+                      heads.attn * heads.attn_dim / 2 * n_tokens, slot,
+                      stream_);
+        DebugChecksum(reinterpret_cast<const float*>(s.k_cache), kv_floats,
+                      slot + 1, stream_);
+        DebugChecksum(reinterpret_cast<const float*>(s.v_cache), kv_floats,
+                      slot + 2, stream_);
+        ++attn_debug_count;
       }
     }
   }
@@ -3167,6 +3172,24 @@ std::function<bool(std::string*)> Executor::TwoRankReduceStatus(
   return [communicator = std::move(communicator)](std::string* error) {
     return communicator->CheckQueued(error);
   };
+}
+
+void Executor::PrintAttnChecksums() const {
+  if (attn_debug_slots == nullptr || attn_debug_count == 0) {
+    return;
+  }
+  const std::size_t first =
+      attn_debug_count > 200 ? attn_debug_count - 200 : 0;
+  std::string line = "tp2dbg attnround n=" + std::to_string(attn_debug_count);
+  char item[96];
+  for (std::size_t i = first; i < attn_debug_count; ++i) {
+    std::snprintf(item, sizeof(item), " [%.17g %.17g %.17g]",
+                  attn_debug_slots[3 * i], attn_debug_slots[3 * i + 1],
+                  attn_debug_slots[3 * i + 2]);
+    line += item;
+  }
+  line += "\n";
+  std::fwrite(line.data(), 1, line.size(), stderr);
 }
 
 void Executor::PrintArChecksums() const {
