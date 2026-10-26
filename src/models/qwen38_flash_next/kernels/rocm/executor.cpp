@@ -6002,6 +6002,26 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     hidden = hidden_source +
              static_cast<std::size_t>(control_host_->hidden_row) * hc_dim;
   } else {
+    if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr) {
+      static thread_local double* draft_dbg = nullptr;
+      if (draft_dbg == nullptr &&
+          hipHostMalloc(&draft_dbg, 3 * sizeof(double),
+                        hipHostMallocDefault) == hipSuccess) {
+        // empty
+      }
+      if (draft_dbg != nullptr) {
+        const float* src =
+            hidden_source ? hidden_source : session.mtp_.target_hidden;
+        DebugChecksum(src, static_cast<std::size_t>(hc_dim), draft_dbg,
+                      stream_);
+        DebugChecksum(session.mtp_.h, static_cast<std::size_t>(n * hc_dim),
+                      draft_dbg + 1, stream_);
+        if (hipStreamSynchronize(stream_) == hipSuccess) {
+          std::fprintf(stderr, "tp2dbg draftchk h_src=%.17g h_carry=%.17g\n",
+                       draft_dbg[0], draft_dbg[1]);
+        }
+      }
+    }
     MtpHidden(hidden_source ? hidden_source : session.mtp_.target_hidden,
               session.mtp_.h, &session.control_->hidden_row, s_.mtp_h, n,
               hc_dim, stream_);
