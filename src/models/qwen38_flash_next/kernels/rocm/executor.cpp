@@ -3707,6 +3707,24 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
     part.data = static_cast<std::uint8_t*>(output.data) +
                 static_cast<std::size_t>(rank) * half * (output.cols / 32) * 34;
     float* exchange = s_.logits + half;
+    if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr) {
+      // The two comparable points of the split-vocab path: the shared
+      // post-AR activation feeding the head, and the crossed candidate
+      // row after the single-row all-reduce.
+      static thread_local double* split_dbg = nullptr;
+      if (split_dbg == nullptr &&
+          hipHostMalloc(&split_dbg, 2 * sizeof(double),
+                        hipHostMallocDefault) == hipSuccess) {
+        // allocated
+      }
+      if (split_dbg != nullptr) {
+        DebugChecksum(s_.mixed, width, split_dbg, stream_);
+        if (hipStreamSynchronize(stream_) == hipSuccess) {
+          std::fprintf(stderr, "tp2dbg splitchk pre mixed=%.17g\n",
+                       split_dbg[0]);
+        }
+      }
+    }
     if (!Dense(part, s_.mixed, s_.logits, 1, error_msg)) {
       return false;
     }
@@ -3715,6 +3733,21 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
                     stream_);
     if (!AllReduce(exchange, 1, error_msg)) {
       return false;
+    }
+    if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr) {
+      static thread_local double* split_dbg2 = nullptr;
+      if (split_dbg2 == nullptr &&
+          hipHostMalloc(&split_dbg2, sizeof(double),
+                        hipHostMallocDefault) == hipSuccess) {
+        // allocated
+      }
+      if (split_dbg2 != nullptr) {
+        DebugChecksum(exchange, width, split_dbg2, stream_);
+        if (hipStreamSynchronize(stream_) == hipSuccess) {
+          std::fprintf(stderr, "tp2dbg splitchk post xrow=%.17g\n",
+                       split_dbg2[0]);
+        }
+      }
     }
     SplitArgmaxFinish(exchange, s_.mtp_token, stream_);
     return Check(
