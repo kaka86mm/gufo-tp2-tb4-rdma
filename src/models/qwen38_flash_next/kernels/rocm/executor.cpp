@@ -5783,6 +5783,26 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
         reinterpret_cast<PenaltyArgmaxCandidate*>(s_.mtp_scratch_ids),
         s_.mtp_argmax, rows, vocab, stream_);
   } else {
+    if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr) {
+      // The target's verification logits: with the body sums, the selected
+      // draft row and the full draft KV all proven identical, these logits
+      // are the last unchecksummed input to the acceptance decision.
+      static thread_local double* logit_dbg = nullptr;
+      if (logit_dbg == nullptr &&
+          hipHostMalloc(&logit_dbg, sizeof(double),
+                        hipHostMallocDefault) == hipSuccess) {
+        // allocated
+      }
+      if (logit_dbg != nullptr) {
+        DebugChecksum(VerificationLogits(),
+                      static_cast<std::size_t>(rows) * vocab, logit_dbg,
+                      stream_);
+        if (hipStreamSynchronize(stream_) == hipSuccess) {
+          std::fprintf(stderr, "tp2dbg logitchk rows=%zu vocab=%u sum=%.17g\n",
+                       rows, vocab, logit_dbg[0]);
+        }
+      }
+    }
     gufo::hip::LaunchBatchedGPUArgmax(
         VerificationLogits(), s_.mtp_ids, rows, vocab,
         {reinterpret_cast<float*>(s_.mtp_scratch_ids),
