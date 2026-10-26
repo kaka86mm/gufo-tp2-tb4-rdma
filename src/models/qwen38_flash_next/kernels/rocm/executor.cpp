@@ -3742,7 +3742,8 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
         DebugChecksum(res, hc_dim, split_dbg + 1, stream_);
         if (hipStreamSynchronize(stream_) == hipSuccess) {
           std::fprintf(stderr,
-                       "tp2dbg splitchk pre mixed=%.17g res=%.17g\n",
+                       "tp2dbg splitchk pos=%u mixed=%.17g res=%.17g\n",
+                       draft != nullptr ? draft->position_ : 0xFFFFFFFFu,
                        split_dbg[0], split_dbg[1]);
         }
       }
@@ -5941,6 +5942,33 @@ bool Executor::MtpForward(Session& session,
                           std::int32_t hidden_row, MtpOutput output,
                           std::string* error_msg,
                           const float* hidden_source) const {
+  struct MtpTailTrace {
+    const Executor* ex;
+    const Session* sn;
+    std::int32_t hrow;
+    ~MtpTailTrace() {
+      if (ex == nullptr || hrow < 0 ||
+          std::getenv("GUFO_TP2_DRAFTCHK") == nullptr) {
+        return;
+      }
+      static thread_local double* tail_dbg = nullptr;
+      if (tail_dbg == nullptr &&
+          hipHostMalloc(&tail_dbg, sizeof(double),
+                        hipHostMallocDefault) == hipSuccess) {
+        // allocated
+      }
+      if (tail_dbg != nullptr) {
+        const std::size_t hc_dim = ex->config().HcDim();
+        DebugChecksum(ex->s_.res +
+                          static_cast<std::size_t>(hrow) * hc_dim,
+                      hc_dim, tail_dbg, ex->stream_);
+        if (hipStreamSynchronize(ex->stream_) == hipSuccess) {
+          std::fprintf(stderr, "tp2dbg mtptail pos=%u hrow=%d res=%.17g\n",
+                       sn->position_, hrow, tail_dbg[0]);
+        }
+      }
+    }
+  } tail_trace{this, &session, hidden_row};
   DropReadyQ8();
   const auto n = static_cast<std::uint32_t>(tokens.size());
   if (session.owner_ != this ||
