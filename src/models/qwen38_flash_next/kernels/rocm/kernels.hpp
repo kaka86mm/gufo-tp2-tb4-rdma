@@ -623,6 +623,12 @@ void DebugChecksum(const float* data, std::size_t count, double* out,
                    hipStream_t stream);
 void DebugChecksumCoherent(const float* data, std::size_t count, double* out,
                            hipStream_t stream);
+/// Deferred checksum: the kernel writes `sum_slot` then, after a fence,
+/// `tag_slot = tag`. The host polls the tag and reads the sum later, so no
+/// stream synchronization is needed at the instrumentation site.
+void DebugRingChecksum(const float* data, std::size_t count, double* sum_slot,
+                       unsigned long long* tag_slot, unsigned long long tag,
+                       hipStream_t stream);
 
 inline constexpr std::uint32_t kArgmaxParts = 64;
 struct ArgmaxCandidate {

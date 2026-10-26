@@ -591,7 +591,12 @@ extern "C" int qfn_mmq_quantize_q8_1(
         X_f32, nullptr, X_q8, GGML_TYPE_Q8_0, K,
         (int64_t)K, (int64_t)K * N, (int64_t)K * N,
         ne10_padded, N, 1, 1, stream);
-    return hipGetLastError() == hipSuccess ? 0 : -2;
+    const hipError_t qerr = hipGetLastError();
+    if (qerr != hipSuccess) {
+        fprintf(stderr, "qfn quantize lasterr=%d N=%d K=%d\n",
+                static_cast<int>(qerr), N, K);
+    }
+    return qerr == hipSuccess ? 0 : -2;
 }
 
 // The 320-row HC down projection has too few waves to hide its long K

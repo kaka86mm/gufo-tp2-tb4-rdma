@@ -7,6 +7,8 @@
 #include <sstream>
 #include <array>
 #include <atomic>
+#include <string>
+#include <mutex>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -46,7 +48,83 @@ std::size_t ar_debug_count = 0;
 // capturing stream blocks forever, so Run brackets the capture and Drain
 // consults this counter instead of the HIP API.
 thread_local int capture_depth = 0;
+// Set on ANY thread while it records a capture: peer threads must not
+// synchronize or launch instrumentation on the shared stream meanwhile
+// (ThreadLocal mode invalidates the capture silently, with no HIP error
+// logged - only hipStreamEndCapture reports "previous error").
+std::atomic<int> any_capture_recording{0};
 }  // namespace
+
+bool CaptureRecording() { return capture_depth > 0; }
+
+bool AnyCaptureRecording() { return any_capture_recording.load() > 0; }
+
+namespace {
+// Pinned ring of (sum, tag) slots written by checksum kernels; a drainer
+// thread prints completed slots. Replaces the per-call
+// hipStreamSynchronize of the sync instruments: those millisecond gaps
+// flattened the races the instruments chase (six clean batteries with
+// syncs, none without).
+struct Tp2Ring {
+  static constexpr std::uint64_t kCap = 1u << 16;
+  double* sums = nullptr;
+  unsigned long long* tags = nullptr;
+  std::mutex mu;
+  std::uint64_t next = 0;
+  std::uint64_t drained = 0;
+  std::vector<std::string> labels;
+  std::atomic<bool> stop{false};
+  std::thread drain;
+  bool ok = false;
+  Tp2Ring() {
+    if (hipHostMalloc(&sums, kCap * sizeof(double), hipHostMallocDefault) !=
+            hipSuccess ||
+        hipHostMalloc(&tags, kCap * sizeof(unsigned long long),
+                      hipHostMallocDefault) != hipSuccess) {
+      return;
+    }
+    std::memset(tags, 0, kCap * sizeof(unsigned long long));
+    ok = true;
+    drain = std::thread([this] {
+      while (!stop.load(std::memory_order_relaxed)) {
+        {
+          std::lock_guard<std::mutex> guard(mu);
+          const std::uint64_t snapshot = next;
+          while (drained < snapshot) {
+            const std::uint64_t slot = drained % kCap;
+            if (tags[slot] != drained + 1) break;
+            std::fprintf(stderr, "tp2dbg ring t=%llu %s sum=%.17g\n",
+                         static_cast<unsigned long long>(drained + 1),
+                         labels[drained].c_str(), sums[slot]);
+            ++drained;
+          }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+    });
+  }
+};
+Tp2Ring* Tp2RingGet() {
+  static Tp2Ring* ring = new Tp2Ring();
+  return ring;
+}
+}  // namespace
+
+void Tp2RingSum(const char* label, const float* data, std::size_t count,
+                hipStream_t stream) {
+  Tp2Ring* ring = Tp2RingGet();
+  if (!ring->ok) return;
+  unsigned long long tag = 0;
+  {
+    std::lock_guard<std::mutex> guard(ring->mu);
+    if (ring->next - ring->drained >= Tp2Ring::kCap) return;
+    tag = ring->next + 1;
+    ring->labels.push_back(label);
+    ++ring->next;
+  }
+  DebugRingChecksum(data, count, ring->sums + (tag - 1) % Tp2Ring::kCap,
+                    ring->tags + (tag - 1) % Tp2Ring::kCap, tag, stream);
+}
 namespace {
 
 using core::GgmlType;
@@ -3326,7 +3404,8 @@ Executor::SplitReduce Executor::TwoRankSplitReduce(
       return false;
     }
     const std::size_t rows = bytes / (sizeof(float) * hidden);
-    if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr) {
+    if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr &&
+        !AnyCaptureRecording()) {
       // The deferred-epilogue add's peer, checksummed on the consumer's
       // stream right before the add reads it.
       static thread_local double* fin_dbg = nullptr;
@@ -3702,7 +3781,8 @@ bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
 bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
                        bool candidates, const Session* draft,
                        std::string* error_msg) const {
-  if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr) {
+  if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr &&
+        !AnyCaptureRecording()) {
     // Every head call's mixed-input row and the res row feeding it,
     // comparable across ranks (both are full post-AR activations).
     static thread_local double* h_dbg = nullptr;
@@ -3712,17 +3792,10 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
       // allocated
     }
     if (h_dbg != nullptr) {
-      const std::size_t hc_dim = config().HcDim();
-      DebugChecksum(res, hc_dim, h_dbg, stream_);
-      // mixed is written by the caller's HcMix; checksum the LOGITS OUTPUT
-      // after the generic Dense below is not possible here - checksum res
-      // now, and the head's mixed after HcMix happens in the caller. The
-      // split path has its own pre-check.
-      if (hipStreamSynchronize(stream_) == hipSuccess) {
-        std::fprintf(stderr, "tp2dbg headin pos=%u res=%.17g\n",
-                     draft != nullptr ? draft->position_ : 0xFFFFFFFFu,
-                     h_dbg[0]);
-      }
+      char hin_lab[48];
+      std::snprintf(hin_lab, sizeof hin_lab, "headin pos=%u",
+                    draft != nullptr ? draft->position_ : 0xFFFFFFFFu);
+      Tp2RingSum(hin_lab, res, config().HcDim(), stream_);
     }
   }
   const DeviceTensor& output = model_->output();
@@ -3747,7 +3820,8 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
     part.data = static_cast<std::uint8_t*>(output.data) +
                 static_cast<std::size_t>(rank) * half * (output.cols / 32) * 34;
     float* exchange = s_.logits + half;
-    if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr) {
+    if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr &&
+        !AnyCaptureRecording()) {
       // The comparable points of the split-vocab path: the head's mixed
       // input row, the residual row feeding the head's HcMix, and the
       // crossed candidate row after the single-row all-reduce. The
@@ -3761,14 +3835,14 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
       }
       if (split_dbg != nullptr) {
         const std::size_t hc_dim = config().HcDim();
-        DebugChecksum(s_.mixed, width, split_dbg, stream_);
-        DebugChecksum(res, hc_dim, split_dbg + 1, stream_);
-        if (hipStreamSynchronize(stream_) == hipSuccess) {
-          std::fprintf(stderr,
-                       "tp2dbg splitchk pos=%u mixed=%.17g res=%.17g\n",
-                       draft != nullptr ? draft->position_ : 0xFFFFFFFFu,
-                       split_dbg[0], split_dbg[1]);
-        }
+        char spm_lab[64];
+        std::snprintf(spm_lab, sizeof spm_lab, "splitmix pos=%u",
+                      draft != nullptr ? draft->position_ : 0xFFFFFFFFu);
+        char spr_lab[64];
+        std::snprintf(spr_lab, sizeof spr_lab, "splitres pos=%u",
+                      draft != nullptr ? draft->position_ : 0xFFFFFFFFu);
+        Tp2RingSum(spm_lab, s_.mixed, width, stream_);
+        Tp2RingSum(spr_lab, res, hc_dim, stream_);
       }
     }
     if (!Dense(part, s_.mixed, s_.logits, 1, error_msg)) {
@@ -3780,7 +3854,8 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
     if (!AllReduce(exchange, 1, error_msg)) {
       return false;
     }
-    if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr) {
+    if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr &&
+        !AnyCaptureRecording()) {
       static thread_local double* split_dbg2 = nullptr;
       if (split_dbg2 == nullptr &&
           hipHostMalloc(&split_dbg2, sizeof(double),
@@ -3788,11 +3863,7 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
         // allocated
       }
       if (split_dbg2 != nullptr) {
-        DebugChecksum(exchange, width, split_dbg2, stream_);
-        if (hipStreamSynchronize(stream_) == hipSuccess) {
-          std::fprintf(stderr, "tp2dbg splitchk post xrow=%.17g\n",
-                       split_dbg2[0]);
-        }
+        Tp2RingSum("splitxrow", exchange, width, stream_);
       }
     }
     SplitArgmaxFinish(exchange, s_.mtp_token, stream_);
@@ -3801,7 +3872,8 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
                        hipMemcpyDeviceToHost, stream_),
         "draft token download", error_msg);
   }
-  if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr) {
+  if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr &&
+        !AnyCaptureRecording()) {
     // The generic full-vocab head: checksum the mixed input right before
     // the Dense (the only verify-path mixed instrumentation).
     static thread_local double* g_dbg = nullptr;
@@ -3812,12 +3884,10 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
     }
     if (g_dbg != nullptr) {
       const std::size_t width = config().hidden_size;
-      DebugChecksum(s_.mixed, width, g_dbg, stream_);
-      if (hipStreamSynchronize(stream_) == hipSuccess) {
-        std::fprintf(stderr, "tp2dbg headmix pos=%u mixed=%.17g\n",
-                     draft != nullptr ? draft->position_ : 0xFFFFFFFFu,
-                     g_dbg[0]);
-      }
+      char hm_lab[48];
+      std::snprintf(hm_lab, sizeof hm_lab, "headmix pos=%u",
+                    draft != nullptr ? draft->position_ : 0xFFFFFFFFu);
+      Tp2RingSum(hm_lab, s_.mixed, config().hidden_size, stream_);
     }
   }
   if (!(draft != nullptr ? DraftLogits(*draft, s_.mixed, s_.logits, error_msg)
@@ -4037,6 +4107,7 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
         return false;
       }
       ++capture_depth;
+      any_capture_recording.fetch_add(1);
       if (standing_owner == 0) {
         // A capture without a prepass minted nothing above.
         standing_owner = next_standing_owner_++;
@@ -4073,6 +4144,7 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
                      static_cast<unsigned long long>(key));
       }
       --capture_depth;
+      any_capture_recording.fetch_sub(1);
       // The recording body ran with cleared producer caches and leaves
       // different cache state than the real pass; clear again so the next
       // round starts from the same state it would without capture.
@@ -4667,7 +4739,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     // Only the requested tail needs the head's normalization.
     const std::size_t skip = static_cast<std::size_t>(n - n_logits);
     const DeviceMixer& head = model_->hc_head();
-    const bool body_head_trace = std::getenv("GUFO_TP2_DRAFTCHK") != nullptr;
+    const bool body_head_trace = std::getenv("GUFO_TP2_DRAFTCHK") != nullptr &&
+                         !AnyCaptureRecording();
     if (body_head_trace) {
       // THE verify rows' provenance: the mixed input row and, after the
       // Dense, the logits rows - the last unchecksummed writer of the
@@ -4679,12 +4752,10 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
         // allocated
       }
       if (bh_dbg != nullptr) {
-        DebugChecksum(s_.res + skip * c.HcDim(), c.HcDim(), bh_dbg,
-                      stream_);
-        if (hipStreamSynchronize(stream_) == hipSuccess) {
-          std::fprintf(stderr, "tp2dbg bodyhead pos=%u n=%u res=%.17g\n",
-                       session.position_, n_logits, bh_dbg[0]);
-        }
+        char bh_lab[64];
+        std::snprintf(bh_lab, sizeof bh_lab, "bodyhead pos=%u n=%u",
+                      session.position_, n_logits);
+        Tp2RingSum(bh_lab, s_.res + skip * c.HcDim(), c.HcDim(), stream_);
       }
     }
     if (!HcMix(head, s_.res + skip * c.HcDim(), false, s_.mixed, nullptr,
@@ -4699,11 +4770,10 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
         // allocated
       }
       if (bm_dbg != nullptr) {
-        DebugChecksum(s_.mixed, c.hidden_size, bm_dbg, stream_);
-        if (hipStreamSynchronize(stream_) == hipSuccess) {
-          std::fprintf(stderr, "tp2dbg bodymix pos=%u mixed=%.17g\n",
-                       session.position_, bm_dbg[0]);
-        }
+        char bmx_lab[48];
+        std::snprintf(bmx_lab, sizeof bmx_lab, "bodymix pos=%u",
+                      session.position_);
+        Tp2RingSum(bmx_lab, s_.mixed, c.hidden_size, stream_);
       }
     }
     if (!Dense(model_->output(), s_.mixed, s_.logits, n_logits, error_msg)) {
@@ -4717,14 +4787,11 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
         // allocated
       }
       if (bo_dbg != nullptr) {
-        DebugChecksum(s_.logits,
-                      static_cast<std::size_t>(n_logits) *
-                          c.vocab_size,
-                      bo_dbg, stream_);
-        if (hipStreamSynchronize(stream_) == hipSuccess) {
-          std::fprintf(stderr, "tp2dbg bodyout pos=%u logits=%.17g\n",
-                       session.position_, bo_dbg[0]);
-        }
+        char bo_lab[48];
+        std::snprintf(bo_lab, sizeof bo_lab, "bodyout pos=%u",
+                      session.position_);
+        Tp2RingSum(bo_lab, s_.logits,
+                   static_cast<std::size_t>(n_logits) * c.vocab_size, stream_);
       }
     }
     if (download_logits &&
@@ -5936,7 +6003,8 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
         reinterpret_cast<PenaltyArgmaxCandidate*>(s_.mtp_scratch_ids),
         s_.mtp_argmax, rows, vocab, stream_);
   } else {
-    if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr) {
+    if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr &&
+        !AnyCaptureRecording()) {
       // The target's verification logits: with the body sums, the selected
       // draft row and the full draft KV all proven identical, these logits
       // are the last unchecksummed input to the acceptance decision.
@@ -5947,13 +6015,18 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
         // allocated
       }
       if (logit_dbg != nullptr) {
-        DebugChecksum(VerificationLogits(),
-                      static_cast<std::size_t>(rows) * vocab, logit_dbg,
-                      stream_);
-        if (hipStreamSynchronize(stream_) == hipSuccess) {
-          std::fprintf(stderr, "tp2dbg logitchk rows=%zu vocab=%u sum=%.17g\n",
-                       rows, vocab, logit_dbg[0]);
-        }
+        static thread_local unsigned long long lseq = 0;
+        ++lseq;
+        char li_lab[128];
+        std::snprintf(li_lab, sizeof li_lab,
+                      "logitchk seq=%llu rows=%zu vocab=%u src=%s delta=%td",
+                      lseq, rows, vocab,
+                      selected_logits_ != nullptr ? "sel" : "slogits",
+                      selected_logits_ != nullptr
+                          ? selected_logits_ - batch_logits_
+                          : static_cast<std::ptrdiff_t>(-1));
+        Tp2RingSum(li_lab, VerificationLogits(),
+                   static_cast<std::size_t>(rows) * vocab, stream_);
       }
     }
     gufo::hip::LaunchBatchedGPUArgmax(
@@ -6202,7 +6275,8 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     hidden = hidden_source +
              static_cast<std::size_t>(control_host_->hidden_row) * hc_dim;
   } else {
-    if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr) {
+    if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr &&
+        !AnyCaptureRecording()) {
       static thread_local double* draft_dbg = nullptr;
       if (draft_dbg == nullptr &&
           hipHostMalloc(&draft_dbg, 3 * sizeof(double),

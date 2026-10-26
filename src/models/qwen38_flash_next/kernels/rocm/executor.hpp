@@ -33,6 +33,17 @@
 
 namespace gufo::models::qwen38_flash_next::rocm {
 
+/// True while this thread is recording a HIP graph capture. Instruments
+/// must not synchronize or allocate host memory while this is set.
+bool CaptureRecording();
+/// True while ANY thread records a HIP graph capture (cross-thread safe).
+bool AnyCaptureRecording();
+/// Deferred instrument checksum: enqueue a ring slot and return without
+/// synchronizing; a drainer thread prints "tp2dbg ring" lines later.
+/// `label` carries the site's fields; the drainer appends sum=.
+void Tp2RingSum(const char* label, const float* data, std::size_t count,
+                hipStream_t stream);
+
 class Executor;
 class SnapshotAllocator;
 struct ArgmaxCandidate;

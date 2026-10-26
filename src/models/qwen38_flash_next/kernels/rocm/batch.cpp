@@ -1133,9 +1133,35 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
       }
     }
     UseScratch(base);
-    return HcMixBatch(model_->hc_head(), base.res, false, base.mixed, nullptr,
-                      rows, error) &&
-           DenseBatch(model_->output(), base.mixed, batch_logits_, rows, error);
+    const bool batchchk = std::getenv("GUFO_TP2_DRAFTCHK") != nullptr &&
+                       !AnyCaptureRecording();
+    static thread_local unsigned long long bseq = 0;
+    if (batchchk) {
+      char lab[64];
+      std::snprintf(lab, sizeof lab, "batchres seq=%llu rows=%u", bseq, rows);
+      Tp2RingSum(lab, base.res,
+                 static_cast<std::size_t>(rows) * config().HcDim(), stream_);
+    }
+    if (!HcMixBatch(model_->hc_head(), base.res, false, base.mixed, nullptr,
+                    rows, error)) {
+      return false;
+    }
+    if (batchchk) {
+      char lab[64];
+      std::snprintf(lab, sizeof lab, "batchmix seq=%llu rows=%u", bseq, rows);
+      Tp2RingSum(lab, base.mixed,
+                 static_cast<std::size_t>(rows) * config().hidden_size, stream_);
+    }
+    if (!DenseBatch(model_->output(), base.mixed, batch_logits_, rows, error)) {
+      return false;
+    }
+    if (batchchk) {
+      char lab[64];
+      std::snprintf(lab, sizeof lab, "batchout seq=%llu rows=%u", bseq, rows);
+      Tp2RingSum(lab, batch_logits_,
+                 static_cast<std::size_t>(rows) * config().vocab_size, stream_);
+    }
+    return true;
   };
   bool ok = false;
   try {
@@ -1173,6 +1199,10 @@ bool Executor::SelectBatchLogits(std::uint32_t offset, std::uint32_t rows,
       static_cast<std::size_t>(rows) * config().vocab_size;
   selected_logits_ =
       batch_logits_ + static_cast<std::size_t>(offset) * config().vocab_size;
+  if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr) {
+    std::fprintf(stderr, "tp2dbg selbatch off=%u rows=%u delta=%td\n", offset,
+                 rows, selected_logits_ - batch_logits_);
+  }
   if (logits != nullptr) {
     if (!Check(hipMemcpyAsync(logits_host_, selected_logits_,
                               count * sizeof(float), hipMemcpyDeviceToHost,

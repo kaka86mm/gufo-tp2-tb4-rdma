@@ -8645,6 +8645,39 @@ void DebugChecksum(const float* data, std::size_t count, double* out,
                      data, count, out);
 }
 
+__global__ void DebugRingChecksumKernel(const float* __restrict__ data,
+                                        std::size_t count, double* sum_slot,
+                                        unsigned long long* tag_slot,
+                                        unsigned long long tag) {
+  __shared__ double partial[kThreads];
+  const std::size_t stride =
+      static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  std::uint64_t sum = 0;
+  for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+       i < count; i += stride) {
+    sum += reinterpret_cast<const std::uint32_t*>(data)[i];
+  }
+  partial[threadIdx.x] = static_cast<double>(sum);
+  __syncthreads();
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    double total = 0.0;
+    for (int i = 0; i < blockDim.x; ++i) {
+      total += partial[i];
+    }
+    *sum_slot = total;
+    __threadfence();
+    *tag_slot = tag;
+  }
+}
+
+void DebugRingChecksum(const float* data, std::size_t count, double* sum_slot,
+                       unsigned long long* tag_slot, unsigned long long tag,
+                       hipStream_t stream) {
+  hipLaunchKernelGGL(DebugRingChecksumKernel, dim3(1), dim3(kThreads), 0,
+                     stream, data, count, sum_slot, tag_slot, tag);
+}
+
 void AddRowsBroadcast(const float* embedding, float* residual,
                       std::uint32_t n_tokens, std::uint32_t hidden,
                       std::uint32_t streams, hipStream_t stream) {
