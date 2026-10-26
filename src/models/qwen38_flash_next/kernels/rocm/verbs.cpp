@@ -930,13 +930,26 @@ public:
       Poison(error, "overlapped exchange event record failed");
       return false;
     }
+    float* landing = nullptr;
+    const float* landing_src = nullptr;
+    if (graph_mode_ && oneshot_landing_ != nullptr) {
+      const std::size_t slot =
+          static_cast<std::size_t>(operation_id % kWindows);
+      landing = oneshot_landing_ + slot * kWindowBytes / sizeof(float) +
+                kDataOffset / sizeof(float);
+      landing_src = reinterpret_cast<const float*>(
+          static_cast<const std::uint8_t*>(recv_device_) +
+          slot * kWindowBytes + kDataOffset);
+    }
     {
       std::lock_guard jobs(jobs_mutex_);
       jobs_.push_back({.ready = ready,
                        .data = data,
                        .bytes = bytes,
                        .scope_id = *bound_scope_,
-                       .operation_id = operation_id});
+                       .operation_id = operation_id,
+                       .overlapped_landing = landing,
+                       .overlapped_src = landing_src});
     }
     ++next_operation_;
     ++started_;
@@ -1121,6 +1134,12 @@ private:
     std::uint64_t operation_id{0};
     /// A QueuePartial exchange: the GPU stages it and waits for it.
     bool queued{false};
+    /// An overlapped exchange's landing copy: the worker copies the
+    /// received partial into a device slot and finishes only after the
+    /// copy completes, so the executor's add reads device memory instead
+    /// of the pinned window (NIC DMA does not invalidate the GPU's L2).
+    float* overlapped_landing{nullptr};
+    const float* overlapped_src{nullptr};
     /// The send window this exchange stages into and writes from: fixed at
     /// zero for graph replay (single flight), rotating for overlapped use.
     std::size_t window{0};
@@ -1330,6 +1349,10 @@ private:
     if (hipMalloc(&landing_arena_, landing_arena_bytes_) != hipSuccess) {
       landing_arena_ = nullptr;
       landing_arena_bytes_ = 0;
+    }
+    if (hipMalloc(&oneshot_landing_, kWindows * kWindowBytes) !=
+        hipSuccess) {
+      oneshot_landing_ = nullptr;
     }
     send_mr_ = ibv_reg_mr(pd_, send_buffer_, kBufferBytes, kMemoryAccessFlags);
     recv_mr_ = ibv_reg_mr(pd_, recv_buffer_, kBufferBytes, kMemoryAccessFlags);
@@ -1771,6 +1794,20 @@ private:
             Transfer(job.scope_id, job.operation_id, job.bytes,
                      (job.operation_id % kWindows) * kWindowBytes,
                      &finished.error);
+        if (finished.peer != nullptr && job.overlapped_landing != nullptr) {
+          // Copy the received partial to the device landing slot and wait
+          // for the copy: FinishPartial's caller enqueues its add right
+          // after this push, with no event to order against.
+          if (hipMemcpyAsync(job.overlapped_landing, job.overlapped_src,
+                             job.bytes, hipMemcpyHostToDevice,
+                             landing_stream_) != hipSuccess ||
+              hipStreamSynchronize(landing_stream_) != hipSuccess) {
+            finished.peer = nullptr;
+            finished.error = "overlapped landing copy failed";
+          } else {
+            finished.peer = job.overlapped_landing;
+          }
+        }
       }
       const bool failed = finished.peer == nullptr;
       if (failed || job.queued) {
@@ -2176,6 +2213,9 @@ private:
   float* landing_arena_{nullptr};
   std::size_t landing_arena_bytes_{0};
   std::size_t landing_cursor_{0};
+  /// Device ring (kWindows x kWindowBytes) for overlapped exchange
+  /// landings, mirroring the pinned window rotation.
+  float* oneshot_landing_{nullptr};
   struct EarlyReceive {
     std::uint32_t immediate{0};
     std::uint32_t length{0};
