@@ -3702,6 +3702,29 @@ bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
 bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
                        bool candidates, const Session* draft,
                        std::string* error_msg) const {
+  if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr) {
+    // Every head call's mixed-input row and the res row feeding it,
+    // comparable across ranks (both are full post-AR activations).
+    static thread_local double* h_dbg = nullptr;
+    if (h_dbg == nullptr &&
+        hipHostMalloc(&h_dbg, 2 * sizeof(double),
+                      hipHostMallocDefault) == hipSuccess) {
+      // allocated
+    }
+    if (h_dbg != nullptr) {
+      const std::size_t hc_dim = config().HcDim();
+      DebugChecksum(res, hc_dim, h_dbg, stream_);
+      // mixed is written by the caller's HcMix; checksum the LOGITS OUTPUT
+      // after the generic Dense below is not possible here - checksum res
+      // now, and the head's mixed after HcMix happens in the caller. The
+      // split path has its own pre-check.
+      if (hipStreamSynchronize(stream_) == hipSuccess) {
+        std::fprintf(stderr, "tp2dbg headin pos=%u res=%.17g\n",
+                     draft != nullptr ? draft->position_ : 0xFFFFFFFFu,
+                     h_dbg[0]);
+      }
+    }
+  }
   const DeviceTensor& output = model_->output();
   const std::uint32_t prefix = model_->draft_output().rows;
   const std::uint32_t rows =
@@ -3777,6 +3800,25 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
         hipMemcpyAsync(mtp_token_host_, s_.mtp_token, sizeof(std::int32_t),
                        hipMemcpyDeviceToHost, stream_),
         "draft token download", error_msg);
+  }
+  if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr) {
+    // The generic full-vocab head: checksum the mixed input right before
+    // the Dense (the only verify-path mixed instrumentation).
+    static thread_local double* g_dbg = nullptr;
+    if (g_dbg == nullptr &&
+        hipHostMalloc(&g_dbg, sizeof(double),
+                      hipHostMallocDefault) == hipSuccess) {
+      // allocated
+    }
+    if (g_dbg != nullptr) {
+      const std::size_t width = config().hidden_size;
+      DebugChecksum(s_.mixed, width, g_dbg, stream_);
+      if (hipStreamSynchronize(stream_) == hipSuccess) {
+        std::fprintf(stderr, "tp2dbg headmix pos=%u mixed=%.17g\n",
+                     draft != nullptr ? draft->position_ : 0xFFFFFFFFu,
+                     g_dbg[0]);
+      }
+    }
   }
   if (!(draft != nullptr ? DraftLogits(*draft, s_.mixed, s_.logits, error_msg)
                          : Dense(output, s_.mixed, s_.logits, 1, error_msg))) {
