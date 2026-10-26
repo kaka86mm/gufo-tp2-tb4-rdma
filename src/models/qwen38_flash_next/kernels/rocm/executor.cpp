@@ -3266,7 +3266,10 @@ void Executor::PrintAttnChecksums() const {
 }
 
 void Executor::PrintArChecksums() const {
-  if (ar_debug_slots == nullptr || ar_debug_count == 0) {
+  // Pure-replay rounds advance no eager counter, but their baked checksum
+  // kernels still refresh the slots; print them too (n=0 marks a
+  // replay-only round) or their divergences stay invisible.
+  if (ar_debug_slots == nullptr) {
     return;
   }
   // One write: per-slot fprintf interleaves with worker spin logs on

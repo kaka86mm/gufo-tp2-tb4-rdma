@@ -1657,6 +1657,16 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
                              const TpInstruction& instruction,
                              const Respond& respond, std::string* error) {
   ++request.count;
+  if (std::getenv("GUFO_TP2_DEBUG") != nullptr) {
+    std::fprintf(stderr,
+                 "tp2dbg call seq=%llu op=%d cnt=%lld off=%lld tok=%d pend=%d\n",
+                 static_cast<unsigned long long>(sequence),
+                 static_cast<int>(instruction.op),
+                 static_cast<long long>(instruction.count),
+                 static_cast<long long>(instruction.offset),
+                 static_cast<int>(instruction.token),
+                 static_cast<int>(instruction.pending));
+  }
   const bool prompt_fits = instruction.prompt_size <= request.prompt.size();
   const auto prefill_prompt =
       instruction.op == TpInstructionOp::kPrefill && prompt_fits
