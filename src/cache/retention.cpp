@@ -468,6 +468,16 @@ void RetentionPolicy::Emit(RetentionAction action, RetentionReason reason,
   if (sink_)
     sink_->Emit(event);
 }
+// (diagnostic) eviction victim trace: both ranks must pick the same
+// victims; a divergence here wedges the exchange sequence.
+[[maybe_unused]] static void Tp2VictimTrace(const char* why,
+                                            std::uint64_t id, Rows boundary) {
+  if (std::getenv("GUFO_TP2_DEBUG") != nullptr) {
+    std::fprintf(stderr, "tp2dbg evict why=%s id=%llu boundary=%u\n", why,
+                 static_cast<unsigned long long>(id), boundary);
+  }
+}
+
 void RetentionPolicy::Erase(std::size_t i, RetentionReason reason,
                             std::uint32_t rank) {
   const auto unique = retained_payload_bytes_ ? UniquePayloadBytes(i) : 0;
@@ -477,6 +487,8 @@ void RetentionPolicy::Erase(std::size_t i, RetentionReason reason,
   const auto boundary = e.checkpoint->Boundary();
   const auto purpose = e.purpose;
   const auto used = e.last_used;
+  Tp2VictimTrace(std::to_string(static_cast<int>(reason)).c_str(),
+                 id.value, boundary);
   index_.DropResident(e.entry);
   e = {};
   for (auto& peer : records_)
