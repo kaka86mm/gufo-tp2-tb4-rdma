@@ -4667,10 +4667,65 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     // Only the requested tail needs the head's normalization.
     const std::size_t skip = static_cast<std::size_t>(n - n_logits);
     const DeviceMixer& head = model_->hc_head();
+    const bool body_head_trace = std::getenv("GUFO_TP2_DRAFTCHK") != nullptr;
+    if (body_head_trace) {
+      // THE verify rows' provenance: the mixed input row and, after the
+      // Dense, the logits rows - the last unchecksummed writer of the
+      // verification buffer.
+      static thread_local double* bh_dbg = nullptr;
+      if (bh_dbg == nullptr &&
+          hipHostMalloc(&bh_dbg, 3 * sizeof(double),
+                        hipHostMallocDefault) == hipSuccess) {
+        // allocated
+      }
+      if (bh_dbg != nullptr) {
+        DebugChecksum(s_.res + skip * c.HcDim(), c.HcDim(), bh_dbg,
+                      stream_);
+        if (hipStreamSynchronize(stream_) == hipSuccess) {
+          std::fprintf(stderr, "tp2dbg bodyhead pos=%u n=%u res=%.17g\n",
+                       session.position_, n_logits, bh_dbg[0]);
+        }
+      }
+    }
     if (!HcMix(head, s_.res + skip * c.HcDim(), false, s_.mixed, nullptr,
-               n_logits, error_msg) ||
-        !Dense(model_->output(), s_.mixed, s_.logits, n_logits, error_msg)) {
+               n_logits, error_msg)) {
       return false;
+    }
+    if (body_head_trace) {
+      static thread_local double* bm_dbg = nullptr;
+      if (bm_dbg == nullptr &&
+          hipHostMalloc(&bm_dbg, sizeof(double),
+                        hipHostMallocDefault) == hipSuccess) {
+        // allocated
+      }
+      if (bm_dbg != nullptr) {
+        DebugChecksum(s_.mixed, c.hidden_size, bm_dbg, stream_);
+        if (hipStreamSynchronize(stream_) == hipSuccess) {
+          std::fprintf(stderr, "tp2dbg bodymix pos=%u mixed=%.17g\n",
+                       session.position_, bm_dbg[0]);
+        }
+      }
+    }
+    if (!Dense(model_->output(), s_.mixed, s_.logits, n_logits, error_msg)) {
+      return false;
+    }
+    if (body_head_trace) {
+      static thread_local double* bo_dbg = nullptr;
+      if (bo_dbg == nullptr &&
+          hipHostMalloc(&bo_dbg, sizeof(double),
+                        hipHostMallocDefault) == hipSuccess) {
+        // allocated
+      }
+      if (bo_dbg != nullptr) {
+        DebugChecksum(s_.logits,
+                      static_cast<std::size_t>(n_logits) *
+                          c.vocab_size,
+                      bo_dbg, stream_);
+        if (hipStreamSynchronize(stream_) == hipSuccess) {
+          std::fprintf(stderr, "tp2dbg bodyout pos=%u logits=%.17g\n",
+                       session.position_, bo_dbg[0]);
+        }
+      }
     }
     if (download_logits &&
         !Check(hipMemcpyAsync(logits_host_, s_.logits,
