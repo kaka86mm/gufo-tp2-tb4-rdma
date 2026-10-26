@@ -3326,6 +3326,23 @@ Executor::SplitReduce Executor::TwoRankSplitReduce(
       return false;
     }
     const std::size_t rows = bytes / (sizeof(float) * hidden);
+    if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr) {
+      // The deferred-epilogue add's peer, checksummed on the consumer's
+      // stream right before the add reads it.
+      static thread_local double* fin_dbg = nullptr;
+      if (fin_dbg == nullptr &&
+          hipHostMalloc(&fin_dbg, sizeof(double),
+                        hipHostMallocDefault) == hipSuccess) {
+        // allocated
+      }
+      if (fin_dbg != nullptr) {
+        DebugChecksum(peer, bytes / sizeof(float), fin_dbg, stream);
+        if (hipStreamSynchronize(stream) == hipSuccess) {
+          std::fprintf(stderr, "tp2dbg finchk rows=%zu peer=%.17g\n", rows,
+                       fin_dbg[0]);
+        }
+      }
+    }
     if (rows != 0) {
       AddRowsBroadcast(peer, data, static_cast<std::uint32_t>(rows), hidden, 1,
                        stream);

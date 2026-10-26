@@ -932,6 +932,8 @@ public:
     }
     float* landing = nullptr;
     const float* landing_src = nullptr;
+    static thread_local std::uint64_t ov_count = 0;
+    const bool ov_trace = Tp2Trace() && (++ov_count & 0x3F) == 0;
     if (graph_mode_ && oneshot_landing_ != nullptr) {
       const std::size_t slot =
           static_cast<std::size_t>(operation_id % kWindows);
@@ -950,6 +952,11 @@ public:
                        .operation_id = operation_id,
                        .overlapped_landing = landing,
                        .overlapped_src = landing_src});
+      if (ov_trace) {
+        std::fprintf(stderr, "tp2dbg ovland op=%llu on=%d\n",
+                     static_cast<unsigned long long>(operation_id),
+                     landing != nullptr);
+      }
     }
     ++next_operation_;
     ++started_;
