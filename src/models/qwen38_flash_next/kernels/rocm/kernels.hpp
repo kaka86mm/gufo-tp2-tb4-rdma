@@ -629,6 +629,12 @@ void DebugChecksumCoherent(const float* data, std::size_t count, double* out,
 void DebugRingChecksum(const float* data, std::size_t count, double* sum_slot,
                        unsigned long long* tag_slot, unsigned long long tag,
                        hipStream_t stream);
+/// Baked replay checksum: appends (k, sum) to a small host-visible ring and
+/// bumps a device-side counter. Recorded into graphs, it fires on every
+/// replay, so replayed rounds become comparable across ranks by k index.
+void DebugReplayChecksum(const float* data, std::size_t count, double* sums,
+                         unsigned long long* cnts, unsigned long long* counter,
+                         int cap, hipStream_t stream);
 
 inline constexpr std::uint32_t kArgmaxParts = 64;
 struct ArgmaxCandidate {

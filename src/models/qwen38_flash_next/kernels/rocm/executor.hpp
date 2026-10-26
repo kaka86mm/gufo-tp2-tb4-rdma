@@ -44,6 +44,7 @@ bool AnyCaptureRecording();
 void Tp2RingSum(const char* label, const float* data, std::size_t count,
                 hipStream_t stream);
 
+
 class Executor;
 class SnapshotAllocator;
 struct ArgmaxCandidate;
@@ -445,6 +446,10 @@ public:
                                      std::string* error_msg) const;
 
   /// Greedy verification keeps full logit rows on the GPU, including penalties.
+  /// GUFO_TP2_REPCHK: per-layer residual checksum baked into captured
+  /// graphs; replayed rounds append (k, sum) entries, comparable by k.
+  void RepChkLayer(std::uint32_t layer, const float* data,
+                   std::size_t count) const;
   [[nodiscard]] bool GreedyMtpPredictions(
       std::span<ArgmaxCandidate> predictions,
       const sampling::SamplerState& sampler,

@@ -7,6 +7,8 @@
 #include <sstream>
 #include <array>
 #include <atomic>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <string>
 #include <mutex>
 #include <bit>
@@ -108,7 +110,111 @@ Tp2Ring* Tp2RingGet() {
   static Tp2Ring* ring = new Tp2Ring();
   return ring;
 }
+
+// Baked replay-checksum sites: one per trunk layer, each holding a small
+// (k, sum) ring in pinned memory plus a device-side counter. The kernels
+// are recorded into captured graphs, so replayed rounds keep appending -
+// the divergence inside replays becomes visible by k index. A poller
+// thread dumps everything when /tmp/gufo-repchk-dump appears (created via
+// docker exec on the wedged container).
+struct RepChkSite {
+  double* sums = nullptr;
+  unsigned long long* cnts = nullptr;
+  unsigned long long* counter = nullptr;
+};
+struct RepChkRegistry {
+  static constexpr unsigned kCap = 256;
+  static constexpr unsigned kMaxSites = 160;
+  RepChkSite sites[kMaxSites];
+  std::atomic<bool> started{false};
+  std::atomic<bool> on{false};
+  std::thread poller;
+  void start() {
+    if (started.exchange(true)) return;
+    on.store(true);
+    poller = std::thread([this] {
+      const char* dump = "/tmp/gufo-repchk-dump";
+      int ticks = 0;
+      while (true) {
+        struct stat st;
+        const bool trigger = stat(dump, &st) == 0;
+        // A snapshot every second survives a poison exit; the explicit
+        // trigger dumps to stderr for live inspection.
+        if (trigger || ++ticks >= 50) {
+          ticks = 0;
+          FILE* out = trigger ? stderr : std::fopen(
+              "/tmp/gufo-repchk-snap.txt", "w");
+          if (out != nullptr) {
+            if (trigger) {
+              unlink(dump);
+            }
+            for (unsigned s = 0; s < kMaxSites; ++s) {
+              const RepChkSite& site = sites[s];
+              if (site.cnts == nullptr) continue;
+              for (unsigned j = 0; j < kCap; ++j) {
+                const unsigned long long k = site.cnts[j];
+                if (k != 0) {
+                  std::fprintf(out, "tp2dbg repchk site=%u k=%llu sum=%.17g\n",
+                               s, static_cast<unsigned long long>(k),
+                               site.sums[j]);
+                }
+              }
+            }
+            std::fflush(out);
+            if (!trigger) {
+              std::fclose(out);
+            }
+          }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
+    });
+  }
+};
+RepChkRegistry* RepChkGet() {
+  static RepChkRegistry* reg = new RepChkRegistry();
+  return reg;
+}
 }  // namespace
+
+void Executor::RepChkLayer(std::uint32_t layer, const float* data,
+                           std::size_t count) const {
+  RepChkRegistry* reg = RepChkGet();
+  if (!reg->on.load()) {
+    if (std::getenv("GUFO_TP2_REPCHK") == nullptr) {
+      return;
+    }
+    // Host allocations are illegal mid-capture; the first passes are eager,
+    // so sites exist before any recording references them.
+    if (AnyCaptureRecording()) {
+      return;
+    }
+    reg->start();
+  }
+  if (layer >= RepChkRegistry::kMaxSites) {
+    return;
+  }
+  RepChkSite& site = reg->sites[layer];
+  if (site.sums == nullptr) {
+    if (AnyCaptureRecording()) {
+      return;
+    }
+    if (hipHostMalloc(&site.sums, RepChkRegistry::kCap * sizeof(double),
+                      hipHostMallocDefault) != hipSuccess ||
+        hipHostMalloc(&site.cnts,
+                      RepChkRegistry::kCap * sizeof(unsigned long long),
+                      hipHostMallocDefault) != hipSuccess ||
+        hipMalloc(&site.counter, sizeof(unsigned long long)) != hipSuccess) {
+      site.sums = nullptr;
+      return;
+    }
+    std::memset(site.cnts, 0,
+                RepChkRegistry::kCap * sizeof(unsigned long long));
+    (void)hipMemset(site.counter, 0, sizeof(unsigned long long));
+  }
+  DebugReplayChecksum(data, count, site.sums, site.cnts, site.counter,
+                      static_cast<int>(RepChkRegistry::kCap), stream_);
+}
 
 void Tp2RingSum(const char* label, const float* data, std::size_t count,
                 hipStream_t stream) {
@@ -4707,9 +4813,38 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       }
       normed = LayerBack(il, n);
     }
+      // GUFO_TP2_REPCHK: baked per-layer residual checksum - fires
+      // on every execution incl. graph replays, k-indexed per rank.
+      RepChkLayer(il, s_.res,
+                 static_cast<std::size_t>(skipped != 0 ? n - skipped : n) *
+                     config().HcDim());
   }
   if (end_layer < c.num_layers) {
     return true;
+  }
+  if (std::getenv("GUFO_TP2_REPCHK") != nullptr) {
+    // Layer-0 cache witness (sites 110-113): the first layer whose output
+    // diverges reads only this state, written by prior rounds. k/v rows are
+    // __half; a fixed row window keeps the kernel bakeable.
+    const DeviceLayer& l0 = model_->layers()[0];
+    const MixerHeads& heads0 = trunk_heads();
+    if (!l0.linear) {
+      const Session::AttentionState& a0 = session.attention_[0];
+      const std::size_t rows = std::min<std::uint64_t>(
+          8192, static_cast<std::uint64_t>(session.max_context_));
+      const std::size_t words =
+          rows * heads0.attn_kv * heads0.attn_dim / 2;
+      RepChkLayer(110, reinterpret_cast<const float*>(a0.k_cache), words);
+      RepChkLayer(111, reinterpret_cast<const float*>(a0.v_cache), words);
+    } else {
+      const Session::LinearState& s0 = session.linear_[0];
+      RepChkLayer(112, s0.conv_state,
+                  static_cast<std::size_t>(c.ssm_conv_kernel - 1) *
+                      heads0.SsmConvChannels());
+      RepChkLayer(113, s0.state,
+                  static_cast<std::size_t>(heads0.ssm_v) * heads0.ssm_dim *
+                      heads0.ssm_dim);
+    }
   }
   if (checkpoint) {
     if (checkpoint->hidden_rows != 0 &&
@@ -4771,6 +4906,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
         Tp2RingSum(bh_lab, s_.res + skip * c.HcDim(), c.HcDim(), stream_);
       }
     }
+    RepChkLayer(100, s_.res + skip * c.HcDim(),
+                static_cast<std::size_t>(n_logits) * c.HcDim());
     if (!HcMix(head, s_.res + skip * c.HcDim(), false, s_.mixed, nullptr,
                n_logits, error_msg)) {
       return false;
@@ -4789,6 +4926,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
         Tp2RingSum(bmx_lab, s_.mixed, c.hidden_size, stream_);
       }
     }
+    RepChkLayer(101, s_.mixed,
+                static_cast<std::size_t>(n_logits) * c.hidden_size);
     if (!Dense(model_->output(), s_.mixed, s_.logits, n_logits, error_msg)) {
       return false;
     }
@@ -4807,6 +4946,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                    static_cast<std::size_t>(n_logits) * c.vocab_size, stream_);
       }
     }
+    RepChkLayer(102, s_.logits,
+                static_cast<std::size_t>(n_logits) * c.vocab_size);
     if (download_logits &&
         !Check(hipMemcpyAsync(logits_host_, s_.logits,
                               static_cast<std::size_t>(n_logits) *
@@ -5975,6 +6116,22 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
   // Proposal selection has finished. Its two ID buffers and argmax scratch
   // can be reused until the next draft head overwrites them.
   const auto vocab = config().vocab_size;
+  if (std::getenv("GUFO_TP2_REPCHK") != nullptr && !AnyCaptureRecording()) {
+    // Consumer-side witness: every compute stage is checksum-clean into the
+    // wedge, so a greedy split means THIS read resolved differently - the
+    // source pointer, or the buffer's content between write and read.
+    static thread_local unsigned long long gseq = 0;
+    ++gseq;
+    char glab[128];
+    std::snprintf(glab, sizeof glab,
+                  "greedyin seq=%llu rows=%zu vocab=%u src=%s delta=%td", gseq,
+                  rows, vocab, selected_logits_ != nullptr ? "sel" : "slogits",
+                  selected_logits_ != nullptr
+                      ? selected_logits_ - batch_logits_
+                      : static_cast<std::ptrdiff_t>(-1));
+    Tp2RingSum(glab, VerificationLogits(),
+               static_cast<std::size_t>(rows) * vocab, stream_);
+  }
   // Keep the host upload alive until the final stream synchronization. This
   // workspace is shared, never part of a session or its persistent snapshot.
   std::vector<sampling::TokenPenalty> penalties;

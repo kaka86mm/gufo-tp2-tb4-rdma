@@ -1142,6 +1142,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
       Tp2RingSum(lab, base.res,
                  static_cast<std::size_t>(rows) * config().HcDim(), stream_);
     }
+    RepChkLayer(103, base.res,
+                static_cast<std::size_t>(rows) * config().HcDim());
     if (!HcMixBatch(model_->hc_head(), base.res, false, base.mixed, nullptr,
                     rows, error)) {
       return false;
@@ -1152,6 +1154,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
       Tp2RingSum(lab, base.mixed,
                  static_cast<std::size_t>(rows) * config().hidden_size, stream_);
     }
+    RepChkLayer(104, base.mixed,
+                static_cast<std::size_t>(rows) * config().hidden_size);
     if (!DenseBatch(model_->output(), base.mixed, batch_logits_, rows, error)) {
       return false;
     }
@@ -1161,6 +1165,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
       Tp2RingSum(lab, batch_logits_,
                  static_cast<std::size_t>(rows) * config().vocab_size, stream_);
     }
+    RepChkLayer(105, batch_logits_,
+                static_cast<std::size_t>(rows) * config().vocab_size);
     return true;
   };
   bool ok = false;

@@ -8678,6 +8678,43 @@ void DebugRingChecksum(const float* data, std::size_t count, double* sum_slot,
                      stream, data, count, sum_slot, tag_slot, tag);
 }
 
+__global__ void DebugReplayChecksumKernel(
+    const float* __restrict__ data, std::size_t count, double* sums,
+    unsigned long long* cnts, unsigned long long* counter, int cap) {
+  __shared__ double partial[kThreads];
+  const std::size_t stride =
+      static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  std::uint64_t sum = 0;
+  for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+       i < count; i += stride) {
+    sum += reinterpret_cast<const std::uint32_t*>(data)[i];
+  }
+  partial[threadIdx.x] = static_cast<double>(sum);
+  __syncthreads();
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    double total = 0.0;
+    for (int i = 0; i < blockDim.x; ++i) {
+      total += partial[i];
+    }
+    // The device-side counter makes the entry index survive graph replays:
+    // each execution (eager, recording, or replayed) appends one ring entry,
+    // and both ranks advance their counters in lockstep.
+    const unsigned long long k = *counter + 1;
+    sums[k % cap] = total;
+    __threadfence();
+    cnts[k % cap] = k;
+    *counter = k;
+  }
+}
+
+void DebugReplayChecksum(const float* data, std::size_t count, double* sums,
+                         unsigned long long* cnts, unsigned long long* counter,
+                         int cap, hipStream_t stream) {
+  hipLaunchKernelGGL(DebugReplayChecksumKernel, dim3(1), dim3(kThreads), 0,
+                     stream, data, count, sums, cnts, counter, cap);
+}
+
 void AddRowsBroadcast(const float* embedding, float* residual,
                       std::uint32_t n_tokens, std::uint32_t hidden,
                       std::uint32_t streams, hipStream_t stream) {
