@@ -3708,20 +3708,25 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
                 static_cast<std::size_t>(rank) * half * (output.cols / 32) * 34;
     float* exchange = s_.logits + half;
     if (std::getenv("GUFO_TP2_DRAFTCHK") != nullptr) {
-      // The two comparable points of the split-vocab path: the shared
-      // post-AR activation feeding the head, and the crossed candidate
-      // row after the single-row all-reduce.
+      // The comparable points of the split-vocab path: the head's mixed
+      // input row, the residual row feeding the head's HcMix, and the
+      // crossed candidate row after the single-row all-reduce. The
+      // residual row narrows the divergence to before-or-after the final
+      // deferred epilogue that settles on it.
       static thread_local double* split_dbg = nullptr;
       if (split_dbg == nullptr &&
-          hipHostMalloc(&split_dbg, 2 * sizeof(double),
+          hipHostMalloc(&split_dbg, 3 * sizeof(double),
                         hipHostMallocDefault) == hipSuccess) {
         // allocated
       }
       if (split_dbg != nullptr) {
+        const std::size_t hc_dim = config().HcDim();
         DebugChecksum(s_.mixed, width, split_dbg, stream_);
+        DebugChecksum(res, hc_dim, split_dbg + 1, stream_);
         if (hipStreamSynchronize(stream_) == hipSuccess) {
-          std::fprintf(stderr, "tp2dbg splitchk pre mixed=%.17g\n",
-                       split_dbg[0]);
+          std::fprintf(stderr,
+                       "tp2dbg splitchk pre mixed=%.17g res=%.17g\n",
+                       split_dbg[0], split_dbg[1]);
         }
       }
     }
