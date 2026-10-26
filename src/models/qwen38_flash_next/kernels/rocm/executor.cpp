@@ -2830,6 +2830,23 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   const std::uint32_t channels = heads.SsmConvChannels();
   const float* qkv = s_.qkv;
   const float* z = s_.z;
+  if (std::getenv("GUFO_TP2_REPCHK") != nullptr &&
+      &l == &model_->layers()[0]) {
+    // Layer-0 GDN witness set: entry state (114/115 - an external writer
+    // between rounds shows as a mismatch vs the previous round's 112/113),
+    // and the scan's direct inputs (116/117) whose projections no other
+    // site covers. The residual bit-sum is ULP-sensitive, so with res clean
+    // and state diverged the origin is inside this path.
+    RepChkLayer(114, s.conv_state,
+                static_cast<std::size_t>(c.ssm_conv_kernel - 1) * channels);
+    RepChkLayer(115, s.state,
+                static_cast<std::size_t>(heads.ssm_v) * heads.ssm_dim *
+                    heads.ssm_dim);
+    RepChkLayer(116, s_.qkv,
+                static_cast<std::size_t>(n_tokens) * channels);
+    RepChkLayer(117, s_.alpha_beta,
+                static_cast<std::size_t>(n_tokens) * l.ssm_alpha_beta.rows);
+  }
   std::uint32_t qkv_stride = channels;
   std::uint32_t z_stride = heads.SsmValueDim();
   bool convolved = false;
@@ -4128,17 +4145,37 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
       std::fprintf(stderr, "tp2dbg replay key=%llu\n",
                    static_cast<unsigned long long>(key));
     }
-    if (const auto it = session.graphs_.find(key);
-        it != session.graphs_.end()) {
-      exec = it->second;
-      if (const auto state = session.graph_states_.find(key);
-          state != session.graph_states_.end() && tp2_trace &&
-          state->second != dispatch_state()) {
+    const auto baked_state_usable = [&](std::uint64_t key_) {
+      const auto it = session.graphs_.find(key_);
+      if (it == session.graphs_.end()) {
+        return true;
+      }
+      const auto state = session.graph_states_.find(key_);
+      if (state == session.graph_states_.end() ||
+          state->second == dispatch_state()) {
+        return true;
+      }
+      // The graph's kernel arguments were baked against a different
+      // producer/dispatch state (e.g. the alternating Q8 slot): replaying
+      // would read stale quantized activations and silently diverge the
+      // ranks - the exact face-2 signature (identical inputs, diverged
+      // GDN state / projections, replay-only). Both ranks derive dispatch
+      // state from the mirrored instruction stream, so both detect the
+      // mismatch at the same run and take the replacement route together.
+      if (tp2_trace) {
         std::fprintf(stderr,
                      "tp2dbg MISMATCH key=%llu baked=%s now=%s\n",
-                     static_cast<unsigned long long>(key),
+                     static_cast<unsigned long long>(key_),
                      state->second.c_str(), dispatch_state().c_str());
       }
+      (void)hipGraphExecDestroy(it->second);
+      session.graphs_.erase(it);
+      session.graph_states_.erase(state);
+      return false;
+    };
+    if (const auto it = session.graphs_.find(key);
+        it != session.graphs_.end() && baked_state_usable(key)) {
+      exec = it->second;
     } else {
       std::uint64_t standing_owner = 0;
       // A warmed target shape may need its first graph or a replacement
