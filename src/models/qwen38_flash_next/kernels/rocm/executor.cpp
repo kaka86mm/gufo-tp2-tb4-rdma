@@ -3972,6 +3972,37 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
                  static_cast<int>(graph), static_cast<int>(synchronize),
                  static_cast<int>(session.warmed_.contains(key)));
   }
+  // Graph-set symmetry gate: the replay-vs-recapture choice below is a
+  // rank-local look at graphs_/warmed_, but trims and resets shift those
+  // sets at rank-local times (a lagged reset on one rank destroys verifier
+  // graphs the peer still holds). One side recapturing - extra prepass
+  // exchanges - while the other replays desyncs the exchange sequence and
+  // poisons the communicator (outgoing/incoming op mismatch). Both ranks
+  // vote through one scalar all-reduce BEFORE branching; if either side
+  // lacks the graph, both drop it and take the full capture path together.
+  if (graph && synchronize && tp2_graphs &&
+      model_->tp_world_size() > 1 && (key & (std::uint64_t{1} << 40)) == 0) {
+    const bool holds = session.warmed_.contains(key) &&
+                       session.graphs_.contains(key);
+    float vote = holds ? 0.0F : 1.0F;
+    if (!AllReduce(&vote, 1, error_msg)) {
+      return false;
+    }
+    if (vote != 0.0F && !holds) {
+      // Asymmetric graph sets (a lagged trim or reset destroyed this shape's
+      // graph on one rank only). The holder replays; this rank runs the SAME
+      // pass eagerly - an eager pass and a replay of one shape fire the
+      // identical exchange sequence, so the op streams stay paired. Forcing
+      // a synchronized recapture instead (either route) faults the GPU.
+      // The sets re-converge at the next reset; until then this one shape
+      // runs eager here at replay speed's cost only.
+      graph = false;
+      if (tp2_trace) {
+        std::fprintf(stderr, "tp2dbg graphgate key=%llu eager-fallback\n",
+                     static_cast<unsigned long long>(key));
+      }
+    }
+  }
   // Taken by the replay branch; held until Run returns so the launch's
   // standing fires and the drain stay serialized across sessions.
   struct ReplaySlot {
