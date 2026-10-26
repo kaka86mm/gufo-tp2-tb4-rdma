@@ -6010,15 +6010,41 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
         // empty
       }
       if (draft_dbg != nullptr) {
-        const float* src =
-            hidden_source ? hidden_source : session.mtp_.target_hidden;
-        DebugChecksum(src, static_cast<std::size_t>(hc_dim), draft_dbg,
-                      stream_);
-        DebugChecksum(session.mtp_.h, static_cast<std::size_t>(n * hc_dim),
-                      draft_dbg + 1, stream_);
-        if (hipStreamSynchronize(stream_) == hipSuccess) {
-          std::fprintf(stderr, "tp2dbg draftchk h_src=%.17g h_carry=%.17g\n",
-                       draft_dbg[0], draft_dbg[1]);
+        // Per-row checksums of the carried hidden plus the device-selected
+        // row: names WHICH row diverges and whether the selection itself
+        // differs across ranks.
+        static thread_local double* row_dbg = nullptr;
+        static thread_local std::uint32_t* row_sel = nullptr;
+        if (row_dbg == nullptr &&
+            hipHostMalloc(&row_dbg, 8 * sizeof(double),
+                          hipHostMallocDefault) == hipSuccess &&
+            hipHostMalloc(&row_sel, sizeof(std::uint32_t),
+                          hipHostMallocDefault) == hipSuccess) {
+          // allocated
+        }
+        // Rows past the selected one are often never-written allocation
+        // garbage (frozen values prove it): checksum only the selected
+        // row, plus the draft KV frontier rows the attention reads.
+        // Checksum the DRAFT'S FULL KV caches (every row it can attend
+        // over), not a fixed prefix: the divergence carrier may sit in
+        // rolled-back speculative rows anywhere in the window.
+        if (row_dbg != nullptr && row_sel != nullptr) {
+          const std::size_t mtp_kv_floats =
+              static_cast<std::size_t>(session.max_context_) *
+              model_->mtp().heads.AttentionKvDim() / 2;
+          (void)hipMemcpyAsync(row_sel, &session.control_->hidden_row,
+                               sizeof(std::uint32_t),
+                               hipMemcpyDeviceToHost, stream_);
+          DebugChecksum(reinterpret_cast<const float*>(
+                            session.mtp_.k_cache),
+                        mtp_kv_floats, row_dbg, stream_);
+          DebugChecksum(reinterpret_cast<const float*>(
+                            session.mtp_.v_cache),
+                        mtp_kv_floats, row_dbg + 1, stream_);
+          if (hipStreamSynchronize(stream_) == hipSuccess) {
+            std::fprintf(stderr, "tp2dbg draftchk k_all=%.17g v_all=%.17g\n",
+                         row_dbg[0], row_dbg[1]);
+          }
         }
       }
     }
