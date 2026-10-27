@@ -67,6 +67,24 @@ GdnBakedStatePtrs() {
   static std::unordered_map<const void*, std::pair<const void*, const void*>> m;
   return m;
 }
+
+// Per-session site slots: the k rings are shared across sessions, so
+// cross-rank k comparison mixes sessions whenever the two engines
+// interleave rounds in different order. Deriving the site id from the
+// LinearState's stable address keeps each session's sequence on its own
+// sites, immune to scheduling-order skew.
+std::unordered_map<const void*, unsigned>& SessionSlots() {
+  static std::unordered_map<const void*, unsigned> m;
+  return m;
+}
+unsigned SessionSlot(const void* linear_state) {
+  auto& m = SessionSlots();
+  auto it = m.find(linear_state);
+  if (it != m.end()) return it->second;
+  const unsigned slot = static_cast<unsigned>(m.size());
+  m.emplace(linear_state, slot);
+  return slot;
+}
 // Set on ANY thread while it records a capture: peer threads must not
 // synchronize or launch instrumentation on the shared stream meanwhile
 // (ThreadLocal mode invalidates the capture silently, with no HIP error
@@ -140,7 +158,7 @@ struct RepChkSite {
   unsigned long long* counter = nullptr;
 };
 struct RepChkRegistry {
-  static constexpr unsigned kCap = 256;
+  static constexpr unsigned kCap = 4096;
   static constexpr unsigned kMaxSites = 160;
   RepChkSite sites[kMaxSites];
   std::atomic<bool> started{false};
@@ -2873,9 +2891,10 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
     // and the scan's direct inputs (116/117) whose projections no other
     // site covers. The residual bit-sum is ULP-sensitive, so with res clean
     // and state diverged the origin is inside this path.
-    RepChkLayer(114, s.conv_state,
+    const unsigned slot = SessionSlot(&s);
+    RepChkLayer(320 + slot, s.conv_state,
                 static_cast<std::size_t>(c.ssm_conv_kernel - 1) * channels);
-    RepChkLayer(115, s.state,
+    RepChkLayer(300 + slot, s.state,
                 static_cast<std::size_t>(heads.ssm_v) * heads.ssm_dim *
                     heads.ssm_dim);
     RepChkLayer(116, s_.qkv,
@@ -3046,6 +3065,17 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                     c.SsmConvChannels());
     RepChkLayer(122, s_.gdn_raw,
                 static_cast<std::size_t>(n_tokens) * c.SsmValueDim());
+    // The REAL scan inputs: qkv/z/alpha_beta are written by projections
+    // INSIDE this function (after the entry sites), so checksumming them at
+    // entry measured the previous round's data. Here they hold what
+    // GatedDeltaNet is about to consume.
+    const unsigned slot = SessionSlot(&s);
+    RepChkLayer(340 + slot, qkv,
+                static_cast<std::size_t>(n_tokens) * qkv_stride);
+    RepChkLayer(360 + slot, z,
+                static_cast<std::size_t>(n_tokens) * z_stride);
+    RepChkLayer(380 + slot, s_.alpha_beta,
+                static_cast<std::size_t>(n_tokens) * 2 * c.ssm_num_v_heads);
   }
   GatedDeltaNet(qkv, qkv_stride, z, z_stride, s_.alpha_beta, l.ssm_conv1d.f32(),
                 l.ssm_a.f32(), l.ssm_dt.f32(), l.ssm_norm.f32(), s.conv_state,
@@ -4959,10 +4989,11 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       RepChkLayer(111, reinterpret_cast<const float*>(a0.v_cache), words);
     } else {
       const Session::LinearState& s0 = session.linear_[0];
-      RepChkLayer(112, s0.conv_state,
+      const unsigned slot0 = SessionSlot(&s0);
+      RepChkLayer(420 + slot0, s0.conv_state,
                   static_cast<std::size_t>(c.ssm_conv_kernel - 1) *
                       heads0.SsmConvChannels());
-      RepChkLayer(113, s0.state,
+      RepChkLayer(400 + slot0, s0.state,
                   static_cast<std::size_t>(heads0.ssm_v) * heads0.ssm_dim *
                       heads0.ssm_dim);
     }
