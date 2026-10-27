@@ -2994,6 +2994,20 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                  static_cast<int>(out_q8_1), static_cast<int>(half_output),
                  static_cast<int>(convolved), static_cast<int>(z_streams != nullptr),
                  n_tokens);
+    // The exact pointers baked into this recording's GatedDeltaNet nodes.
+    // Both ranks allocate in lockstep, so device addresses should match; a
+    // mismatch is a session-slot/allocation skew feeding different buffers
+    // through otherwise identical graphs.
+    std::fprintf(stderr,
+                 "tp2dbg gdnptrs key=%llu st=%p cv=%p qkv=%p z=%p ab=%p "
+                 "qn=%p kn=%p cs=%p raw=%p\n",
+                 static_cast<unsigned long long>(g_recording_key),
+                 static_cast<void*>(s.state), static_cast<void*>(s.conv_state),
+                 reinterpret_cast<void*>(const_cast<float*>(qkv)), reinterpret_cast<void*>(const_cast<float*>(z)),
+                 reinterpret_cast<void*>(s_.alpha_beta), reinterpret_cast<void*>(s_.qn),
+                 static_cast<void*>(s_.kn),
+                 static_cast<void*>(s_.conv_scratch),
+                 static_cast<void*>(s_.gdn_raw));
   }
   if (std::getenv("GUFO_TP2_REPCHK") != nullptr &&
       &l == &model_->layers()[0]) {
