@@ -4416,9 +4416,10 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
               hipKernelNodeParams params{};
               if (hipGraphKernelNodeGetParams(node, &params) ==
                   hipSuccess) {
-                std::snprintf(item, sizeof(item), " k%u.%u.%u/%u",
+                std::snprintf(item, sizeof(item), " k%u.%u.%u/%u@%p",
                               params.gridDim.x, params.gridDim.y,
-                              params.gridDim.z, params.blockDim.x);
+                              params.gridDim.z, params.blockDim.x,
+                              params.func);
                 // Reading kernelParams blindly is unsafe (no public arg
                 // count); the enqueue-time ar-args print covers the
                 // exchange scalars instead.

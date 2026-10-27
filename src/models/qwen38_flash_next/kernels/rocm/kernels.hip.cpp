@@ -8684,11 +8684,16 @@ __global__ void DebugReplayChecksumKernel(
   __shared__ double partial[kThreads];
   const std::size_t stride =
       static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  // Position-mixed hash: a plain bit-sum is invariant under element
+  // permutations and stale/fresh line mixes, so "identical" sums do not
+  // prove element-wise equality. XOR with a position-dependent constant
+  // makes every element's slot in the hash unique.
   std::uint64_t sum = 0;
   for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x +
                        threadIdx.x;
        i < count; i += stride) {
-    sum += reinterpret_cast<const std::uint32_t*>(data)[i];
+    const std::uint32_t bits = reinterpret_cast<const std::uint32_t*>(data)[i];
+    sum += bits ^ (static_cast<std::uint32_t>(i) * 0x9E3779B9u);
   }
   partial[threadIdx.x] = static_cast<double>(sum);
   __syncthreads();
