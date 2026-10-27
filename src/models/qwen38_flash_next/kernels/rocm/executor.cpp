@@ -7,6 +7,8 @@
 #include <sstream>
 #include <array>
 #include <atomic>
+#include <unordered_map>
+#include <utility>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <string>
@@ -54,6 +56,17 @@ thread_local int capture_depth = 0;
 // launch sites tag their host-side path decisions with the graph they
 // will be baked into (GUFO_TP2_REPCHK variant comparison).
 thread_local std::uint64_t g_recording_key = 0;
+
+// Baked GDN state pointers per LinearState (recorded when a graph for
+// this state is captured). If the session's buffers ever move while a
+// graph referencing them survives, replays write FREED memory - the
+// ghost-write hazard: eager passes read the live buffers (clean), the
+// baked checksums read the ghost (divergent, reuse-dependent).
+std::unordered_map<const void*, std::pair<const void*, const void*>>&
+GdnBakedStatePtrs() {
+  static std::unordered_map<const void*, std::pair<const void*, const void*>> m;
+  return m;
+}
 // Set on ANY thread while it records a capture: peer threads must not
 // synchronize or launch instrumentation on the shared stream meanwhile
 // (ThreadLocal mode invalidates the capture silently, with no HIP error
@@ -2844,6 +2857,17 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   }
   if (std::getenv("GUFO_TP2_REPCHK") != nullptr &&
       &l == &model_->layers()[0]) {
+    if (const auto baked = GdnBakedStatePtrs().find(&s);
+        baked != GdnBakedStatePtrs().end() &&
+        (baked->second.first != s.state ||
+         baked->second.second != s.conv_state)) {
+      std::fprintf(stderr,
+                   "tp2dbg GHOST linear=%p baked_st=%p now_st=%p "
+                   "baked_cv=%p now_cv=%p\n",
+                   static_cast<void*>(&s), baked->second.first,
+                   static_cast<void*>(s.state), baked->second.second,
+                   static_cast<void*>(s.conv_state));
+    }
     // Layer-0 GDN witness set: entry state (114/115 - an external writer
     // between rounds shows as a mismatch vs the previous round's 112/113),
     // and the scan's direct inputs (116/117) whose projections no other
@@ -2998,6 +3022,7 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
     // Both ranks allocate in lockstep, so device addresses should match; a
     // mismatch is a session-slot/allocation skew feeding different buffers
     // through otherwise identical graphs.
+    GdnBakedStatePtrs()[&s] = {s.state, s.conv_state};
     std::fprintf(stderr,
                  "tp2dbg gdnptrs key=%llu st=%p cv=%p qkv=%p z=%p ab=%p "
                  "qn=%p kn=%p cs=%p raw=%p\n",
