@@ -159,7 +159,7 @@ struct RepChkSite {
 };
 struct RepChkRegistry {
   static constexpr unsigned kCap = 4096;
-  static constexpr unsigned kMaxSites = 160;
+  static constexpr unsigned kMaxSites = 512;
   RepChkSite sites[kMaxSites];
   std::atomic<bool> started{false};
   std::atomic<bool> on{false};
