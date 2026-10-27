@@ -50,6 +50,10 @@ std::size_t ar_debug_count = 0;
 // capturing stream blocks forever, so Run brackets the capture and Drain
 // consults this counter instead of the HIP API.
 thread_local int capture_depth = 0;
+// The shape key currently being recorded on this thread; lets nested
+// launch sites tag their host-side path decisions with the graph they
+// will be baked into (GUFO_TP2_REPCHK variant comparison).
+thread_local std::uint64_t g_recording_key = 0;
 // Set on ANY thread while it records a capture: peer threads must not
 // synchronize or launch instrumentation on the shared stream meanwhile
 // (ThreadLocal mode invalidates the capture silently, with no HIP error
@@ -2831,6 +2835,14 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   const float* qkv = s_.qkv;
   const float* z = s_.z;
   if (std::getenv("GUFO_TP2_REPCHK") != nullptr &&
+      &l == &model_->layers()[0] && g_recording_key != 0) {
+    std::fprintf(stderr,
+                 "tp2dbg gdnvar key=%llu proj_ready=%d spec=%d n=%u\n",
+                 static_cast<unsigned long long>(g_recording_key),
+                 static_cast<int>(projections_ready),
+                 static_cast<int>(speculative), n_tokens);
+  }
+  if (std::getenv("GUFO_TP2_REPCHK") != nullptr &&
       &l == &model_->layers()[0]) {
     // Layer-0 GDN witness set: entry state (114/115 - an external writer
     // between rounds shows as a mismatch vs the previous round's 112/113),
@@ -2972,6 +2984,17 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                         c.ssm_head_dim == 128 &&
                         l.ssm_out.type == GgmlType::kQ8_0 &&
                         l.ssm_out.cols == value_dim && UnpaddedQ8(value_dim);
+  if (std::getenv("GUFO_TP2_REPCHK") != nullptr &&
+      &l == &model_->layers()[0] && g_recording_key != 0) {
+    std::fprintf(stderr,
+                 "tp2dbg gdnflags key=%llu tiled=%d out_q8_1=%d "
+                 "half_output=%d convolved=%d z_streams=%d n=%u\n",
+                 static_cast<unsigned long long>(g_recording_key),
+                 static_cast<int>(MatrixRows(n_tokens) && !speculative),
+                 static_cast<int>(out_q8_1), static_cast<int>(half_output),
+                 static_cast<int>(convolved), static_cast<int>(z_streams != nullptr),
+                 n_tokens);
+  }
   if (std::getenv("GUFO_TP2_REPCHK") != nullptr &&
       &l == &model_->layers()[0]) {
     // Round-local scratch as GatedDeltaNet actually sees it (post-conv,
@@ -4283,6 +4306,7 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
       }
       ++capture_depth;
       any_capture_recording.fetch_add(1);
+      g_recording_key = key;
       if (standing_owner == 0) {
         // A capture without a prepass minted nothing above.
         standing_owner = next_standing_owner_++;
@@ -4318,6 +4342,7 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
         std::fprintf(stderr, "tp2dbg rec-unwind-b key=%llu\n",
                      static_cast<unsigned long long>(key));
       }
+      g_recording_key = 0;
       --capture_depth;
       any_capture_recording.fetch_sub(1);
       // The recording body ran with cleared producer caches and leaves
