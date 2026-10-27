@@ -2846,6 +2846,12 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                 static_cast<std::size_t>(n_tokens) * channels);
     RepChkLayer(117, s_.alpha_beta,
                 static_cast<std::size_t>(n_tokens) * l.ssm_alpha_beta.rows);
+    RepChkLayer(118, s_.z,
+                static_cast<std::size_t>(n_tokens) * heads.SsmValueDim());
+    // The host-side alternation counter: if its history diverges across
+    // ranks, an eager projection reads a slot whose stale content was
+    // written by a different previous quantization on each rank.
+    std::fprintf(stderr, "tp2dbg q8slot v=%u n=%u\n", q8_slot_, n_tokens);
   }
   std::uint32_t qkv_stride = channels;
   std::uint32_t z_stride = heads.SsmValueDim();
@@ -2966,6 +2972,19 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                         c.ssm_head_dim == 128 &&
                         l.ssm_out.type == GgmlType::kQ8_0 &&
                         l.ssm_out.cols == value_dim && UnpaddedQ8(value_dim);
+  if (std::getenv("GUFO_TP2_REPCHK") != nullptr &&
+      &l == &model_->layers()[0]) {
+    // Round-local scratch as GatedDeltaNet actually sees it (post-conv,
+    // pre-scan). With state/qkv/ab/z all proven bit-identical at the
+    // divergence round, these buffers are the last unverified inputs.
+    RepChkLayer(119, s_.qn, static_cast<std::size_t>(n_tokens) * c.SsmKeyDim());
+    RepChkLayer(120, s_.kn, static_cast<std::size_t>(n_tokens) * c.SsmKeyDim());
+    RepChkLayer(121, s_.conv_scratch,
+                (static_cast<std::size_t>(n_tokens) + c.ssm_conv_kernel) *
+                    c.SsmConvChannels());
+    RepChkLayer(122, s_.gdn_raw,
+                static_cast<std::size_t>(n_tokens) * c.SsmValueDim());
+  }
   GatedDeltaNet(qkv, qkv_stride, z, z_stride, s_.alpha_beta, l.ssm_conv1d.f32(),
                 l.ssm_a.f32(), l.ssm_dt.f32(), l.ssm_norm.f32(), s.conv_state,
                 s_.conv_scratch, s_.qn, s_.kn, s_.gdn_raw, s.state, s_.gdn_out,
