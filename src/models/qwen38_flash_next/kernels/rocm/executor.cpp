@@ -81,7 +81,8 @@ unsigned SessionSlot(const void* linear_state) {
   auto& m = SessionSlots();
   auto it = m.find(linear_state);
   if (it != m.end()) return it->second;
-  const unsigned slot = static_cast<unsigned>(m.size());
+  // Unregistered (created before REPCHK saw it): fall back to first touch.
+  const unsigned slot = 100 + static_cast<unsigned>(m.size());
   m.emplace(linear_state, slot);
   return slot;
 }
@@ -1652,6 +1653,14 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   s->index_capacity_ = IndexerCapacity(c, options_.max_batch, max_context);
   s->linear_.resize(c.num_layers);
   s->attention_.resize(c.num_layers);
+  if (std::getenv("GUFO_TP2_REPCHK") != nullptr && !s->linear_.empty()) {
+    // Creation order is mirrored by the instruction stream, so this slot
+    // id is rank-invariant - unlike first-touch order, which the two
+    // engines can interleave differently (the source of the w49 artifact:
+    // same-numbered slots held different sessions' data).
+    static unsigned next_creation_slot = 0;
+    SessionSlots()[&s->linear_[0]] = next_creation_slot++;
+  }
   auto& a = s->allocations_;
   // The trunk's state holds this rank's heads; the draft block's all of them.
   const MixerHeads& heads = model_->trunk_heads();
