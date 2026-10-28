@@ -1664,6 +1664,27 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   auto& a = s->allocations_;
   // The trunk's state holds this rank's heads; the draft block's all of them.
   const MixerHeads& heads = model_->trunk_heads();
+  if (std::getenv("GUFO_TP2_REPCHK") != nullptr) {
+    // Deterministic zeros on creation: recycled bytes differ per rank
+    // (allocation history), and full-buffer state checksums would report
+    // that stale-region noise as divergence from k=1. Zeroed, the state
+    // sites' first true divergence is the live GDN-state divergence.
+    for (const auto& ls : s->linear_) {
+      if (ls.conv_state != nullptr) {
+        (void)hipMemsetAsync(ls.conv_state, 0,
+                             static_cast<std::size_t>(c.ssm_conv_kernel - 1) *
+                                 heads.SsmConvChannels() * sizeof(float),
+                             stream_);
+      }
+      if (ls.state != nullptr) {
+        (void)hipMemsetAsync(
+            ls.state, 0,
+            static_cast<std::size_t>(heads.ssm_v) * heads.ssm_dim *
+                heads.ssm_dim * sizeof(float),
+            stream_);
+      }
+    }
+  }
   const std::size_t kv_row = heads.AttentionKvDim();
   const std::size_t conv_elems =
       static_cast<std::size_t>(c.ssm_conv_kernel - 1) * heads.SsmConvChannels();
@@ -2900,10 +2921,9 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
     // and the scan's direct inputs (116/117) whose projections no other
     // site covers. The residual bit-sum is ULP-sensitive, so with res clean
     // and state diverged the origin is inside this path.
-    const unsigned slot = SessionSlot(&s);
-    RepChkLayer(320 + slot, s.conv_state,
+    RepChkLayer(114, s.conv_state,
                 static_cast<std::size_t>(c.ssm_conv_kernel - 1) * channels);
-    RepChkLayer(300 + slot, s.state,
+    RepChkLayer(115, s.state,
                 static_cast<std::size_t>(heads.ssm_v) * heads.ssm_dim *
                     heads.ssm_dim);
     RepChkLayer(116, s_.qkv,
@@ -3078,12 +3098,9 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
     // INSIDE this function (after the entry sites), so checksumming them at
     // entry measured the previous round's data. Here they hold what
     // GatedDeltaNet is about to consume.
-    const unsigned slot = SessionSlot(&s);
-    RepChkLayer(340 + slot, qkv,
-                static_cast<std::size_t>(n_tokens) * qkv_stride);
-    RepChkLayer(360 + slot, z,
-                static_cast<std::size_t>(n_tokens) * z_stride);
-    RepChkLayer(380 + slot, s_.alpha_beta,
+    RepChkLayer(123, qkv, static_cast<std::size_t>(n_tokens) * qkv_stride);
+    RepChkLayer(124, z, static_cast<std::size_t>(n_tokens) * z_stride);
+    RepChkLayer(125, s_.alpha_beta,
                 static_cast<std::size_t>(n_tokens) * 2 * c.ssm_num_v_heads);
   }
   GatedDeltaNet(qkv, qkv_stride, z, z_stride, s_.alpha_beta, l.ssm_conv1d.f32(),
@@ -4834,6 +4851,12 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                          .emb_row = 0};
   bool normed = false;  ///< xn holds the next mixer's grouped norm of res
   for (std::uint32_t il = first_layer; il < end_layer; ++il) {
+    if (il == first_layer && std::getenv("GUFO_TP2_REPCHK") != nullptr) {
+      // Scratch-only ladder (session-mix immune where interleaves align):
+      // the trunk batch's input residual rows as layer 0 sees them.
+      RepChkLayer(130, s_.res,
+                  static_cast<std::size_t>(n) * config().HcDim());
+    }
     if (!options_.all_reduce) {
       if (!session.CheckCancellation(error_msg))
         return false;
@@ -4943,6 +4966,11 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                    last_attention)) {
       return false;
     }
+    if (il == first_layer && std::getenv("GUFO_TP2_REPCHK") != nullptr) {
+      // Layer 0's mixed output: MixerPart's HcMix wrote s_.mixed (scratch).
+      RepChkLayer(131, s_.mixed,
+                  static_cast<std::size_t>(n) * config().hidden_size);
+    }
     // Cache updates precede the FFN. Without MTP, only requested head rows
     // and the checkpoint frontier consume the final layer's residual.
     // Keep aligned tiles and at least 96 rows to retain the wide arithmetic.
@@ -4998,11 +5026,10 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       RepChkLayer(111, reinterpret_cast<const float*>(a0.v_cache), words);
     } else {
       const Session::LinearState& s0 = session.linear_[0];
-      const unsigned slot0 = SessionSlot(&s0);
-      RepChkLayer(420 + slot0, s0.conv_state,
+      RepChkLayer(112, s0.conv_state,
                   static_cast<std::size_t>(c.ssm_conv_kernel - 1) *
                       heads0.SsmConvChannels());
-      RepChkLayer(400 + slot0, s0.state,
+      RepChkLayer(113, s0.state,
                   static_cast<std::size_t>(heads0.ssm_v) * heads0.ssm_dim *
                       heads0.ssm_dim);
     }
