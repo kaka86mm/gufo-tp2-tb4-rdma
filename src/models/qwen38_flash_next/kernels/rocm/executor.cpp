@@ -7,8 +7,6 @@
 #include <sstream>
 #include <array>
 #include <atomic>
-#include <unordered_map>
-#include <utility>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <string>
@@ -56,36 +54,6 @@ thread_local int capture_depth = 0;
 // launch sites tag their host-side path decisions with the graph they
 // will be baked into (GUFO_TP2_REPCHK variant comparison).
 thread_local std::uint64_t g_recording_key = 0;
-
-// Baked GDN state pointers per LinearState (recorded when a graph for
-// this state is captured). If the session's buffers ever move while a
-// graph referencing them survives, replays write FREED memory - the
-// ghost-write hazard: eager passes read the live buffers (clean), the
-// baked checksums read the ghost (divergent, reuse-dependent).
-std::unordered_map<const void*, std::pair<const void*, const void*>>&
-GdnBakedStatePtrs() {
-  static std::unordered_map<const void*, std::pair<const void*, const void*>> m;
-  return m;
-}
-
-// Per-session site slots: the k rings are shared across sessions, so
-// cross-rank k comparison mixes sessions whenever the two engines
-// interleave rounds in different order. Deriving the site id from the
-// LinearState's stable address keeps each session's sequence on its own
-// sites, immune to scheduling-order skew.
-std::unordered_map<const void*, unsigned>& SessionSlots() {
-  static std::unordered_map<const void*, unsigned> m;
-  return m;
-}
-unsigned SessionSlot(const void* linear_state) {
-  auto& m = SessionSlots();
-  auto it = m.find(linear_state);
-  if (it != m.end()) return it->second;
-  // Unregistered (created before REPCHK saw it): fall back to first touch.
-  const unsigned slot = 100 + static_cast<unsigned>(m.size());
-  m.emplace(linear_state, slot);
-  return slot;
-}
 // Set on ANY thread while it records a capture: peer threads must not
 // synchronize or launch instrumentation on the shared stream meanwhile
 // (ThreadLocal mode invalidates the capture silently, with no HIP error
@@ -159,8 +127,8 @@ struct RepChkSite {
   unsigned long long* counter = nullptr;
 };
 struct RepChkRegistry {
-  static constexpr unsigned kCap = 4096;
-  static constexpr unsigned kMaxSites = 512;
+  static constexpr unsigned kCap = 256;
+  static constexpr unsigned kMaxSites = 160;
   RepChkSite sites[kMaxSites];
   std::atomic<bool> started{false};
   std::atomic<bool> on{false};
@@ -1653,38 +1621,9 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   s->index_capacity_ = IndexerCapacity(c, options_.max_batch, max_context);
   s->linear_.resize(c.num_layers);
   s->attention_.resize(c.num_layers);
-  if (std::getenv("GUFO_TP2_REPCHK") != nullptr && !s->linear_.empty()) {
-    // Creation order is mirrored by the instruction stream, so this slot
-    // id is rank-invariant - unlike first-touch order, which the two
-    // engines can interleave differently (the source of the w49 artifact:
-    // same-numbered slots held different sessions' data).
-    static unsigned next_creation_slot = 0;
-    SessionSlots()[&s->linear_[0]] = next_creation_slot++;
-  }
   auto& a = s->allocations_;
   // The trunk's state holds this rank's heads; the draft block's all of them.
   const MixerHeads& heads = model_->trunk_heads();
-  if (std::getenv("GUFO_TP2_REPCHK") != nullptr) {
-    // Deterministic zeros on creation: recycled bytes differ per rank
-    // (allocation history), and full-buffer state checksums would report
-    // that stale-region noise as divergence from k=1. Zeroed, the state
-    // sites' first true divergence is the live GDN-state divergence.
-    for (const auto& ls : s->linear_) {
-      if (ls.conv_state != nullptr) {
-        (void)hipMemsetAsync(ls.conv_state, 0,
-                             static_cast<std::size_t>(c.ssm_conv_kernel - 1) *
-                                 heads.SsmConvChannels() * sizeof(float),
-                             stream_);
-      }
-      if (ls.state != nullptr) {
-        (void)hipMemsetAsync(
-            ls.state, 0,
-            static_cast<std::size_t>(heads.ssm_v) * heads.ssm_dim *
-                heads.ssm_dim * sizeof(float),
-            stream_);
-      }
-    }
-  }
   const std::size_t kv_row = heads.AttentionKvDim();
   const std::size_t conv_elems =
       static_cast<std::size_t>(c.ssm_conv_kernel - 1) * heads.SsmConvChannels();
@@ -2905,17 +2844,6 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   }
   if (std::getenv("GUFO_TP2_REPCHK") != nullptr &&
       &l == &model_->layers()[0]) {
-    if (const auto baked = GdnBakedStatePtrs().find(&s);
-        baked != GdnBakedStatePtrs().end() &&
-        (baked->second.first != s.state ||
-         baked->second.second != s.conv_state)) {
-      std::fprintf(stderr,
-                   "tp2dbg GHOST linear=%p baked_st=%p now_st=%p "
-                   "baked_cv=%p now_cv=%p\n",
-                   static_cast<void*>(&s), baked->second.first,
-                   static_cast<void*>(s.state), baked->second.second,
-                   static_cast<void*>(s.conv_state));
-    }
     // Layer-0 GDN witness set: entry state (114/115 - an external writer
     // between rounds shows as a mismatch vs the previous round's 112/113),
     // and the scan's direct inputs (116/117) whose projections no other
@@ -3066,21 +2994,6 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                  static_cast<int>(out_q8_1), static_cast<int>(half_output),
                  static_cast<int>(convolved), static_cast<int>(z_streams != nullptr),
                  n_tokens);
-    // The exact pointers baked into this recording's GatedDeltaNet nodes.
-    // Both ranks allocate in lockstep, so device addresses should match; a
-    // mismatch is a session-slot/allocation skew feeding different buffers
-    // through otherwise identical graphs.
-    GdnBakedStatePtrs()[&s] = {s.state, s.conv_state};
-    std::fprintf(stderr,
-                 "tp2dbg gdnptrs key=%llu st=%p cv=%p qkv=%p z=%p ab=%p "
-                 "qn=%p kn=%p cs=%p raw=%p\n",
-                 static_cast<unsigned long long>(g_recording_key),
-                 static_cast<void*>(s.state), static_cast<void*>(s.conv_state),
-                 reinterpret_cast<void*>(const_cast<float*>(qkv)), reinterpret_cast<void*>(const_cast<float*>(z)),
-                 reinterpret_cast<void*>(s_.alpha_beta), reinterpret_cast<void*>(s_.qn),
-                 static_cast<void*>(s_.kn),
-                 static_cast<void*>(s_.conv_scratch),
-                 static_cast<void*>(s_.gdn_raw));
   }
   if (std::getenv("GUFO_TP2_REPCHK") != nullptr &&
       &l == &model_->layers()[0]) {
@@ -3094,14 +3007,6 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                     c.SsmConvChannels());
     RepChkLayer(122, s_.gdn_raw,
                 static_cast<std::size_t>(n_tokens) * c.SsmValueDim());
-    // The REAL scan inputs: qkv/z/alpha_beta are written by projections
-    // INSIDE this function (after the entry sites), so checksumming them at
-    // entry measured the previous round's data. Here they hold what
-    // GatedDeltaNet is about to consume.
-    RepChkLayer(123, qkv, static_cast<std::size_t>(n_tokens) * qkv_stride);
-    RepChkLayer(124, z, static_cast<std::size_t>(n_tokens) * z_stride);
-    RepChkLayer(125, s_.alpha_beta,
-                static_cast<std::size_t>(n_tokens) * 2 * c.ssm_num_v_heads);
   }
   GatedDeltaNet(qkv, qkv_stride, z, z_stride, s_.alpha_beta, l.ssm_conv1d.f32(),
                 l.ssm_a.f32(), l.ssm_dt.f32(), l.ssm_norm.f32(), s.conv_state,
@@ -4172,14 +4077,13 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
     MtpTopCandidates(s_.logits, s_.mtp_ids, s_.mtp_scratch_ids, s_.mtp_scores,
                      rows, stream_);
     if (draft != nullptr)
-      RemapDraftIds(s_.mtp_ids, count, prefix, draft->mtp_.draft_ids,
-                    kMtpDraftExtraRows, stream_);
+      RemapDraftIds(s_.mtp_ids, count, prefix, draft->mtp_.draft_ids, stream_);
   }
   if (token) {
     Argmax(s_.logits, s_.mtp_argmax, s_.mtp_token, 1, rows, stream_);
     if (draft != nullptr)
       RemapDraftIds(reinterpret_cast<std::uint32_t*>(s_.mtp_token), 1, prefix,
-                    draft->mtp_.draft_ids, kMtpDraftExtraRows, stream_);
+                    draft->mtp_.draft_ids, stream_);
     if (!Check(
             hipMemcpyAsync(mtp_token_host_, s_.mtp_token, sizeof(std::int32_t),
                            hipMemcpyDeviceToHost, stream_),
@@ -4512,10 +4416,9 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
               hipKernelNodeParams params{};
               if (hipGraphKernelNodeGetParams(node, &params) ==
                   hipSuccess) {
-                std::snprintf(item, sizeof(item), " k%u.%u.%u/%u@%p",
+                std::snprintf(item, sizeof(item), " k%u.%u.%u/%u",
                               params.gridDim.x, params.gridDim.y,
-                              params.gridDim.z, params.blockDim.x,
-                              params.func);
+                              params.gridDim.z, params.blockDim.x);
                 // Reading kernelParams blindly is unsafe (no public arg
                 // count); the enqueue-time ar-args print covers the
                 // exchange scalars instead.
@@ -4852,12 +4755,6 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                          .emb_row = 0};
   bool normed = false;  ///< xn holds the next mixer's grouped norm of res
   for (std::uint32_t il = first_layer; il < end_layer; ++il) {
-    if (il == first_layer && std::getenv("GUFO_TP2_REPCHK") != nullptr) {
-      // Scratch-only ladder (session-mix immune where interleaves align):
-      // the trunk batch's input residual rows as layer 0 sees them.
-      RepChkLayer(130, s_.res,
-                  static_cast<std::size_t>(n) * config().HcDim());
-    }
     if (!options_.all_reduce) {
       if (!session.CheckCancellation(error_msg))
         return false;
@@ -4966,11 +4863,6 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     if (!MixerPart(session, il, batch, normed, true, error_msg, checkpoint,
                    last_attention)) {
       return false;
-    }
-    if (il == first_layer && std::getenv("GUFO_TP2_REPCHK") != nullptr) {
-      // Layer 0's mixed output: MixerPart's HcMix wrote s_.mixed (scratch).
-      RepChkLayer(131, s_.mixed,
-                  static_cast<std::size_t>(n) * config().hidden_size);
     }
     // Cache updates precede the FFN. Without MTP, only requested head rows
     // and the checkpoint frontier consume the final layer's residual.

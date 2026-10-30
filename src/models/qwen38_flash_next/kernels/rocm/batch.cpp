@@ -322,7 +322,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
                 l.attn_k_norm.f32(), nullptr, nullptr, session.mtp_.k_cache,
                 session.mtp_.v_cache, n, 0, c.num_kv_heads, c.head_dim,
                 c.rotary_dim, &session.control_->mtp_position, c.rope_theta,
-                c.rms_eps, stream_, session.vision_input_.rope(), false, yarn_))
+                c.rms_eps, stream_, session.vision_input_.rope()))
           return Fail(error, "batched MTP cache projection failed");
         StoreRows(base.ik + std::size_t{offsets[i]} * c.indexer_head_dim,
                   session.mtp_.index_k, n, c.indexer_head_dim,
@@ -335,7 +335,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
                             &session.control_->mtp_position, n, pool,
                             c.compress_ratio, c.indexer_head_dim, c.rotary_dim,
                             c.rope_theta, c.rms_eps, capacity, stream_,
-                            session.vision_input_.rope(), yarn_);
+                            session.vision_input_.rope());
         }
       }
       return true;
@@ -613,8 +613,7 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
         Argmax(logits_of(i), s_.mtp_argmax, s_.mtp_token, 1, rows, stream_);
         if (table != nullptr)
           RemapDraftIds(reinterpret_cast<std::uint32_t*>(s_.mtp_token), 1,
-                        static_cast<std::uint32_t>(prefix), table,
-                        kMtpDraftExtraRows, stream_);
+                        static_cast<std::uint32_t>(prefix), table, stream_);
         if (!Check(hipMemcpyAsync(batch_candidates_host_[i].ids.data(),
                                   s_.mtp_token, sizeof(std::int32_t),
                                   hipMemcpyDeviceToHost, stream_),
@@ -626,8 +625,7 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
                        s_.mtp_scores, rows, stream_);
       if (table != nullptr)
         RemapDraftIds(s_.mtp_ids, static_cast<std::uint32_t>(count),
-                      static_cast<std::uint32_t>(prefix), table,
-                      kMtpDraftExtraRows, stream_);
+                      static_cast<std::uint32_t>(prefix), table, stream_);
       if (!Check(hipMemcpyAsync(batch_candidates_host_ + i, s_.mtp_ids,
                                 offsetof(MtpCandidateLogits, logits) +
                                     count * sizeof(float),
