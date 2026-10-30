@@ -4669,24 +4669,52 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   // The distributed path never captures (see Run); its mixers wait for the
   // rows at the PLE layer themselves, so it neither splits nor waits here.
   const bool ple_split = graph && model_->tp_world_size() == 1;
-  const std::uint32_t first_layer =
+  // Face-2 bisection: split the captured trunk at a layer boundary and keep
+  // one half eager on both ranks. GUFO_TP2_EAGER_PREFIX=N runs layers [0,N)
+  // eagerly; GUFO_TP2_EAGER_SUFFIX=N runs [N,end) eagerly. Same stream and
+  // arithmetic as ple_split; the eager half exchanges on the normal path
+  // while the captured half replays pinned ones. Captured halves keep the
+  // fixed graph grid, eager halves take the round's real pool grid.
+  static const int tp2_eager_prefix = [] {
+    const char* e = std::getenv("GUFO_TP2_EAGER_PREFIX");
+    return e == nullptr ? 0 : std::max(std::atoi(e), 0);
+  }();
+  static const int tp2_eager_suffix = [] {
+    const char* e = std::getenv("GUFO_TP2_EAGER_SUFFIX");
+    return e == nullptr ? 0 : std::max(std::atoi(e), 0);
+  }();
+  bool prefix_eager = false;
+  bool suffix_eager = false;
+  std::uint32_t first_layer =
       ple_split && c.ple_layer > 0 ? static_cast<std::uint32_t>(c.ple_layer)
                                    : 0;
+  if (!ple_split && model_->tp_world_size() > 1 &&
+      (tp2_eager_prefix > 0 || tp2_eager_suffix > 0)) {
+    const int split =
+        tp2_eager_prefix > 0 ? tp2_eager_prefix : tp2_eager_suffix;
+    first_layer = std::min<std::uint32_t>(static_cast<std::uint32_t>(split),
+                                          c.num_layers);
+    prefix_eager = tp2_eager_prefix > 0;
+    suffix_eager = tp2_eager_suffix > 0;
+  }
   if (first_layer > 0) {
     const auto prefix = [&] {
       return ForwardBody(session, n, 0, false, speculative, sparse, start_pos,
-                         graph_pool_grid, 0, first_layer, error_msg);
+                         graph && !prefix_eager ? graph_pool_grid : pool_grid,
+                         0, first_layer, error_msg);
     };
     constexpr std::uint64_t kPrefixKey = std::uint64_t{1} << 35;
-    if (!Run(session, key | kPrefixKey, graph, prefix, error_msg, false)) {
+    if (!Run(session, key | kPrefixKey, graph && !prefix_eager, prefix,
+             error_msg, false)) {
       return false;
     }
   }
   const auto body = [&] {
     return ForwardBody(session, n, n_logits, logits != nullptr, speculative,
-                       sparse, start_pos, graph ? graph_pool_grid : pool_grid,
+                       sparse, start_pos,
+                       graph && !suffix_eager ? graph_pool_grid : pool_grid,
                        first_layer, c.num_layers, error_msg, checkpoint,
-                       ple_split);
+                       first_layer > 0);
   };
   // The prefix is already queued. Wait once before the suffix so recording
   // its graph can reuse these pinned rows while the eager pass executes.
