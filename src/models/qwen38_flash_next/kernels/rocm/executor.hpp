@@ -694,7 +694,8 @@ private:
                    std::uint32_t first_layer, std::uint32_t end_layer,
                    std::string* error_msg,
                    PrefillCheckpoint* checkpoint = nullptr,
-                   bool embeddings_ready = false) const;
+                   bool embeddings_ready = false,
+                   std::uint32_t seg_mask = 0x7) const;
   /// A prefill chunk that PairLead splits after `lead` rows (see Forward):
   /// runs the two trunk batches a layer apart, then the draft block over
   /// both.

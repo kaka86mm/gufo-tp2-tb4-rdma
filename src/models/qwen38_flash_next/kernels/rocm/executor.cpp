@@ -4683,25 +4683,49 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     const char* e = std::getenv("GUFO_TP2_EAGER_SUFFIX");
     return e == nullptr ? 0 : std::max(std::atoi(e), 0);
   }();
+  // GUFO_TP2_EAGER_SEG: 1 keeps layer 0's upload/embed eager, 2 also keeps
+  // layer 0's MixerPart eager; the rest of layer 0 and all deeper layers
+  // stay captured. Segment mode splits inside layer 0, layer mode at a
+  // layer boundary.
+  static const int tp2_eager_seg = [] {
+    const char* e = std::getenv("GUFO_TP2_EAGER_SEG");
+    return e == nullptr ? 0 : std::max(std::min(std::atoi(e), 2), 0);
+  }();
   bool prefix_eager = false;
   bool suffix_eager = false;
   std::uint32_t first_layer =
       ple_split && c.ple_layer > 0 ? static_cast<std::uint32_t>(c.ple_layer)
                                    : 0;
-  if (!ple_split && model_->tp_world_size() > 1 &&
-      (tp2_eager_prefix > 0 || tp2_eager_suffix > 0)) {
+  std::uint32_t prefix_end = first_layer;
+  std::uint32_t prefix_mask = 0x7;
+  std::uint32_t suffix_mask = 0x7;
+  if (!ple_split && model_->tp_world_size() > 1 && tp2_eager_seg > 0 &&
+      tp2_eager_prefix == 0 && tp2_eager_suffix == 0) {
+    if (std::getenv("GUFO_TP2_DEBUG") != nullptr) {
+      std::fprintf(stderr, "tp2dbg ple_layer=%d num_layers=%u\n", c.ple_layer,
+                   c.num_layers);
+    }
+    prefix_end = 1;
+    prefix_mask = (1u << tp2_eager_seg) - 1;
+    suffix_mask = 0x7u & ~prefix_mask;
+    prefix_eager = true;
+    first_layer = 0;
+  } else if (!ple_split && model_->tp_world_size() > 1 &&
+             (tp2_eager_prefix > 0 || tp2_eager_suffix > 0)) {
     const int split =
         tp2_eager_prefix > 0 ? tp2_eager_prefix : tp2_eager_suffix;
     first_layer = std::min<std::uint32_t>(static_cast<std::uint32_t>(split),
                                           c.num_layers);
+    prefix_end = first_layer;
     prefix_eager = tp2_eager_prefix > 0;
     suffix_eager = tp2_eager_suffix > 0;
   }
-  if (first_layer > 0) {
+  if (prefix_end > 0) {
     const auto prefix = [&] {
       return ForwardBody(session, n, 0, false, speculative, sparse, start_pos,
                          graph && !prefix_eager ? graph_pool_grid : pool_grid,
-                         0, first_layer, error_msg);
+                         0, prefix_end, error_msg, nullptr, false,
+                         prefix_mask);
     };
     constexpr std::uint64_t kPrefixKey = std::uint64_t{1} << 35;
     if (!Run(session, key | kPrefixKey, graph && !prefix_eager, prefix,
@@ -4714,7 +4738,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                        sparse, start_pos,
                        graph && !suffix_eager ? graph_pool_grid : pool_grid,
                        first_layer, c.num_layers, error_msg, checkpoint,
-                       first_layer > 0);
+                       first_layer > 0, suffix_mask);
   };
   // The prefix is already queued. Wait once before the suffix so recording
   // its graph can reuse these pinned rows while the eager pass executes.
@@ -4757,9 +4781,17 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                            std::uint32_t first_layer, std::uint32_t end_layer,
                            std::string* error_msg,
                            PrefillCheckpoint* checkpoint,
-                           bool embeddings_ready) const {
+                           bool embeddings_ready,
+                           std::uint32_t seg_mask) const {
   const Config& c = config();
-  if (first_layer == 0) {
+  // Face-2 segment bisection: with a partial mask, only the marked pieces of
+  // layer first_layer run (bit 1 = upload/embed, bit 2 = MixerPart,
+  // bit 4 = FFN); deeper layers always run whole. The trunk call site splits
+  // the round into an eager prefix call and a captured suffix call.
+  const bool seg_gate = first_layer == 0 && seg_mask != 0x7;
+  if (first_layer == 0 && (!seg_gate || (seg_mask & 1u)) == 0) {
+    // This call starts mid-layer: the prefix already uploaded and embedded.
+  } else if (first_layer == 0) {
     if (!Check(hipMemcpyAsync(session.control_, control_host_,
                               sizeof(Session::Control), hipMemcpyHostToDevice,
                               stream_),
@@ -4883,12 +4915,20 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     if (!session.CheckCancellation(error_msg)) {
       return false;
     }
+    const bool layer0_seg = seg_gate && il == 0;
+    if (layer0_seg && (seg_mask & 2u) != 0) {
+      static const bool seg_trace = std::getenv("GUFO_TP2_DEBUG") != nullptr;
+      if (seg_trace && il == first_layer) {
+        std::fprintf(stderr, "tp2dbg seg-mixer il=%u mask=%u\n", il, seg_mask);
+      }
+    }
     // The last target layer's query outputs have no later cache consumer.
     // Preserve all K/V/indexer rows and the final query's original tile.
     const bool last_attention = WidePrefill(n) && !session.mtp_enabled_ &&
                                 il + 1 == c.num_layers && n_logits == 1 &&
                                 checkpoint == nullptr;
-    if (!MixerPart(session, il, batch, normed, true, error_msg, checkpoint,
+    if ((!layer0_seg || (seg_mask & 2u)) &&
+        !MixerPart(session, il, batch, normed, true, error_msg, checkpoint,
                    last_attention)) {
       return false;
     }
@@ -4902,6 +4942,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                                  il + 1 == c.num_layers && n > needed
                              ? (n - needed) / 128 * 128
                              : 0U;
+    if (!layer0_seg || (seg_mask & 4u)) {
     if (skipped != 0) {
       struct RestoreScratch {
         const Executor* executor;
@@ -4927,6 +4968,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       RepChkLayer(il, s_.res,
                  static_cast<std::size_t>(skipped != 0 ? n - skipped : n) *
                      config().HcDim());
+    }
   }
   if (end_layer < c.num_layers) {
     return true;
