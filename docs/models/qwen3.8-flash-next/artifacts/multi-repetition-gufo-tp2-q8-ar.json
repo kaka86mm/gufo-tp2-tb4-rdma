@@ -1,0 +1,397 @@
+{
+  "artifactType": "servingBenchmark",
+  "benchmarkSchema": "gufo.serving-benchmark.v1",
+  "canonical": {
+    "cppStandard": "C++20",
+    "cpuArchitecture": "x86_64",
+    "cpuLogicalCores": 32,
+    "cpuModel": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+    "cpuPhysicalCores": 16,
+    "cxxCompiler": "GCC 15.3.0",
+    "gpuArchitecture": "gfx1151",
+    "gpuComputeUnits": 20,
+    "gpuDriver": "amdgpu",
+    "gpuName": "Radeon 8060S Graphics",
+    "gpuPciId": "1002:1586",
+    "kernelRelease": "7.2.8-100.fc43.x86_64",
+    "memoryTotalBytes": 134144495616,
+    "memoryType": "LPDDR5X (Unified)",
+    "rocmVersion": "7.2.3",
+    "schemaVersion": "1.0.0"
+  },
+  "fingerprintId": "6b2efb13d43e544522f065c7e6d5e66db58338741359b5761ef22c8c5f1dd6bf",
+  "metricDefinitions": {
+    "aggregate_output_tokens_per_second": "overall: completion tokens divided by the sum of measured round spans (end-to-end, includes prefill and queueing)",
+    "aggregate_total_tokens_per_second": "overall: actual prefill plus completion tokens divided by the sum of measured round spans; other statistics describe individual rounds",
+    "completion_sha256": "SHA-256 of generated text for cross-concurrency exactness checks; generated text itself is omitted",
+    "decode_tokens_per_second": "completion tokens divided by server decode time",
+    "draft_acceptance": "accepted support-model tokens divided by drafted support-model tokens",
+    "matchedRoundOutputTokensPerSecond": "aggregate output tokens per second over rounds whose completions all matched the reference hashes",
+    "prefill_tokens_per_second": "actual server prefill tokens divided by server prefill time"
+  },
+  "model": {
+    "id": "bench"
+  },
+  "modelBench": {
+    "measuredOn": "2026-10-09",
+    "mode": "ar",
+    "table": "multi-repetition",
+    "target": "gufo"
+  },
+  "notes": [
+    "tp2 rank0 podman run --rm --name gufo-model-bench-multi-repetition-ar-c1-rank0 --security-opt label=disable --userns keep-id:uid=1000,gid=1000 --device kfd --device dri --device infiniband --group-add keep-groups --ulimit memlock=-1 --network host -v gufo -w gufo -v models:ro -v nix:ro -v gufo -e xdg-cache gufo-tp2-dev:7.2.3 gufo serve --host 127.0.0.1 --port 36643 --sessions 1 llm --model Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf --context 4096 --served-model-name bench --think off --max-pending-per-client 8 --tp-rdma-device usb4_rdma0 --speculative off --tp-world-size 2 --tp-rank 0 --tp-bootstrap-port 18515 --tp-control-port 18516 --tp-control-token <redacted> rank1 podman run --rm --name gufo-model-bench-multi-repetition-ar-c1-rank1 --security-opt label=disable --userns keep-id:uid=1000,gid=1000 --device kfd --device dri --device infiniband --group-add keep-groups --ulimit memlock=-1 --network host -v gufo -w gufo -v models:ro -v nix:ro -v gufo -e xdg-cache gufo-tp2-dev:7.2.3 gufo serve --host 127.0.0.1 --port 36643 --sessions 1 llm --model Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf --context 4096 --served-model-name bench --think off --max-pending-per-client 8 --tp-rdma-device usb4_rdma0 --speculative off --tp-world-size 2 --tp-rank 1 --tp-bootstrap-port 18515 --tp-control-port 18516 --tp-control-token <redacted> --tp-bootstrap-host <redacted>",
+    "fresh server per concurrency level"
+  ],
+  "reference": {
+    "source": "self-c1"
+  },
+  "results": {
+    "c1": {
+      "aggregate": {
+        "output_tokens_per_second": {
+          "maximum": 22.101094262880256,
+          "median": 22.101094262880256,
+          "minimum": 22.101094262880256,
+          "overall": 22.101094262880256,
+          "p95": 22.101094262880256,
+          "p99": 22.101094262880256
+        },
+        "prefill_tokens_per_second": {
+          "maximum": 351.20020102108157,
+          "median": 351.20020102108157,
+          "minimum": 351.20020102108157,
+          "overall": 351.20020102108157,
+          "p95": 351.20020102108157,
+          "p99": 351.20020102108157
+        },
+        "total_tokens_per_second": {
+          "maximum": 373.3012952839618,
+          "median": 373.3012952839618,
+          "minimum": 373.3012952839618,
+          "overall": 373.3012952839618,
+          "p95": 373.3012952839618,
+          "p99": 373.3012952839618
+        }
+      },
+      "cases": {
+        "synthetic_repetition_pp2048": {
+          "acceptance": null,
+          "acceptedPerOutputToken": 0.0,
+          "acceptedTokens": 0,
+          "cacheHits": 0,
+          "completionHashCounts": {
+            "82fd84fded8d257a194ac1eca43b70a866a79bac1e97e45d19f0292d6a7118bd": 1
+          },
+          "completionHashes": [
+            "82fd84fded8d257a194ac1eca43b70a866a79bac1e97e45d19f0292d6a7118bd"
+          ],
+          "decode_tokens_per_second": {
+            "maximum": 29.190677985263864,
+            "median": 29.190677985263864,
+            "minimum": 29.190677985263864,
+            "p95": 29.190677985263864,
+            "p99": 29.190677985263864
+          },
+          "draftedPerOutputToken": 0.0,
+          "draftedTokens": 0,
+          "matchesC1": true,
+          "matchesReference": true,
+          "requestAcceptance": {
+            "maximum": null,
+            "median": null,
+            "minimum": null,
+            "p95": null,
+            "p99": null
+          },
+          "requestsWithDrafts": 0
+        }
+      },
+      "categories": {
+        "repetition": {
+          "acceptance": null,
+          "acceptedPerOutputToken": 0.0,
+          "acceptedTokens": 0,
+          "cacheHits": 0,
+          "completionHashCounts": {
+            "82fd84fded8d257a194ac1eca43b70a866a79bac1e97e45d19f0292d6a7118bd": 1
+          },
+          "completionHashes": [
+            "82fd84fded8d257a194ac1eca43b70a866a79bac1e97e45d19f0292d6a7118bd"
+          ],
+          "decode_tokens_per_second": {
+            "maximum": 29.190677985263864,
+            "median": 29.190677985263864,
+            "minimum": 29.190677985263864,
+            "p95": 29.190677985263864,
+            "p99": 29.190677985263864
+          },
+          "draftedPerOutputToken": 0.0,
+          "draftedTokens": 0,
+          "requestAcceptance": {
+            "maximum": null,
+            "median": null,
+            "minimum": null,
+            "p95": null,
+            "p99": null
+          },
+          "requestsWithDrafts": 0
+        }
+      },
+      "completionExactness": {
+        "comparedCases": 1,
+        "comparedRequests": 1,
+        "exactRate": 1.0,
+        "exactRequests": 1,
+        "matchedCases": 1,
+        "matchedRoundOutputTokensPerSecond": 22.101094262880256,
+        "matchedRounds": 1
+      },
+      "corpusPromptCount": 1,
+      "executionPlans": [
+        "serial-c1"
+      ],
+      "latency": {
+        "client_event_inter_token_ms": {
+          "maximum": 34.54393611791888,
+          "median": 34.54393611791888,
+          "minimum": 34.54393611791888,
+          "p95": 34.54393611791888,
+          "p99": 34.54393611791888
+        },
+        "client_ttft_ms": {
+          "maximum": 1403.8573149591684,
+          "median": 1403.8573149591684,
+          "minimum": 1403.8573149591684,
+          "p95": 1403.8573149591684,
+          "p99": 1403.8573149591684
+        },
+        "queue_ms": {
+          "maximum": 0.743244,
+          "median": 0.743244,
+          "minimum": 0.743244,
+          "p95": 0.743244,
+          "p99": 0.743244
+        },
+        "request_ms": {
+          "maximum": 5791.568438988179,
+          "median": 5791.568438988179,
+          "minimum": 5791.568438988179,
+          "p95": 5791.568438988179,
+          "p99": 5791.568438988179
+        },
+        "server_inter_token_ms": {
+          "maximum": 34.545459834645676,
+          "median": 34.545459834645676,
+          "minimum": 34.545459834645676,
+          "p95": 34.545459834645676,
+          "p99": 34.545459834645676
+        },
+        "server_max_inter_token_ms": {
+          "maximum": 49.448501,
+          "median": 49.448501,
+          "minimum": 49.448501,
+          "p95": 49.448501,
+          "p99": 49.448501
+        },
+        "server_ttft_ms": {
+          "maximum": 1403.072004,
+          "median": 1403.072004,
+          "minimum": 1403.072004,
+          "p95": 1403.072004,
+          "p99": 1403.072004
+        }
+      },
+      "logicalConcurrency": [
+        1
+      ],
+      "measuredSpanMs": 5791.568438988179,
+      "metricsSources": [
+        "gufo"
+      ],
+      "physicalExecutionWidths": [
+        1
+      ],
+      "promptPreparation": "cold prompts",
+      "requestCount": 1,
+      "roundCount": 1,
+      "rounds": [
+        {
+          "output_tokens_per_second": 22.101094262880256,
+          "prefill_tokens_per_second": 351.20020102108157,
+          "repetition": 0,
+          "sampleCount": 1,
+          "span_ms": 5791.568438988179,
+          "total_tokens_per_second": 373.3012952839618
+        }
+      ],
+      "samples": [
+        {
+          "cache_hit": false,
+          "cached_prompt_tokens": 0,
+          "case_id": "synthetic_repetition_pp2048",
+          "category": "repetition",
+          "client_event_inter_token_ms": 34.54393611791888,
+          "client_ttft_ms": 1403.8573149591684,
+          "completion_sha256": "82fd84fded8d257a194ac1eca43b70a866a79bac1e97e45d19f0292d6a7118bd",
+          "completion_tokens": 128,
+          "concurrency": 1,
+          "decode_ms": 4384.961530000001,
+          "decode_tokens_per_second": 29.190677985263864,
+          "draft_acceptance": null,
+          "draft_accepted_tokens": 0,
+          "draft_tokens": 0,
+          "execution_plan": "serial-c1",
+          "metrics_source": "gufo",
+          "physical_execution_width": 1,
+          "prefill_ms": 1398.065705,
+          "prefill_tokens": 2034,
+          "prefill_tokens_per_second": 1454.8672445977782,
+          "prompt_tokens": 2034,
+          "queue_ms": 0.743244,
+          "repetition": 0,
+          "request_index": 0,
+          "requested_logical_concurrency": 1,
+          "server_inter_token_ms": 34.545459834645676,
+          "server_max_inter_token_ms": 49.448501,
+          "server_ttft_ms": 1403.072004,
+          "wall_ms": 5791.568438988179,
+          "whole_request_tokens_per_second": 373.3012952839618
+        }
+      ],
+      "scheduledPromptCount": 1,
+      "speculative": {
+        "acceptance": null,
+        "acceptedPerOutputToken": 0.0,
+        "acceptedTokens": 0,
+        "cacheHits": 0,
+        "draftedPerOutputToken": 0.0,
+        "draftedTokens": 0,
+        "requestAcceptance": {
+          "maximum": null,
+          "median": null,
+          "minimum": null,
+          "p95": null,
+          "p99": null
+        },
+        "requestsWithDrafts": 0
+      },
+      "stage": {
+        "decode_tokens_per_second": {
+          "maximum": 29.190677985263864,
+          "median": 29.190677985263864,
+          "minimum": 29.190677985263864,
+          "p95": 29.190677985263864,
+          "p99": 29.190677985263864
+        },
+        "prefill_tokens_per_second": {
+          "maximum": 1454.8672445977782,
+          "median": 1454.8672445977782,
+          "minimum": 1454.8672445977782,
+          "p95": 1454.8672445977782,
+          "p99": 1454.8672445977782
+        },
+        "whole_request_tokens_per_second": {
+          "maximum": 373.3012952839618,
+          "median": 373.3012952839618,
+          "minimum": 373.3012952839618,
+          "p95": 373.3012952839618,
+          "p99": 373.3012952839618
+        }
+      }
+    }
+  },
+  "schemaVersion": "1.0.0",
+  "source": {
+    "buildMode": "container-gpu-tp2",
+    "dirty": true,
+    "revision": "c85349b51c739657ccce9684d5b7eb06aef79774"
+  },
+  "topology": {
+    "id": "tp2",
+    "rankFingerprints": {
+      "rank0": {
+        "canonical": {
+          "cppStandard": "C++20",
+          "cpuArchitecture": "x86_64",
+          "cpuLogicalCores": 32,
+          "cpuModel": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+          "cpuPhysicalCores": 16,
+          "cxxCompiler": "GCC 15.3.0",
+          "gpuArchitecture": "gfx1151",
+          "gpuComputeUnits": 20,
+          "gpuDriver": "amdgpu",
+          "gpuName": "Radeon 8060S Graphics",
+          "gpuPciId": "1002:1586",
+          "kernelRelease": "7.2.8-100.fc43.x86_64",
+          "memoryTotalBytes": 134144495616,
+          "memoryType": "LPDDR5X (Unified)",
+          "rocmVersion": "7.2.3",
+          "schemaVersion": "1.0.0"
+        },
+        "fingerprintId": "6b2efb13d43e544522f065c7e6d5e66db58338741359b5761ef22c8c5f1dd6bf",
+        "schemaVersion": "1.0.0"
+      },
+      "rank1": {
+        "canonical": {
+          "cppStandard": "C++20",
+          "cpuArchitecture": "x86_64",
+          "cpuLogicalCores": 32,
+          "cpuModel": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+          "cpuPhysicalCores": 16,
+          "cxxCompiler": "GCC 15.3.0",
+          "gpuArchitecture": "gfx1151",
+          "gpuComputeUnits": 20,
+          "gpuDriver": "amdgpu",
+          "gpuName": "Radeon 8060S Graphics",
+          "gpuPciId": "1002:1586",
+          "kernelRelease": "7.2.8-100.fc43.x86_64",
+          "memoryTotalBytes": 134144487424,
+          "memoryType": "LPDDR5X (Unified)",
+          "rocmVersion": "7.2.3",
+          "schemaVersion": "1.0.0"
+        },
+        "fingerprintId": "736f2a53bd61d0a4b19b20d32cad4965b6d59d0a0730adb742164001900f876b",
+        "schemaVersion": "1.0.0"
+      }
+    },
+    "requestTransport": "openai-chat-completions-sse",
+    "worldSize": 2
+  },
+  "warnings": [],
+  "workload": {
+    "cachePrompt": false,
+    "caseIds": [
+      "synthetic_repetition_pp2048"
+    ],
+    "categories": [
+      "repetition"
+    ],
+    "concurrency": [
+      1
+    ],
+    "corpusLayout": "homogeneous",
+    "endpointProfile": "gufo",
+    "id": "qwen3.8-flash-next-multi-repetition-gufo-ar",
+    "maxOutputTokens": 128,
+    "mode": "corpus",
+    "paddingPolicy": "repeat-each-case",
+    "pinnedReferenceSlots": false,
+    "prefillFirst": false,
+    "promptCount": 1,
+    "promptGenerator": {
+      "promptSha256": "b7b9e6a3b00182fca0a28476a01d18e4427b014950c99d9dd2ec789b237f2674",
+      "recipe": "single-user-d0",
+      "requestedTokens": 2048,
+      "task": "repetition",
+      "templateOverhead": 12,
+      "tokensPerWord": 1.167
+    },
+    "repetitions": 1,
+    "suiteSha256": "807c9ced8cbebf372cb3364ecb96e120ccde7f072c2d9a65a887bd2ad3610d51",
+    "temperature": 0.0,
+    "transport": "openai-chat-completions-sse",
+    "warmupMaxOutputTokens": 16,
+    "warmupPolicy": "first-cohort",
+    "warmupRounds": 1
+  }
+}

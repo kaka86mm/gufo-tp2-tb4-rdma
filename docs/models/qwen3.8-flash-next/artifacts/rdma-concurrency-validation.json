@@ -1,0 +1,146 @@
+{
+  "allPreparedOutputsMatchFreshAr": true,
+  "c1Checks": {
+    "onehost-multi-ar": {
+      "completionSha256": "b7df29a4a061aef9f0eb72057935f0523ab707463a2ad1f9767d77922f866839",
+      "freshTokPerSecond": 26.638784117718497,
+      "preparedTokPerSecond": 26.587982799677242
+    },
+    "onehost-multi-mixed": {
+      "completionSha256": "b7df29a4a061aef9f0eb72057935f0523ab707463a2ad1f9767d77922f866839",
+      "draftCountsMatch": true,
+      "freshAcceptedTokens": 51,
+      "freshDraftTokens": 102,
+      "freshTokPerSecond": 31.906051307822985,
+      "preparedAcceptedTokens": 51,
+      "preparedDraftTokens": 102,
+      "preparedTokPerSecond": 31.989327856395196
+    },
+    "onehost-multi-repetition": {
+      "completionSha256": "82fd84fded8d257a194ac1eca43b70a866a79bac1e97e45d19f0292d6a7118bd",
+      "draftCountsMatch": true,
+      "freshAcceptedTokens": 101,
+      "freshDraftTokens": 114,
+      "freshTokPerSecond": 60.43883950092394,
+      "preparedAcceptedTokens": 101,
+      "preparedDraftTokens": 114,
+      "preparedTokPerSecond": 60.61975599240152
+    },
+    "tp2-multi-ar": {
+      "completionSha256": "32dc0cbc80a30e5f6b2e9747a3c2577acad088a77f1ade593d00d592313816a6",
+      "freshTokPerSecond": 32.91006696057827,
+      "preparedTokPerSecond": 32.92791664309425
+    },
+    "tp2-multi-mixed": {
+      "completionSha256": "32dc0cbc80a30e5f6b2e9747a3c2577acad088a77f1ade593d00d592313816a6",
+      "draftCountsMatch": true,
+      "freshAcceptedTokens": 44,
+      "freshDraftTokens": 105,
+      "freshTokPerSecond": 36.3518105929623,
+      "preparedAcceptedTokens": 44,
+      "preparedDraftTokens": 105,
+      "preparedTokPerSecond": 36.33599881067733
+    },
+    "tp2-multi-repetition": {
+      "completionSha256": "82fd84fded8d257a194ac1eca43b70a866a79bac1e97e45d19f0292d6a7118bd",
+      "draftCountsMatch": true,
+      "freshAcceptedTokens": 101,
+      "freshDraftTokens": 120,
+      "freshTokPerSecond": 71.75544925330821,
+      "preparedAcceptedTokens": 101,
+      "preparedDraftTokens": 120,
+      "preparedTokPerSecond": 64.38914426051088
+    }
+  },
+  "freshArControls": 4,
+  "freshMtpControls": 7,
+  "gains": {
+    "multi-ar": {
+      "c1": 23.845110368786493,
+      "c2": -1.0877796859362854,
+      "c4": 21.165466297811285,
+      "c6": 15.19534720252862,
+      "c8": 22.815405394930586
+    },
+    "multi-mixed": {
+      "c1": 13.587878350539228,
+      "c2": 34.90786225853319,
+      "c4": 18.872976512339857,
+      "c6": 8.118713948974165,
+      "c8": 15.360750306757698
+    },
+    "multi-repetition": {
+      "c1": 14.982088921899116,
+      "c2": 14.740518567726578,
+      "c4": 25.515612478155347,
+      "c6": 22.8999787062969,
+      "c8": 27.660850947079176
+    }
+  },
+  "measuredOn": "2026-10-02",
+  "preparedRequests": 129,
+  "repeatInvestigation": {
+    "finding": "Three added prepared controls agree with the fresh controls; the first prepared timing was slower. All four valid prepared timings are retained in the displayed mean and sample standard deviation. Timing variability limits a precise C1 repetitive gain claim.",
+    "fresh": {
+      "mean": 71.03397421984346,
+      "n": 4,
+      "rates": [
+        71.75544925330821,
+        71.7414942146684,
+        70.8078811200775,
+        69.83107229131973
+      ],
+      "stdev": 0.9163699955800161
+    },
+    "outputsAndDraftCountsMatch": true,
+    "prepared": {
+      "mean": 69.70186173942139,
+      "n": 4,
+      "rates": [
+        64.38914426051088,
+        71.65165068621023,
+        71.95304217200912,
+        70.81360983895536
+      ],
+      "stdev": 3.5744669124511654
+    }
+  },
+  "rows": {
+    "multi-ar": {
+      "onehost-c1": 26.587982799677242,
+      "onehost-c2": 47.17048066097366,
+      "onehost-c4": 75.59826335627739,
+      "onehost-c6": 93.60723274689943,
+      "onehost-c8": 105.11581869869264,
+      "tp2-c1": 32.92791664309425,
+      "tp2-c2": 46.65736975458508,
+      "tp2-c4": 91.5989883086809,
+      "tp2-c6": 107.83117676946986,
+      "tp2-c8": 129.0984188689996
+    },
+    "multi-mixed": {
+      "onehost-c1": 31.989327856395196,
+      "onehost-c2": 49.664317399700856,
+      "onehost-c4": 75.40652472223782,
+      "onehost-c6": 90.29795558199201,
+      "onehost-c8": 102.6335697636811,
+      "tp2-c1": 36.33599881067733,
+      "tp2-c2": 67.00106890922916,
+      "tp2-c4": 89.63798042183751,
+      "tp2-c6": 97.6289882974657,
+      "tp2-c8": 118.39885614599211
+    },
+    "multi-repetition": {
+      "onehost-c1": 60.61975599240152,
+      "onehost-c2": 91.28131662417299,
+      "onehost-c4": 120.14977125949463,
+      "onehost-c6": 134.06169653364287,
+      "onehost-c8": 143.90078201122765,
+      "tp2-c1": 69.70186173942139,
+      "tp2-c2": 104.7366560500245,
+      "tp2-c4": 150.80672128745735,
+      "tp2-c6": 164.76179649314747,
+      "tp2-c8": 183.70496283503465
+    }
+  }
+}
