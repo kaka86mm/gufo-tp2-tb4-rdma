@@ -12,9 +12,10 @@
 #include <vector>
 
 #include "src/cli/serve/inference_backend.hpp"
+#include "src/families/qwen/draft_vocab/draft_vocab.hpp"
 #include "src/families/qwen/text/chat_template.hpp"
-#include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
+#include "src/models/qwen38_flash_next/runner.hpp"
 #include "tests/models/qwen27b/sampling_cases.hpp"
 #include "tests/models/qwen38_flash_next/mtp_replay.hpp"
 
@@ -692,11 +693,12 @@ void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
              : "Batch request " + std::to_string(i) +
                    ": Continue red, blue, blue, red,");
     if (thai) {
-      Require(std::ranges::any_of(prompt,
-                                  [](std::int32_t token) {
-                                    return token >= static_cast<std::int32_t>(
-                                                        qfn::kMtpDraftVocab);
-                                  }),
+      Require(std::ranges::any_of(
+                  prompt,
+                  [](std::int32_t token) {
+                    return token >= static_cast<std::int32_t>(
+                                        gufo::speculative::kDraftVocabPrefix);
+                  }),
               "Thai batch prompt stays inside the draft vocabulary");
     }
     // One member crosses the sparse-attention boundary while the others
@@ -1008,7 +1010,8 @@ std::vector<std::int32_t> RepeatTokens(std::vector<std::int32_t> pattern,
 std::size_t RareTokens(std::span<const std::int32_t> tokens) {
   return static_cast<std::size_t>(
       std::ranges::count_if(tokens, [](std::int32_t token) {
-        return token >= static_cast<std::int32_t>(qfn::kMtpDraftVocab);
+        return token >=
+               static_cast<std::int32_t>(gufo::speculative::kDraftVocabPrefix);
       }));
 }
 
@@ -1035,8 +1038,8 @@ void CheckDraftVocabLifecycle(const std::shared_ptr<qfn::Model>& model) {
     const auto pattern = model->Tokenize(text);
     Require(RareTokens(pattern) * 3 >= pattern.size(),
             "lifecycle pattern is not mostly rare tokens");
-    return RepeatTokens(pattern,
-                        pattern.size() * 2 + qfn::kMtpDraftVocabWindow + 64);
+    return RepeatTokens(pattern, pattern.size() * 2 +
+                                     gufo::speculative::kDraftVocabWindow + 64);
   };
   const auto thai = repeated(
       "แมวสีส้มนอน"
@@ -1680,7 +1683,9 @@ void CheckServingEos(const std::shared_ptr<qfn::Model>& model) {
   std::string error;
   server::TextSpeculativeConfig options;
   options.backend = server::TextSpeculativeBackend::kMtp;
-  Require(backend.load(model, &error, 128, 2, {}, {}, options), error);
+  Require(backend.load(qfn::CreateQwenFlashNextTextRunner(model, 128, options),
+                       &error, 2),
+          error);
   // Synthetic grammar pieces make the boundary deterministic: any ordinary
   // first token completes the empty JSON object; only stop tokens may follow.
   // Actual token IDs, EOS recognition, GPU execution and checkpoints stay real.
@@ -1777,10 +1782,13 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
   using Backend = server::InferenceBackend;
   Backend ar, mtp;
   std::string error;
-  Require(ar.load(model, &error, 6145, 2), error);
+  Require(ar.load(qfn::CreateQwenFlashNextTextRunner(model, 6145), &error, 2),
+          error);
   server::TextSpeculativeConfig options;
   options.backend = server::TextSpeculativeBackend::kMtp;
-  Require(mtp.load(model, &error, 6145, 2, {}, {}, options), error);
+  Require(mtp.load(qfn::CreateQwenFlashNextTextRunner(model, 6145, options),
+                   &error, 2),
+          error);
   struct Reference {
     gufo::test::SamplingCase test;
     std::string prompt;

@@ -14,11 +14,11 @@
 #include <string_view>
 #include <vector>
 
+#include "src/families/qwen/draft_vocab/draft_vocab.hpp"
 #include "src/families/qwen/text/tokenizer.hpp"
 #include "src/families/qwen/vision/encoder.hpp"
 #include "src/families/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
-#include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 
@@ -137,6 +137,9 @@ public:
   [[nodiscard]] std::size_t SessionBytes(core::SessionMode mode,
                                          std::uint32_t context) const noexcept;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
+  /// Caps wide copy verification (Executor::LimitCopyRows); call before any
+  /// session is created.
+  void LimitCopyRows(std::uint32_t rows) noexcept;
   [[nodiscard]] const std::shared_ptr<qwen::vision::Encoder>& VisionEncoder()
       const noexcept {
     return vision_;
@@ -326,7 +329,9 @@ private:
   Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session);
   void ResetImpl(bool reuse_mtp);
 
-  using PrefillCapture = std::function<void(const rocm::PrefillCheckpoint&)>;
+  /// Consumes an in-pass checkpoint, or null when the live session is at
+  /// the boundary.
+  using PrefillCapture = std::function<void(const rocm::PrefillCheckpoint*)>;
   bool SyncThroughComponents(std::span<const std::int32_t>, std::uint32_t,
                              const PrefillCapture&, std::string*);
 
@@ -396,6 +401,13 @@ private:
   MtpLengthController draft_length_;
   /// Index of tokens_ for prompt lookup (single-session MTP drafts).
   speculative::PromptLookup<> lookup_;
+  /// Verification rows (anchor included) the next copy-only cycle of a
+  /// greedy session decoding alone may use; 0 before the first. A copy
+  /// accepted whole at this width doubles it up to max_copy_rows(); any
+  /// rejected copy returns it to the ordinary verifier width.
+  std::uint32_t copy_rows_{0};
+  /// Whole copies accepted in a row at copy_rows_ (two widen it).
+  std::uint32_t copy_streak_{0};
   SpeculativeStats stats_;
   std::shared_ptr<const qwen::vision::Prompt> image_prompt_;
   [[nodiscard]] std::span<const std::uint8_t> ImageIdentity(
@@ -403,7 +415,7 @@ private:
   bool valid_{true};
   ContinuationHooks* continuation_hooks_{nullptr};
   /// This request's draft vocabulary; the device table follows it.
-  MtpDraftVocab draft_vocab_;
+  speculative::DraftVocab draft_vocab_;
   bool draft_vocab_stale_{false};
   std::vector<std::int32_t> draft_added_;
   /// After the token history is replaced: the table restarts from it.

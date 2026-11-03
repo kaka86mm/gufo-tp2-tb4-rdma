@@ -38,7 +38,7 @@ if(NOT GUFO_EXTENSION_FIXTURE)
       ${CMAKE_CURRENT_LIST_DIR}/discovery_test.py)
     # Nested projects configure and build repeatedly; Windows needs the headroom.
     # They use the build's own compiler instead of whichever one CMake finds.
-    set_tests_properties(extension_discovery_test PROPERTIES LABELS "cpu;extensions" TIMEOUT 900
+    set_tests_properties(extension_discovery_test PROPERTIES LABELS "cpu;extensions" PROCESSORS 2 COST 90 TIMEOUT 900
       ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}")
     add_test(NAME extension_api_policy_test COMMAND ${Python3_EXECUTABLE}
       ${PROJECT_SOURCE_DIR}/tests/tools/check_extension_api_test.py)
@@ -47,7 +47,7 @@ if(NOT GUFO_EXTENSION_FIXTURE)
     set_tests_properties(extension_api_policy_test extension_api_surface PROPERTIES LABELS "cpu;extensions")
     add_test(NAME extension_metadata_test COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_LIST_DIR}/metadata_test.py)
-    set_tests_properties(extension_metadata_test PROPERTIES LABELS "cpu;extensions" TIMEOUT 300
+    set_tests_properties(extension_metadata_test PROPERTIES LABELS "cpu;extensions" PROCESSORS 2 COST 80 TIMEOUT 300
       ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}")
     if(NOT WIN32)
       add_test(NAME extension_schema_test COMMAND ${Python3_EXECUTABLE}
@@ -90,6 +90,9 @@ set_tests_properties(ext_runtime_neutral_contracts_test PROPERTIES
   LABELS "cpu;extensions")
 
 add_executable(extension_runtime_test runtime_test.cpp)
+# This in-tree integration test also exercises the private CLI logging facade.
+# The public runtime deliberately no longer exports the repository root.
+target_include_directories(extension_runtime_test PRIVATE "${PROJECT_SOURCE_DIR}")
 target_compile_definitions(extension_runtime_test PRIVATE
   TEST_PROVIDER_HIP=$<BOOL:${ENGINE_ENABLE_HIP}>)
 gufo_target_extensions(extension_runtime_test EXTENSIONS beta base alpha)
