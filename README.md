@@ -4,7 +4,7 @@
 
 [中文文档](README.zh-CN.md)
 
-Two 128 GB Strix Halo machines become one 250 GB inference pool: every transformer layer is split across both hosts, partial sums cross the cables as RDMA WRITEs striped over all rails of two USB4 links (up to 4 rails × 20 Gb/s × 2 lanes with the [thunderbolt-ibverbs](https://github.com/hellas-ai/thunderbolt-ibverbs) stack), and the model is served through gufo's TP2 transport ([neuhaus/gufo](https://github.com/neuhaus/gufo) `rdma` branch).
+Two 128 GB Strix Halo machines become one 250 GB inference pool: every transformer layer is split across both hosts, partial sums cross the cables as RDMA WRITEs striped over all rails of two USB4 links (up to 4 rails × 20 Gb/s × 2 lanes with the [thunderbolt-ibverbs](https://github.com/neuhaus/donnerkeule) write-striping fork), and the model is served through gufo's TP2 transport ([neuhaus/gufo](https://github.com/neuhaus/gufo) `rdma` branch).
 
 ## Measured results (real, reproducible with `run/bench/`)
 
@@ -44,7 +44,7 @@ docs/     BENCHMARKS.md        full data tables incl. losing configurations
 
 **Fast path — stock kernel (Ubuntu 7.0+, any 6.14+ likely works)**
 
-1. Build `thunderbolt_ibverbs` **on each host** against that host's own headers (same version string ≠ same build — see PITFALLS #1), with the activation parameters the upstream README's TP2 example omits:
+1. Build `thunderbolt_ibverbs` **on each host** against that host's own headers (same version string ≠ same build — see PITFALLS #1), from [`neuhaus/donnerkeule`](https://github.com/neuhaus/donnerkeule) `main` — that fork is where write striping lives; the upstream `hellas-ai` tree does not have `native_write_striping`. Use the activation parameters the upstream README's TP2 example omits:
    `profile=linux_perf bind_services=1 allocate_rings=1 start_rings=1 negotiate_native=1 enable_tunnels=1 tbnet=prefer_rdma lanes=2 register_verbs=1 roce_netdev=tbv0 native_write_striping=1`
 2. On both hosts: `sudo bash deploy-ws-core.sh` style deployment — blacklists `thunderbolt_net` (it steals DMA rings), creates the dummy `tbv0` netdev for RoCE GIDs (10.77.0.1/.2), installs the boot units.
 3. Connect **two** USB4 cables between the hosts, verify both links trained at `20.0 Gb/s x2`:
@@ -73,6 +73,6 @@ the exchanges; single-host NPU mode is verified at 91.8 t/s decode.
 
 ## Credits & licenses
 
-- Transport: [hellas-ai/thunderbolt-ibverbs](https://github.com/hellas-ai/thunderbolt-ibverbs) (and the `feat/write-striping` branch it grew) — GPL-2.0
+- Transport: [neuhaus/donnerkeule](https://github.com/neuhaus/donnerkeule) — a fork of [hellas-ai/thunderbolt-ibverbs](https://github.com/hellas-ai/thunderbolt-ibverbs) that carries the write-striping driver in `main` — GPL-2.0
 - Engine: [gufo-org/gufo](https://github.com/gufo-org/gufo) + the TP2 RDMA fork [neuhaus/gufo](https://github.com/neuhaus/gufo) (upstream in review) — MIT
 - Scripts in this repo: MIT. Kernel patches referenced (not redistributed) live in the upstream repo.
