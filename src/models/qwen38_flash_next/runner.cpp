@@ -819,6 +819,12 @@ std::shared_ptr<ext::TextModelRunner> CreateQwenFlashNextTextRunner(
           .vision_model_path = options.vision_model_path,
           .decode_concurrency =
               DecodeConcurrencyForSessions(options.session_count),
+          .tp_rank = options.tp_rank,
+          .tp_world_size = options.tp_world_size,
+          .hip_device = options.tp_hip_device,
+          .communicator =
+              std::static_pointer_cast<rocm::Communicator>(
+                  options.tp_communicator),
           .rope_scaling = rope_scaling,
       },
       &load_error);

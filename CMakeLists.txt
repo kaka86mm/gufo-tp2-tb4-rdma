@@ -371,6 +371,12 @@ target_link_libraries(gufo_serving PUBLIC gufo_ext_runtime gufo_logging
   gufo_core gufo_cache)
 # TP2 rank control: the executor and its disk store serve a rank-0 runner
 # from inference_backend.cpp, which `GUFO_HAS_TP2_CONTROL` enables.
+add_library(gufo_tp_control STATIC src/cli/serve/tp_control.cpp)
+target_include_directories(gufo_tp_control PUBLIC ${PROJECT_SOURCE_DIR})
+target_compile_features(gufo_tp_control PUBLIC cxx_std_20)
+target_link_libraries(gufo_tp_control PUBLIC gufo_core Threads::Threads)
+target_link_libraries(gufo_tp_control PRIVATE OpenSSL::Crypto)
+
 if(NOT WIN32)
   target_sources(gufo_serving PRIVATE src/cli/serve/tp_executor.cpp
     src/cli/serve/tp_disk_store.cpp)

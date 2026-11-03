@@ -20,6 +20,11 @@
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/gguf_reader.hpp"
+#include "src/cli/serve/tp_control.hpp"
+#include "src/cli/serve/tp_executor.hpp"
+#include "src/models/qwen38_flash_next/rope_scaling.hpp"
+#include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
+#include "src/models/deepseek_v4_flash/engine.hpp"
 
 namespace gufo::server {
 
@@ -493,7 +498,14 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             const TextDiskCacheConfig& disk_cache_config,
                             const std::string& vision_model_path,
                             TextRunnerRamCacheOptions ram_cache_config,
-                            bool enable_yarn) {
+                            const TextTpConfig& tp_config, bool enable_yarn) {
+#if !defined(GUFO_HAS_TP2_CONTROL)
+  if (tp_config.world_size > 1) {
+    SetError(error, "TP2 control is unavailable in this build");
+    return false;
+  }
+#endif
+
   std::string load_error;
   auto reader_owner = core::GgufReader::OpenFile(model_path, &load_error);
   if (reader_owner == nullptr) {
@@ -516,6 +528,10 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       .disk_cache = disk_cache_config,
       .ram_cache = ram_cache_config,
       .enable_yarn = enable_yarn,
+      .tp_rank = tp_config.rank,
+      .tp_world_size = tp_config.world_size,
+      .tp_hip_device = tp_config.hip_device,
+      .tp_communicator = tp_config.communicator,
   };
   auto runner = provider->create(options, error);
   if (runner == nullptr) {
@@ -524,6 +540,38 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   return load(std::move(runner), error, session_count, prefill_policy,
               scheduler_policy, disk_cache_config, ram_cache_config);
 }
+bool InferenceBackend::run_worker(std::string* error) {
+#if defined(ENGINE_ENABLE_HIP) && defined(GUFO_HAS_TP2_CONTROL)
+  const auto state = impl_->Snapshot();
+  if (state == nullptr || state->control == nullptr ||
+      state->communicator == nullptr || state->tp_executor == nullptr ||
+      state->tp_world_size != 2 || state->tp_rank != 1) {
+    SetError(error, "TP worker requires a loaded rank-1 Flash-Next model");
+    return false;
+  }
+  const auto respond = [control = state->control](
+                           const TpControlResponse& response,
+                           std::string* respond_error) {
+    return control->SendResponse(response, respond_error);
+  };
+  for (;;) {
+    TpControlCommand command;
+    std::string control_error;
+    if (!state->control->ReceiveCommand(&command, &control_error)) {
+      SetError(error, "TP worker command receive failed: " + control_error);
+      return false;
+    }
+    if (!state->tp_executor->Execute(command, respond, &control_error)) {
+      SetError(error, "TP worker: " + control_error);
+      return false;
+    }
+  }
+#else
+  SetError(error, "TP worker requires the HIP backend");
+  return false;
+#endif
+}
+
 #else
 bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner>,
                             std::string* error, std::size_t, TextPrefillPolicy,

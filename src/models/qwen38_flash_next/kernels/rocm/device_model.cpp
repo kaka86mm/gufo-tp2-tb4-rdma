@@ -14,6 +14,7 @@
 
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
+#include "src/core/quant/ggml_dequant.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
@@ -252,7 +253,7 @@ struct Uploader {
       case core::GgmlType::kBF16:
         return elements * 2;
       default:
-        return gufo::quant::QuantizedRowBytes(type, elements);
+        return quant::QuantizedRowBytes(type, elements);
     }
   }
 

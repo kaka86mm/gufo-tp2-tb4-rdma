@@ -216,7 +216,11 @@ struct TextRunnerDecode {
   std::reference_wrapper<TextRunnerState> state;
   std::size_t max_tokens{0};
   std::reference_wrapper<sampling::SamplerState> sampler;
+  /// This member's forced draft count (a TP2 peer's choice), overriding the
+  /// batch's shared plan; none lets the runner choose. (TP2 neuhaus)
+  std::optional<std::uint32_t> drafts{};
 };
+
 
 enum class InitialOutputState : std::uint8_t {
   kAuto,
@@ -292,6 +296,10 @@ struct ChatTool {
 };
 
 struct ChatRequest {
+  // TP2 (neuhaus rdma): the response_format as the request carried it, so a
+  // TP2 worker can rebuild the same constraint.
+  std::string response_format_json;
+  bool response_format_responses{false};
   enum class ToolChoice : std::uint8_t {
     kAuto,
     kNone,
@@ -322,6 +330,53 @@ struct ChatRequest {
 
 class TextModelRunner {
 public:
+
+
+  // TP2 (neuhaus rdma) mirroring hooks: defaults for single-host runners.
+  [[nodiscard]] virtual std::vector<std::uint8_t> EncodePromptContext(
+      const TextPromptContext&) const {
+    throw std::invalid_argument("model cannot transfer this prompt context");
+  }
+  [[nodiscard]] virtual std::shared_ptr<const TextPromptContext>
+  DecodePromptContext(std::span<const std::uint8_t>) const {
+    throw std::invalid_argument("model cannot decode this prompt context");
+  }
+  /// See ContinuationCache::set_optional_copies_displace_idle.
+  [[nodiscard]] virtual bool OptionalCopiesDisplaceIdle() const {
+    return false;
+  }
+  /// Consulted whenever a request looks up a reusable prefix.
+  [[nodiscard]] virtual bool CanReuse(const TextRunnerState&) const {
+    return true;
+  }
+  [[nodiscard]] virtual bool CanReuse(const TextRunnerSnapshot&) const {
+    return true;
+  }
+
+  // TP2 (neuhaus rdma) plan hooks: a TP2 peer runs the step with the same
+  // plan, so both ranks agree on its cycle width.
+  [[nodiscard]] virtual std::optional<std::uint32_t> PlanDecodeStep(
+      TextRunnerState&, std::size_t,
+      const sampling::SamplerState&, std::size_t = 1) const {
+    return std::nullopt;
+  }
+  /// DecodeStep with a plan from PlanDecodeStep, possibly made by a peer.
+  [[nodiscard]] virtual TextDecodeStep DecodeStepPlanned(
+      TextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler,
+      std::optional<std::uint32_t> /*plan*/) const {
+    return DecodeStep(state, max_tokens, sampler);
+  }
+  [[nodiscard]] virtual std::optional<std::uint32_t> PlanDecodeBatch(
+      std::span<const TextRunnerDecode>, std::size_t = 1) const {
+    return std::nullopt;
+  }
+  [[nodiscard]] virtual std::vector<TextDecodeStep> DecodeBatchPlanned(
+      std::span<const TextRunnerDecode> decodes,
+      std::optional<std::uint32_t> /*plan*/) const {
+    return DecodeBatch(decodes);
+  }
+
   TextModelRunner() = default;
   virtual ~TextModelRunner() = default;
 
@@ -574,6 +629,12 @@ struct TextRunnerOptions {
   TextDiskCacheConfig disk_cache{};
   TextRunnerRamCacheOptions ram_cache{};
   bool enable_yarn{false};
+  // TP2 (neuhaus rdma) identity pass-through; the communicator rides as an
+  // opaque pointer the model-layer runner casts back.
+  std::uint32_t tp_rank{0};
+  std::uint32_t tp_world_size{1};
+  int tp_hip_device{0};
+  std::shared_ptr<void> tp_communicator{};
 };
 
 struct TextBenchOptions {

@@ -6,6 +6,8 @@ gufo_extension_target(
     config.cpp
     continuation_layout.cpp
     ngram.cpp
+    distributed/rdma_gid.cpp
+    distributed/tp_partition.cpp
     rope_scaling.cpp
     weights.cpp
     bench_yarn.cpp
@@ -112,4 +114,20 @@ if(TARGET gufo_qwen38_flash_next_hip)
     ${PROJECT_SOURCE_DIR}
     ${GUFO_EXTENSION_BUILD_ROOT}
   )
+endif()
+
+
+# TP2 (neuhaus rdma): the verbs adapter rides alongside the extension when
+# libibverbs is available, mirroring the classic CMakeLists block.
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(IBVERBS QUIET IMPORTED_TARGET libibverbs)
+endif()
+if(TARGET PkgConfig::IBVERBS AND TARGET gufo_qwen38_flash_next_hip)
+  target_sources(gufo_qwen38_flash_next_hip PRIVATE
+    ${GUFO_EXTENSION_BUILD_ROOT}/kernels/rocm/verbs.cpp)
+  target_link_libraries(gufo_qwen38_flash_next_hip PUBLIC PkgConfig::IBVERBS)
+  target_compile_definitions(gufo_qwen38_flash_next_hip PUBLIC
+    GUFO_ENABLE_TP2_RDMA=1)
+  message(STATUS "qwen38_flash_next: TP2 RDMA adapter enabled (extension)")
 endif()

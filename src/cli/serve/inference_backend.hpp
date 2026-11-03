@@ -14,9 +14,24 @@
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 
+namespace gufo::models::qwen38_flash_next::rocm {
+class Communicator;
+}  // namespace rocm
+
 namespace gufo::server {
 class TpControlChannel;
 
+/// TP2 pair identity, control channel and communicator for the text model.
+struct TextTpConfig {
+  std::uint32_t rank{0};
+  std::uint32_t world_size{1};
+  int hip_device{0};
+  std::shared_ptr<::gufo::models::qwen38_flash_next::rocm::Communicator>
+      communicator;
+  std::shared_ptr<TpControlChannel> control;
+  std::string auth_token;
+};
+// TP2 (neuhaus rdma): types the mirrored runner and serve path need.
 using TextSpeculativeBackend = ext::TextSpeculativeBackend;
 using TextDFlashDraftPolicy = ext::TextDFlashDraftPolicy;
 using TextSpeculativeConfig = ext::TextSpeculativeConfig;
@@ -63,6 +78,9 @@ public:
             const std::string& vision_model_path = {},
             TextRunnerRamCacheOptions ram_cache_config = {},
             const TextTpConfig& tp_config = {}, bool enable_yarn = false);
+
+  [[nodiscard]] std::string tp_failure() const;
+  [[nodiscard]] bool run_worker(std::string* error);
 
   /// Installs a previously prepared runner with request-owned sessions.
   bool load(std::shared_ptr<ext::TextModelRunner> runner, std::string* error,
