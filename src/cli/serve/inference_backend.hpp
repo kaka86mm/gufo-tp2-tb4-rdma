@@ -88,7 +88,8 @@ public:
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
             const TextDiskCacheConfig& disk_cache_config = {},
-            TextRunnerRamCacheOptions ram_cache_config = {});
+            TextRunnerRamCacheOptions ram_cache_config = {},
+            const TextTpConfig& tp_config = {});
 
   /// Stable model identifier used in API responses.
   [[nodiscard]] std::string model_id() const override;

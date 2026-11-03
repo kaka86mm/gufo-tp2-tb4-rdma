@@ -22,11 +22,44 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/cli/serve/tp_control.hpp"
 #include "src/cli/serve/tp_executor.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/communicator.hpp"
+
+
 #include "src/models/qwen38_flash_next/rope_scaling.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
 
 namespace gufo::server {
+
+#if defined(GUFO_HAS_TP2_CONTROL)
+/// Binds the communicator's operation scope to the instruction index of the
+/// model call running on this rank, so a call's exchanges pair only with the
+/// same call's exchanges on the peer, whichever requests are open.
+class CommunicatorCallScope final : public TpCallScope {
+public:
+  explicit CommunicatorCallScope(
+      std::shared_ptr<::gufo::models::qwen38_flash_next::rocm::Communicator>
+          communicator)
+      : communicator_(std::move(communicator)) {
+    if (communicator_ == nullptr) {
+      throw std::invalid_argument("TP call scope needs a communicator");
+    }
+  }
+
+  [[nodiscard]] bool Begin(std::uint64_t index, std::string* error) override {
+    return communicator_->BeginOperation(index, error);
+  }
+  [[nodiscard]] bool End(std::uint64_t index, std::string* error) override {
+    return communicator_->EndOperation(index, error);
+  }
+
+private:
+  std::shared_ptr<::gufo::models::qwen38_flash_next::rocm::Communicator>
+      communicator_;
+};
+
+#endif
+
 
 namespace {
 
@@ -436,48 +469,128 @@ InferenceBackend::InferenceBackend() : impl_(std::make_unique<Impl>()) {}
 InferenceBackend::~InferenceBackend() = default;
 
 #if defined(ENGINE_ENABLE_HIP)
-bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner> runner,
-                            std::string* error, std::size_t session_count,
-                            TextPrefillPolicy prefill_policy,
-                            TextSchedulerPolicy scheduler_policy,
-                            const TextDiskCacheConfig& disk_cache_config,
-                            TextRunnerRamCacheOptions ram_cache_config) {
-  if (runner == nullptr) {
-    if (error && error->empty()) {
-      SetError(error, "Runner must not be null");
-    }
-    return false;
-  }
-  if (session_count == 0) {
-    SetError(error, "HTTP session count must be at least one");
-    return false;
-  }
+bool InferenceBackend::load(
+    std::shared_ptr<ext::TextModelRunner> runner, std::string* error,
+    std::size_t session_count, TextPrefillPolicy prefill_policy,
+    TextSchedulerPolicy scheduler_policy,
+    const TextDiskCacheConfig& disk_cache_config,
+    ext::TextRunnerRamCacheOptions ram_cache_config,
+    const TextTpConfig& tp_config) {
   try {
-    const auto desc = runner->Descriptor();
-    auto new_state = std::make_unique<Impl::State>();
-    new_state->model_path = desc.model_id;
-    new_state->sampling_defaults.max_tokens = 0;
-    new_state->sampling_defaults.model = desc.sampling_preset;
-    new_state->sampling_defaults.sampling = sampling::SamplingConfig{};
+    auto new_state = std::make_shared<Impl::State>();
+    const std::uint32_t tp_world_size = tp_config.world_size;
+    const std::uint32_t tp_rank = tp_config.rank;
+    const bool has_mtp = true;  // TP2 text production always runs MTP
+    const bool has_vision = false;
+    const TextSpeculativeConfig speculative_config{};
+    const bool model_yarn = false;
+    new_state->sampling_defaults.model = sampling::TextModelPreset::kQwen38;
     new_state->sampling_defaults.supplied = {};
-    new_state->supports_images = desc.capabilities.supports_vision;
-    new_state->model_id = desc.model_id;
-    new_state->max_context = desc.max_context;
-    std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
-    if (DiskCacheEnabled(disk_cache_config)) {
-      runner_disk_cache = TextRunnerDiskCacheOptions{
-          .directory = disk_cache_config.directory,
-          .capacity_bytes = disk_cache_config.capacity_bytes,
-          .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+    new_state->supports_images = false;  // TODO(v0.28 port): descriptor modalities
+    // runner arrives pre-built from the provider path
+    new_state->model_id = runner->Descriptor().model_id;
+    new_state->max_context = runner->Descriptor().max_context;
+#if defined(GUFO_HAS_TP2_CONTROL)
+    new_state->tp_max_requests =
+        session_count + scheduler_policy.max_pending_requests;
+    if (tp_world_size > 1) {
+      // Each rank offers its own RAM-cache limit and the pair uses the
+      // smaller one, so a limit above the automatic budget needs the same
+      // --cache-ram-bytes on both ranks.
+      const TpControlConfig control_config{
+          .snapshot_budget_bytes =
+              ram_cache_config.capacity_bytes == 0
+                  ? ext::HostSnapshotBudgetBytes()
+                  : std::min<std::uint64_t>(ram_cache_config.capacity_bytes,
+                                            ext::HostSnapshotCeilingBytes()),
+          .rank = tp_rank,
+          .world_size = tp_world_size,
+          .max_context = new_state->max_context,
+          .max_draft_tokens = has_mtp ? speculative_config.max_draft_tokens : 0,
+          .use_mtp = has_mtp,
+          .auth_token = tp_config.auth_token,
+          .prefill_chunk_tokens =
+              static_cast<std::uint32_t>(prefill_policy.decode_active_tokens),
+          .sessions = static_cast<std::uint32_t>(session_count),
+          .vision = has_vision,
+          .disk_cache = DiskCacheEnabled(disk_cache_config),
+          .yarn = model_yarn,
       };
+      std::string control_error;
+      if (!tp_config.control->Handshake(control_config, &control_error)) {
+        SetError(error, "TP worker handshake failed: " + control_error);
+        return false;
+      }
+      if (tp_rank == 0) {
+        new_state->response_broker = std::make_shared<TpResponseBroker>(
+            tp_config.control, new_state->tp_max_requests);
+      }
     }
-    Logger::Info("loader",
-                 "event=load_phase phase=sessions " + Logger::MemoryStatus());
-    auto runner_pool = std::make_shared<TextRunnerPool>(
-        std::move(runner), session_count, std::move(runner_disk_cache),
-        ram_cache_config);
-    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
-        std::move(runner_pool), prefill_policy, scheduler_policy);
+    if (tp_world_size > 1 && tp_rank != 0) {
+      // Rank 1 serves nothing itself: it executes rank 0's model calls on as
+      // many states as rank 0's pool creates, and builds no pool of its own.
+      // Its disk cache holds its half of what rank 0's cache saves.
+      std::shared_ptr<TpDiskStore> disk;
+      if (DiskCacheEnabled(disk_cache_config)) {
+        const auto persistence = runner->Descriptor().persistence;
+        if (!persistence.has_value()) {
+          SetError(error, "TP worker disk cache needs model fingerprints");
+          return false;
+        }
+        // The same automatic staging as rank 0's continuation disk store.
+        const std::size_t staging =
+            disk_cache_config.staging_capacity_bytes != 0
+                ? disk_cache_config.staging_capacity_bytes
+                : std::min(disk_cache_config.capacity_bytes,
+                           ext::HostSnapshotBudgetBytes() / 4);
+        disk = std::make_shared<TpDiskStore>(
+            TpDiskStore::Options{
+                .directory = disk_cache_config.directory,
+                .capacity_bytes = disk_cache_config.capacity_bytes,
+                .staging_capacity_bytes = staging,
+            },
+            persistence->compatibility_identity, persistence->payload_version);
+      }
+      new_state->tp_executor = std::make_shared<TpExecutor>(
+          std::move(runner), session_count,
+          tp_config.control->snapshot_budget_bytes(),
+          std::make_shared<CommunicatorCallScope>(tp_config.communicator),
+          std::move(disk));
+    } else {
+      std::shared_ptr<TextModelRunner> pool_runner = runner;
+      if (tp_world_size > 1) {
+        new_state->tp_runner = std::make_shared<TpMirroredRunner>(
+            std::move(runner),
+            std::make_shared<TpControlInstructionSink>(
+                tp_config.control, new_state->response_broker),
+            tp_config.control->snapshot_budget_bytes(),
+            std::make_shared<CommunicatorCallScope>(tp_config.communicator));
+        pool_runner = new_state->tp_runner;
+      }
+#else
+    std::shared_ptr<TextModelRunner> pool_runner = runner;
+#endif
+      std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
+      if (DiskCacheEnabled(disk_cache_config)) {
+        runner_disk_cache = TextRunnerDiskCacheOptions{
+            .directory = std::move(disk_cache_config.directory),
+            .capacity_bytes = disk_cache_config.capacity_bytes,
+            .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+        };
+      }
+      auto runner_pool = std::make_shared<TextRunnerPool>(
+          std::move(pool_runner), session_count, std::move(runner_disk_cache),
+          ram_cache_config);
+      new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+          std::move(runner_pool), prefill_policy, scheduler_policy);
+#if defined(GUFO_HAS_TP2_CONTROL)
+    }
+#endif
+    new_state->control = tp_config.control;
+    new_state->communicator = tp_config.communicator;
+    new_state->tp_rank = tp_rank;
+    new_state->tp_world_size = tp_world_size;
+
     {
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
       impl_->state = std::move(new_state);
@@ -488,6 +601,15 @@ bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner> runner,
     return false;
   }
 }
+#else
+bool InferenceBackend::load(
+    std::shared_ptr<ext::TextModelRunner>, std::string* error, std::size_t,
+    TextPrefillPolicy, TextSchedulerPolicy, const TextDiskCacheConfig&,
+    ext::TextRunnerRamCacheOptions, const TextTpConfig&) {
+  SetError(error, "HIP engine is disabled");
+  return false;
+}
+#endif
 
 bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             std::uint32_t max_context,
@@ -538,7 +660,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return false;
   }
   return load(std::move(runner), error, session_count, prefill_policy,
-              scheduler_policy, disk_cache_config, ram_cache_config);
+              scheduler_policy, disk_cache_config, ram_cache_config,
+              tp_config);
 }
 bool InferenceBackend::run_worker(std::string* error) {
 #if defined(ENGINE_ENABLE_HIP) && defined(GUFO_HAS_TP2_CONTROL)
@@ -572,56 +695,6 @@ bool InferenceBackend::run_worker(std::string* error) {
 #endif
 }
 
-#else
-bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner>,
-                            std::string* error, std::size_t, TextPrefillPolicy,
-                            TextSchedulerPolicy, const TextDiskCacheConfig&,
-                            TextRunnerRamCacheOptions) {
-  SetError(error, "HIP engine is disabled");
-  return false;
-}
-
-bool InferenceBackend::load(const std::string&, std::string* error,
-                            std::uint32_t, std::size_t, TextPrefillPolicy,
-                            TextSchedulerPolicy, const TextSpeculativeConfig&,
-                            const TextDiskCacheConfig&, const std::string&,
-                            TextRunnerRamCacheOptions, bool) {
-  SetError(error, "HIP engine is disabled");
-  return false;
-}
-
-bool InferenceBackend::run_worker(std::string* error) {
-#if defined(ENGINE_ENABLE_HIP) && defined(GUFO_HAS_TP2_CONTROL)
-  const auto state = impl_->Snapshot();
-  if (state == nullptr || state->control == nullptr ||
-      state->communicator == nullptr || state->tp_executor == nullptr ||
-      state->tp_world_size != 2 || state->tp_rank != 1) {
-    SetError(error, "TP worker requires a loaded rank-1 Flash-Next model");
-    return false;
-  }
-  const auto respond = [control = state->control](
-                           const TpControlResponse& response,
-                           std::string* respond_error) {
-    return control->SendResponse(response, respond_error);
-  };
-  for (;;) {
-    TpControlCommand command;
-    std::string control_error;
-    if (!state->control->ReceiveCommand(&command, &control_error)) {
-      SetError(error, "TP worker command receive failed: " + control_error);
-      return false;
-    }
-    if (!state->tp_executor->Execute(command, respond, &control_error)) {
-      SetError(error, "TP worker: " + control_error);
-      return false;
-    }
-  }
-#else
-  SetError(error, "TP worker requires the HIP backend");
-  return false;
-#endif
-}
-#endif
 
 std::string InferenceBackend::model_id() const {
 #if defined(ENGINE_ENABLE_HIP)
