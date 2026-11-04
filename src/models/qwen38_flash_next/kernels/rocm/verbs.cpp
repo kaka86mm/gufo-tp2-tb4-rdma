@@ -687,7 +687,7 @@ public:
         remote.mtu < IBV_MTU_256 || remote.mtu > IBV_MTU_4096 ||
         (gpu_windows_
              ? remote.recv_address != 0 || remote.recv_rkey != 0
-             : remote.recv_address != kRecvAddress || remote.recv_rkey == 0)) {
+             : remote.recv_rkey == 0)) {
       SetError(error, "verbs bootstrap metadata is invalid");
       return false;
     }
@@ -1174,13 +1174,28 @@ private:
     return gpu_windows_ ? hipMemcpyDeviceToDevice : hipMemcpyDeviceToHost;
   }
 
-  /// Maps and registers the host windows, used without device windows.
+  /// Allocates the host windows through the HIP driver's own pinned-memory
+  /// path, so later hipHostRegister calls (v0.28's component-cache backing)
+  /// cannot evict the GPU mapping of the exchange windows. The fixed-address
+  /// mmap+register path that this replaces poisons under TP2 on hosts where
+  /// re-registration displaces earlier mappings.
   [[nodiscard]] bool SetupHostWindows(std::string* error) {
-    if (!MapFixedBuffer(kSendAddress, kBufferBytes, &send_buffer_, error)) {
+    const auto alloc = [&](void** buffer, const char* what) {
+      if (hipHostMalloc(buffer, kBufferBytes,
+                        hipHostMallocMapped | hipHostMallocCoherent) !=
+              hipSuccess ||
+          *buffer == nullptr) {
+        SetError(error, std::string("host exchange window ") + what +
+                            " hipHostMalloc failed");
+        return false;
+      }
+      return true;
+    };
+    if (!alloc(&send_buffer_, "send")) {
       return false;
     }
     send_registered_ = true;
-    if (!MapFixedBuffer(kRecvAddress, kBufferBytes, &recv_buffer_, error)) {
+    if (!alloc(&recv_buffer_, "recv")) {
       return false;
     }
     recv_registered_ = true;
@@ -1191,13 +1206,9 @@ private:
     // invalidation (qualified runs agree token-for-token across the ranks).
     // A GPU that caches host mappings would need coherent windows here, as
     // the flags request explicitly.
-    if (hipHostGetDevicePointer(&send_device_, send_buffer_, 0) != hipSuccess ||
-        send_device_ == nullptr ||
-        hipHostGetDevicePointer(&recv_device_, recv_buffer_, 0) != hipSuccess ||
-        recv_device_ == nullptr) {
-      SetError(error, "exchange windows have no device mapping");
-      return false;
-    }
+    // hipHostMallocMapped already provides the device alias.
+    send_device_ = send_buffer_;
+    recv_device_ = recv_buffer_;
     send_mr_ = ibv_reg_mr(pd_, send_buffer_, kBufferBytes, kMemoryAccessFlags);
     recv_mr_ = ibv_reg_mr(pd_, recv_buffer_, kBufferBytes, kMemoryAccessFlags);
     if (send_mr_ == nullptr || recv_mr_ == nullptr) {
@@ -1731,12 +1742,12 @@ private:
     send_gpu_.Release();
     recv_gpu_.Release();
     if (send_registered_) {
-      UnmapFixedBuffer(send_buffer_, kBufferBytes);
+      (void)hipHostFree(send_buffer_);
       send_registered_ = false;
     }
     send_buffer_ = nullptr;
     if (recv_registered_) {
-      UnmapFixedBuffer(recv_buffer_, kBufferBytes);
+      (void)hipHostFree(recv_buffer_);
       recv_registered_ = false;
     }
     recv_buffer_ = nullptr;

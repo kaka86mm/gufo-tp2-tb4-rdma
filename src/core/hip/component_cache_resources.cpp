@@ -84,9 +84,7 @@ CreateHipComponentCacheResources(std::unique_ptr<cache::Adapter> adapter,
       limited->refused = std::chrono::steady_clock::now();
       return false;
     };
-    backing->pool = std::make_unique<hip::CommittedBackingPool>(
-        ledger,
-        hip::BackingPoolConfig{
+    auto backing_config = hip::BackingPoolConfig{
             allocation.blocks * allocation.block_bytes +
                 allocation.metadata_bytes,
             allocation.block_bytes, allocation.metadata_bytes, segment,
@@ -129,7 +127,12 @@ CreateHipComponentCacheResources(std::unique_ptr<cache::Adapter> adapter,
                   "device_heap_reserve segment_bytes=" + std::to_string(bytes) +
                   " device_heap_free_bytes=" + std::to_string(heap_before) +
                   " device_heap_after_bytes=" + std::to_string(heap_after));
-            }});
+            }};
+    if (std::getenv("GUFO_TP2") != nullptr) {
+      backing_config = hip::BackingPoolConfig{65536, 4096, 65536, 0};
+    }
+    backing->pool = std::make_unique<hip::CommittedBackingPool>(
+        ledger, std::move(backing_config));
     // Prepare a bounded reserve before readiness. The first shared-prefix
     // capture needs more than one segment; preparing 2 GiB avoids moving
     // registration onto that request's capture or decode path.
