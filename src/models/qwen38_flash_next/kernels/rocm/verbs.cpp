@@ -143,6 +143,11 @@ bool MapFixedBuffer(std::uintptr_t address, std::size_t bytes, void** buffer,
     SetError(error, "fixed RDMA buffer address mismatch");
     return false;
   }
+  // MAP_ANONYMOUS pages appear lazily on first CPU touch; a registered but
+  // untouched page faults the GPU on first DMA (prefill's second trunk
+  // batch). Touch every page before pinning so GPU writes always land on
+  // present memory.
+  std::memset(mapped, 0, bytes);
   if (hipHostRegister(mapped, bytes, hipHostRegisterMapped) != hipSuccess) {
     ::munmap(mapped, bytes);
     SetError(error, "hipHostRegister for fixed RDMA buffer failed");
