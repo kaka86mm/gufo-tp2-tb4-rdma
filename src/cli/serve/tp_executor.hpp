@@ -203,6 +203,17 @@ public:
   [[nodiscard]] std::string Decode(
       std::span<const TextRunnerToken> tokens) const override;
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override;
+
+  // v0.28 component-cache passthrough: the inner runner owns the adapter and
+  // slot provisioning; the mirror only wraps the bound state with its id.
+  [[nodiscard]] bool UsesComponentCache() const override;
+  [[nodiscard]] std::unique_ptr<ComponentCacheResources>
+  CreateComponentCacheResources(cache::ResourceLedger& ledger,
+                                std::size_t ram) const override;
+  [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
+      cache::Adapter& adapter, cache::Slot& slot) const override;
+  void ReconcileComponentState(TextRunnerState& state,
+                               std::size_t position) const override;
   [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
       TextRunnerState& state, sampling::SamplerState& sampler) const override;
   void PreparePrefixReuse(

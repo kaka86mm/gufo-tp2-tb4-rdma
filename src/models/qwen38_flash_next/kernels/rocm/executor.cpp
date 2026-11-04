@@ -1349,7 +1349,7 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   s->index_capacity_ = IndexerCapacity(c, options_.max_batch, max_context);
   s->linear_.resize(c.num_layers);
   s->attention_.resize(c.num_layers);
-  auto& a = s->allocations_;
+    auto& a = s->allocations_;
   // The trunk's state holds this rank's heads; the draft block's all of them.
   const MixerHeads& heads = model_->trunk_heads();
   const std::size_t kv_row = heads.AttentionKvDim();
@@ -1388,18 +1388,18 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   }
   s->control_ = Alloc<Session::Control>(a, 1, error_msg, &s->allocated_bytes_);
   if (s->mtp_enabled_) {
+    // The draft block's KV caches hold every head, unlike the trunk's rank
+    // half (neuhaus TP2): size them with the MTP heads' row width.
+    const std::size_t mtp_kv_row = model_->mtp().heads.AttentionKvDim();
     // Wide copy verification keeps every row for the draft catch-up.
-    s->mtp_.target_hidden =
-        Alloc<float>(a,
-                     static_cast<std::size_t>(
-                         std::max(options_.max_speculative, max_copy_rows())) *
-                         c.HcDim(),
-                     error_msg, &s->allocated_bytes_);
+    s->mtp_.target_hidden = Alloc<float>(
+        a, static_cast<std::size_t>(options_.max_speculative) * c.HcDim(),
+        error_msg, &s->allocated_bytes_);
     s->mtp_.k_cache =
-        Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
+        Alloc<__half>(a, static_cast<std::size_t>(max_context) * mtp_kv_row,
                       error_msg, &s->allocated_bytes_);
     s->mtp_.v_cache =
-        Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
+        Alloc<__half>(a, static_cast<std::size_t>(max_context) * mtp_kv_row,
                       error_msg, &s->allocated_bytes_);
     s->mtp_.index_k =
         Alloc<float>(a, std::size_t{s->index_capacity_} * c.indexer_head_dim,
@@ -4322,52 +4322,18 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
   }
   if (keep < n) {
     const std::size_t conv_elems =
-        static_cast<std::size_t>(c.ssm_conv_kernel - 1) * c.SsmConvChannels();
-    const std::size_t state_elems = GdnRollbackRowFloats(
-        0, c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim);
-    // A wide verification (ForwardWide) ran consecutive segments of at most
-    // eight rows. Cut back within the segment holding the last kept row;
-    // keeping a whole segment restores the next one's starting state.
-    constexpr std::uint32_t kSegment =
-        static_cast<std::uint32_t>(sizeof(RollbackRows::rows) /
-                                   sizeof(float*)) +
-        1;
-    const std::uint32_t segment = (keep - 1) / kSegment;
-    const std::uint32_t local = keep - segment * kSegment;
-    const bool whole = local == std::min(kSegment, n - segment * kSegment);
-    if (segment != 0 || whole) {
-      if (n <= kSegment || wide_segments_.size() < (n - 1) / kSegment) {
-        AssignError(error_msg, "rollback outside the wide verification");
-        return false;
-      }
-    }
-    const WideSegment* start = whole ? &wide_segments_[segment] : nullptr;
-    const WideSegment* rows =
-        !whole && segment != 0 ? &wide_segments_[segment - 1] : nullptr;
-    const std::size_t slot = local - 1;
-    for (std::size_t il = 0; il < session.linear_.size(); ++il) {
-      auto& l = session.linear_[il];
+        static_cast<std::size_t>(c.ssm_conv_kernel - 1) *
+        model_->trunk_heads().SsmConvChannels();
+    const std::size_t slot = keep - 1;
+    for (auto& l : session.linear_) {
       if (l.state == nullptr) {
         continue;
       }
-      if (start != nullptr) {
-        if (!Check(hipMemcpyAsync(l.state, start->state_start[il],
-                                  state_elems * sizeof(float),
-                                  hipMemcpyDeviceToDevice, stream_),
-                   "state rollback", error_msg) ||
-            !Check(hipMemcpyAsync(l.conv_state, start->conv_start[il],
-                                  conv_elems * sizeof(float),
-                                  hipMemcpyDeviceToDevice, stream_),
-                   "conv rollback", error_msg))
-          return false;
-        continue;
-      }
-      const auto& state_rows = rows ? rows->state[il] : l.state_snapshots;
-      const auto& conv_rows = rows ? rows->conv[il] : l.conv_snapshots;
-      RestoreGdnState(l.state, state_rows, local, c.ssm_num_k_heads,
-                      c.ssm_num_v_heads, stream_);
+      RestoreGdnState(l.state, l.state_snapshots, keep,
+                      model_->trunk_heads().ssm_k, model_->trunk_heads().ssm_v,
+                      stream_);
       if (!Check(hipGetLastError(), "state rollback", error_msg) ||
-          !Check(hipMemcpyAsync(l.conv_state, conv_rows.rows[slot],
+          !Check(hipMemcpyAsync(l.conv_state, l.conv_snapshots.rows[slot],
                                 conv_elems * sizeof(float),
                                 hipMemcpyDeviceToDevice, stream_),
                  "conv rollback", error_msg)) {
@@ -4377,16 +4343,13 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
     if (session.ple_history_ != nullptr) {
       const std::size_t hist =
           static_cast<std::size_t>(c.PleConvHistory()) * c.HcDim();
-      const float* source = start  ? start->ple_start
-                            : rows ? rows->ple.rows[slot]
-                                   : session.ple_snapshots_.rows[slot];
-      if (!Check(
-              hipMemcpyAsync(session.ple_history_, source, hist * sizeof(float),
-                             hipMemcpyDeviceToDevice, stream_),
-              "PLE rollback", error_msg)) {
+      if (!Check(hipMemcpyAsync(
+                     session.ple_history_, session.ple_snapshots_.rows[slot],
+                     hist * sizeof(float), hipMemcpyDeviceToDevice, stream_),
+                 "PLE rollback", error_msg)) {
         return false;
       }
-      session.ngram_ = session.ngram_snapshots_[keep - 1];
+      session.ngram_ = session.ngram_snapshots_[slot];
     }
     session.position_ = session.spec_base_ + keep;
     // Pooled block keys past the kept prefix are stale; they are rebuilt

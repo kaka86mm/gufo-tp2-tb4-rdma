@@ -830,6 +830,31 @@ std::unique_ptr<TextRunnerState> TpMirroredRunner::CreateState() const {
   return std::make_unique<State>(this, std::move(inner), next_state_id_++);
 }
 
+bool TpMirroredRunner::UsesComponentCache() const {
+  return inner_->UsesComponentCache();
+}
+
+std::unique_ptr<ComponentCacheResources>
+TpMirroredRunner::CreateComponentCacheResources(cache::ResourceLedger& ledger,
+                                                std::size_t ram) const {
+  return inner_->CreateComponentCacheResources(ledger, ram);
+}
+
+std::unique_ptr<TextRunnerState> TpMirroredRunner::BindComponentState(
+    cache::Adapter& adapter, cache::Slot& slot) const {
+  auto inner = inner_->BindComponentState(adapter, slot);
+  if (inner == nullptr) {
+    return nullptr;
+  }
+  const std::lock_guard<std::mutex> lock(mutex_);
+  return std::make_unique<State>(this, std::move(inner), next_state_id_++);
+}
+
+void TpMirroredRunner::ReconcileComponentState(TextRunnerState& state,
+                                               std::size_t position) const {
+  inner_->ReconcileComponentState(Mirrored(state).inner(), position);
+}
+
 std::optional<TextDecodeSelection> TpMirroredRunner::PreviewFirstToken(
     TextRunnerState& state, sampling::SamplerState& sampler) const {
   return inner_->PreviewFirstToken(Mirrored(state).inner(), sampler);

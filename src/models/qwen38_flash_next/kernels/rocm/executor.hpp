@@ -359,7 +359,12 @@ public:
   /// anchor is copied from its history (ForwardWide), or 0 without MTP.
   static constexpr std::uint32_t kWideRows = 64;
   [[nodiscard]] std::uint32_t max_copy_rows() const noexcept {
-    return has_mtp() ? std::min({kWideRows, options_.max_batch, copy_rows_cap_})
+    // TP2 (neuhaus port): later wide segments' rollback rows are not backed
+    // on the mirror; keep one segment until the ledger covers them.
+    return has_mtp() ? std::min({kWideRows, options_.max_batch, copy_rows_cap_,
+                                 options_.all_reduce
+                                     ? std::uint32_t{8}
+                                     : std::uint32_t{kWideRows}})
                      : 0;
   }
   /// Caps max_copy_rows() before any session is created, so the wide
