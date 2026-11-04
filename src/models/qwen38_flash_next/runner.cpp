@@ -166,6 +166,16 @@ public:
                                cache::Adapter& adapter, cache::Slot& slot)
       : session_(&session), adapter_(&adapter), slot_(&slot) {}
 
+  /// Standalone mode (TP2 mirror): the state keeps the adapter and slot that
+  /// own its session alive, so it works outside the component cache.
+  void OwnStandalone(std::unique_ptr<cache::MutationGuard> guard,
+                     std::unique_ptr<cache::Adapter> adapter,
+                     std::unique_ptr<cache::Slot> slot) {
+    owned_guard_ = std::move(guard);
+    owned_adapter_ = std::move(adapter);
+    owned_slot_ = std::move(slot);
+  }
+
   void Invalidate() noexcept override {
     session_->SetCancellationCheck({});
     (void)adapter_->Invalidate(*slot_);
@@ -191,6 +201,9 @@ public:
   void set_position(std::size_t position) noexcept { position_ = position; }
 
 private:
+  std::unique_ptr<cache::MutationGuard> owned_guard_;
+  std::unique_ptr<cache::Adapter> owned_adapter_;
+  std::unique_ptr<cache::Slot> owned_slot_;
   QwenFlashNextSession* session_{};
   cache::Adapter* adapter_{};
   cache::Slot* slot_{};
@@ -411,8 +424,26 @@ public:
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
-    throw std::logic_error(
-        "Flash-Next execution slots are owned by the component cache");
+    // Standalone session for consumers outside the component cache (the TP2
+    // mirrored runner builds request-owned states this way).
+    auto adapter = std::make_unique<ContinuationAdapter>(
+        model_,
+        use_mtp_ ? core::SessionMode::kSpeculative
+                 : core::SessionMode::kAutoregressive,
+        max_context_, component_identity_);
+    struct StandaloneGuard final : cache::MutationGuard {
+      void BeforeOverwrite(cache::ComponentId, cache::Rows, cache::Rows) override {}
+      void BeforeRelease(cache::ComponentId, cache::Rows,
+                          cache::Rows) noexcept override {}
+    };
+    // The slot keeps a MutationGuard reference; heap-allocate it and let the
+    // state own it so the reference outlives every slot mutation.
+    auto guard = std::make_unique<StandaloneGuard>();
+    auto slot = adapter->CreateSlot(*guard);
+    auto state = std::make_unique<QwenFlashNextTextRunnerState>(
+        adapter->GetSession(*slot), *adapter, *slot);
+    state->OwnStandalone(std::move(guard), std::move(adapter), std::move(slot));
+    return state;
   }
 
   void PreparePrefixReuse(
