@@ -4062,6 +4062,12 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                              : 0U;
     const auto finish = [&](std::uint32_t rows) {
       defer_residual_ = WmmaExperts(l, rows);
+      // The deferred-residual dance assumes the solo fused-epilogue flow
+      // (moe_pending_). TP2 materializes the MoE epilogue before its
+      // all-reduce, so keep both combines on the immediate path.
+      if (model_->tp_world_size() > 1) {
+        defer_residual_ = false;
+      }
       if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] wmma-done il=%u rows=%u res=%016llx inj=%016llx\n", il, rows, (unsigned long long)stage_res_hash(), (unsigned long long)stage_inject_hash()); }
       // The wide FFN reads the mix only through its F16 rows (router, routed
       // experts) and tiled Q8 rows (shared expert).
