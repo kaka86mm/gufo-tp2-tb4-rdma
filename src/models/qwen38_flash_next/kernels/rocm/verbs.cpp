@@ -17,6 +17,7 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -577,6 +578,13 @@ public:
       return false;
     }
     std::memset(flags_, 0, kFlagBytes);
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+      std::fprintf(stderr,
+                   "[tptrace-v] bufs flags=%p flags_dev=%p arrivals=%p\n",
+                   static_cast<void*>(flags_),
+                   static_cast<void*>(flags_device_),
+                   static_cast<void*>(arrivals_));
+    }
     int clock_khz = 0;
     if (hipDeviceGetAttribute(&clock_khz, hipDeviceAttributeWallClockRate,
                               static_cast<int>(config_.device_index)) !=
@@ -627,6 +635,16 @@ public:
       recv_gpu_.Release();
       if (!SetupHostWindows(error)) {
         return false;
+      }
+      if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[tptrace-v] windows send=%p..%p recv=%p..%p " 
+                     "send_dev=%p recv_dev=%p\n",
+                     static_cast<void*>(send_buffer_),
+                     static_cast<void*>(static_cast<std::uint8_t*>(send_buffer_) + kBufferBytes),
+                     static_cast<void*>(recv_buffer_),
+                     static_cast<void*>(static_cast<std::uint8_t*>(recv_buffer_) + kBufferBytes),
+                     send_device_, recv_device_);
       }
     }
 

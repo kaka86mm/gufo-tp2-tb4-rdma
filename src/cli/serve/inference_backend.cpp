@@ -734,12 +734,13 @@ bool InferenceBackend::run_worker(std::string* error) {
       const TpInstruction& ti = command.instruction;
       std::fprintf(stderr,
           "[tptrace-c] recv seq=%llu kind=%u op=%u idx=%llu state=%u "
-          "off=%u cnt=%u psize=%u tok=%d snap=%llu nbatch=%zu\n",
+          "off=%u cnt=%u psize=%u tok=%d snap=%llu drafts=%u bd=%u nbatch=%zu\n",
           static_cast<unsigned long long>(command.sequence),
           static_cast<unsigned>(command.kind), static_cast<unsigned>(ti.op),
           static_cast<unsigned long long>(ti.index), ti.state, ti.offset,
           ti.count, ti.prompt_size, ti.token,
-          static_cast<unsigned long long>(ti.snapshot_id), ti.batch.size());
+          static_cast<unsigned long long>(ti.snapshot_id), ti.drafts, ti.batch_drafts,
+                    ti.batch.size());
     }
     if (!state->tp_executor->Execute(command, respond, &control_error)) {
       SetError(error, "TP worker: " + control_error);

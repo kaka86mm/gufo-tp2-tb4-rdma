@@ -652,6 +652,14 @@ void TpMirroredRunner::Record(
   const auto found = requests_.find(sequence);
   if (found != requests_.end()) {
     add(found->second.digest);
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+      std::fprintf(stderr,
+                   "[dig] r0 record seq=%llu digest=%016llx\n",
+                   static_cast<unsigned long long>(sequence),
+                   static_cast<unsigned long long>(
+                       found->second.digest.value()));
+      std::fflush(stderr);
+    }
   }
 }
 
@@ -983,6 +991,18 @@ TextDecodeStep TpMirroredRunner::DecodeStep(
   } catch (...) {
     Record(sent.sequence, DigestTpFailure);
     throw;
+  }
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    std::fprintf(stderr,
+                 "[dig] r0 decode idx=%llu drafts=%u sel=%zu t0=%d "
+                 "rounds=%u drafted=%u accepted=%u pos=%zu\n",
+                 static_cast<unsigned long long>(sent.index),
+                 plan.has_value() ? *plan + 1 : 0U, step.selections.size(),
+                 step.selections.empty() ? -1 : step.selections[0].token,
+                 step.draft_rounds, step.draft_tokens,
+                 step.draft_accepted_tokens,
+                 inner_->CheckpointPosition(mirrored.inner()));
+    std::fflush(stderr);
   }
   Record(sent.sequence, [&](TpExecutionDigest& digest) {
     DigestTpDecode(digest, step, inner_->CheckpointPosition(mirrored.inner()));
@@ -1600,6 +1620,18 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
                 : std::nullopt;
         const auto step = runner_->DecodeStepPlanned(state, instruction.count,
                                                      request.sampler, plan);
+        if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+          std::fprintf(stderr,
+                       "[dig] r1 decode idx=%llu drafts=%u sel=%zu t0=%d "
+                       "rounds=%u drafted=%u accepted=%u pos=%zu\n",
+                       static_cast<unsigned long long>(instruction.index),
+                       instruction.drafts, step.selections.size(),
+                       step.selections.empty() ? -1 : step.selections[0].token,
+                       step.draft_rounds, step.draft_tokens,
+                       step.draft_accepted_tokens,
+                       runner_->CheckpointPosition(state));
+          std::fflush(stderr);
+        }
         for (const auto& selection : step.selections) {
           request.sampler.Accept(selection.token);
         }
@@ -1650,6 +1682,13 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
       *error = call_error + " (TP2 ranks diverged; worker stops)";
     }
     return false;
+  }
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    std::fprintf(stderr, "[dig] r1 call-done idx=%llu op=%u digest=%016llx\n",
+                 static_cast<unsigned long long>(instruction.index),
+                 static_cast<unsigned>(instruction.op),
+                 static_cast<unsigned long long>(request.digest.value()));
+    std::fflush(stderr);
   }
   if (TpCacheAcknowledged(instruction.op)) {
     const TpControlResponse response{

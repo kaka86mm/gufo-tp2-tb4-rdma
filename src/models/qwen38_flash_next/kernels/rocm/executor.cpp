@@ -1700,7 +1700,7 @@ std::size_t Executor::SessionBytes(
              sizeof(float) +
          attention * (kv + index) + sizeof(Session::Control) +
          (mode == core::SessionMode::kSpeculative
-              ? kv + index + hidden_rows * c.HcDim() * sizeof(float) +
+              ? mtp_kv + index + hidden_rows * c.HcDim() * sizeof(float) +
                     (model_->draft_output().empty()
                          ? 0
                          : std::size_t{speculative::kDraftVocabExtraRows} *
@@ -2100,8 +2100,17 @@ bool Executor::RouteHints(std::uint32_t n_tokens, bool wide_pairs,
   if (!ExpertMatrixRows(n_tokens)) {
     return true;
   }
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    std::fprintf(stderr, "[stage] routehints-pre-sync n=%u counts_host=%p\n",
+                 n_tokens, static_cast<void*>(counts_host_));
+    std::fflush(stderr);
+  }
   if (!Check(hipEventSynchronize(counts_ready_), "expert counts", error_msg)) {
     return false;
+  }
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    std::fprintf(stderr, "[stage] routehints-counts-synced n=%u\n", n_tokens);
+    std::fflush(stderr);
   }
   // The F16 expert GEMM launches one block per (expert, row tile of its
   // 16-padded bucket): the map is built here and uploaded ahead of the
@@ -2876,7 +2885,10 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
         n_tokens <= options_.max_batch && DenseF16Route(l.attn_qkv, n_tokens) &&
         l.attn_qkv.rows == 2 * (heads.attn + heads.attn_kv) * 256 &&
         l.attn_qkv.cols == 2560 && heads.attn == 12 * heads.attn_kv &&
-        heads.attn_dim == 256 && c.rotary_dim == 64;
+        heads.attn_dim == 256 && c.rotary_dim == 64 &&
+        // The fused kernel bakes the full model's 24/2 head geometry into
+        // its tile layout; a TP rank's halved heads take the split path.
+        model_->tp_world_size() == 1;
     if (fused_projection) {
       PrepareHalfInput(x, n_tokens, l.attn_qkv.cols);
       prepared = AttentionF16Gemm(
@@ -3851,10 +3863,12 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     if (!session.CheckCancellation(error_msg))
       return false;
     const DeviceLayer& l = layers[il];
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] layer-enter il=%u n=%u\n", il, n); }
     if (c.IsPleLayer(il) && !Ple(l, session, n, s_.res, speculative, error_msg,
                                  embeddings_ready, checkpoints)) {
       return false;
     }
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] ple-done il=%u n=%u\n", il, n); }
     // Both stacked SSM projections consume the same F16 input. Avoid writing
     // unused F32/Q8 copies when the wide mixer can supply that input directly.
     const bool half_only = WidePrefill(n) && n <= options_.max_batch &&
@@ -3865,6 +3879,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                half_only)) {
       return false;
     }
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] hcmix-done il=%u n=%u\n", il, n); }
     // The last target layer's query outputs have no later cache consumer.
     // Preserve all K/V/indexer rows and the final query's original tile.
     const bool last_attention = WidePrefill(n) && !session.mtp_enabled_ &&
@@ -3889,6 +3904,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                           last_attention, false, true, pass_rows)) {
       return false;
     }
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] attn-done il=%u n=%u\n", il, n); }
 
     const float* next_norm =
         il + 1 < c.num_layers
@@ -3907,6 +3923,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                              : 0U;
     const auto finish = [&](std::uint32_t rows) {
       defer_residual_ = WmmaExperts(l, rows);
+      if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] wmma-done il=%u rows=%u\n", il, rows); }
       // The wide FFN reads the mix only through its F16 rows (router, routed
       // experts) and tiled Q8 rows (shared expert).
       const bool no_f32 = prefill_phase && defer_residual_ &&
@@ -3917,9 +3934,14 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       Combine(s_.res, l.hc_ffn.norm.f32(), rows, InjectWeights(l.hc_ffn),
               &l.hc_ffn);
       if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, rows, error_msg,
-                 false, no_f32) ||
-          !Moe(l, s_.mixed, s_.block_out, rows, error_msg))
+                 false, no_f32)) {
         return false;
+      }
+      if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] ffn-hcmix-done il=%u rows=%u\n", il, rows); }
+      if (!Moe(l, s_.mixed, s_.block_out, rows, error_msg)) {
+        return false;
+      }
+      if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] moe-done il=%u rows=%u\n", il, rows); }
       // The next layer's mixer follows in this pass (without a PLE step:
       // next_norm is null before a PLE layer).
       Combine(s_.res, next_norm, rows, next_inject,
