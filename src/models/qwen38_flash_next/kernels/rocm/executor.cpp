@@ -2310,24 +2310,30 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
       std::memcpy(&b, &bv[i], sizeof(b));
       bh = (bh ^ b) * 1099511628211ULL;
     }
-    float xv[16] = {};
-    (void)hipMemcpyAsync(xv, s_.xn, 16 * sizeof(float),
+    static std::vector<float> xn_full;
+    xn_full.assign(static_cast<std::size_t>(n_tokens) * c.HcDim(), 0.0F);
+    (void)hipMemcpyAsync(xn_full.data(), s_.xn,
+                         xn_full.size() * sizeof(float),
                          hipMemcpyDeviceToHost, stream_);
     (void)hipStreamSynchronize(stream_);
     std::uint64_t xh = 1469598103934665603ULL;
-    for (std::size_t i = 0; i < 16; ++i) {
+    for (std::size_t i = 0; i < xn_full.size(); ++i) {
       std::uint32_t b;
-      std::memcpy(&b, &xv[i], sizeof(b));
+      std::memcpy(&b, &xn_full[i], sizeof(b));
       xh = (xh ^ b) * 1099511628211ULL;
     }
-    float iv[8] = {};
-    (void)hipMemcpyAsync(iv, s_.inject, 8 * sizeof(float),
-                         hipMemcpyDeviceToHost, stream_);
+    const std::size_t inj_count = static_cast<std::size_t>(n_tokens) *
+                                  c.hc_count * inject_parts_;
+    static std::vector<float> inj_full;
+    inj_full.assign(inj_count, 0.0F);
+    (void)hipMemcpyAsync(inj_full.data(), s_.inject,
+                         inj_count * sizeof(float), hipMemcpyDeviceToHost,
+                         stream_);
     (void)hipStreamSynchronize(stream_);
     std::uint64_t ih = 1469598103934665603ULL;
-    for (std::size_t i = 0; i < 8; ++i) {
+    for (std::size_t i = 0; i < inj_count; ++i) {
       std::uint32_t b;
-      std::memcpy(&b, &iv[i], sizeof(b));
+      std::memcpy(&b, &inj_full[i], sizeof(b));
       ih = (ih ^ b) * 1099511628211ULL;
     }
     std::fprintf(stderr,
