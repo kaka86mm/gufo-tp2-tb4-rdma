@@ -3979,7 +3979,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                                  embeddings_ready, checkpoints)) {
       return false;
     }
-    if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] ple-done il=%u n=%u res=%016llx\n", il, n, (unsigned long long)stage_res_hash()); }
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] ple-done il=%u n=%u res=%016llx inj=%016llx\n", il, n, (unsigned long long)stage_res_hash(), (unsigned long long)stage_inject_hash()); }
     // Both stacked SSM projections consume the same F16 input. Avoid writing
     // unused F32/Q8 copies when the wide mixer can supply that input directly.
     const bool half_only = WidePrefill(n) && n <= options_.max_batch &&
@@ -3990,7 +3990,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                half_only)) {
       return false;
     }
-    if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] hcmix-done il=%u n=%u res=%016llx\n", il, n, (unsigned long long)stage_res_hash()); }
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] hcmix-done il=%u n=%u res=%016llx inj=%016llx\n", il, n, (unsigned long long)stage_res_hash(), (unsigned long long)stage_inject_hash()); }
     // The last target layer's query outputs have no later cache consumer.
     // Preserve all K/V/indexer rows and the final query's original tile.
     const bool last_attention = WidePrefill(n) && !session.mtp_enabled_ &&
@@ -4015,7 +4015,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                           last_attention, false, true, pass_rows)) {
       return false;
     }
-    if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] attn-done il=%u n=%u res=%016llx\n", il, n, (unsigned long long)stage_res_hash()); }
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] attn-done il=%u n=%u res=%016llx inj=%016llx\n", il, n, (unsigned long long)stage_res_hash(), (unsigned long long)stage_inject_hash()); }
 
     const float* next_norm =
         il + 1 < c.num_layers
@@ -4034,7 +4034,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                              : 0U;
     const auto finish = [&](std::uint32_t rows) {
       defer_residual_ = WmmaExperts(l, rows);
-      if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] wmma-done il=%u rows=%u res=%016llx\n", il, rows, (unsigned long long)stage_res_hash()); }
+      if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] wmma-done il=%u rows=%u res=%016llx inj=%016llx\n", il, rows, (unsigned long long)stage_res_hash(), (unsigned long long)stage_inject_hash()); }
       // The wide FFN reads the mix only through its F16 rows (router, routed
       // experts) and tiled Q8 rows (shared expert).
       const bool no_f32 = prefill_phase && defer_residual_ &&
@@ -4048,7 +4048,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                  false, no_f32)) {
         return false;
       }
-      if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] ffn-hcmix-done il=%u rows=%u res=%016llx\n", il, rows, (unsigned long long)stage_res_hash()); }
+      if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] ffn-hcmix-done il=%u rows=%u res=%016llx inj=%016llx\n", il, rows, (unsigned long long)stage_res_hash(), (unsigned long long)stage_inject_hash()); }
       if (!Moe(l, s_.mixed, s_.block_out, rows, error_msg)) {
         return false;
       }
