@@ -2298,10 +2298,14 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
       std::memcpy(&b, &bv[i], sizeof(b));
       bh = (bh ^ b) * 1099511628211ULL;
     }
-    std::fprintf(stderr, "[cb] seq=%llu n=%u res_in=%016llx bo=%016llx\n",
+    std::fprintf(stderr,
+                 "[cb] seq=%llu n=%u res_in=%016llx bo=%016llx "
+                 "bo_ptr=%p injw=%p\n",
                  static_cast<unsigned long long>(cb_seq++), n_tokens,
                  static_cast<unsigned long long>(rh),
-                 static_cast<unsigned long long>(bh));
+                 static_cast<unsigned long long>(bh),
+                 static_cast<const void*>(s_.block_out),
+                 static_cast<const void*>(inject_w));
     std::fflush(stderr);
   }
   inject_fused_ = nullptr;
