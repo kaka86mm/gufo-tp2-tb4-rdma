@@ -1451,6 +1451,16 @@ bool Session::FinishDecode(const DecodeRequest& request,
   while (keep < k) {
     if (gpu_greedy && !cpu_rows) {
       const auto& prediction = greedy[keep - 1];
+      if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+        static std::uint64_t g_seq = 0;
+        std::fprintf(stderr,
+                     "[vg] seq=%llu keep=%zu draft=%d idx=%d val=%.6e "
+                     "match=%d\n",
+                     static_cast<unsigned long long>(g_seq++), keep,
+                     chain[keep], prediction.index, prediction.value,
+                     prediction.index == chain[keep] ? 1 : 0);
+        std::fflush(stderr);
+      }
       if (!std::isfinite(prediction.value)) {
         AssignError(error_msg, "logit distribution contains no finite values");
         return false;
