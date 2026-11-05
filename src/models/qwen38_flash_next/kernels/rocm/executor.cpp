@@ -4215,8 +4215,29 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     const std::size_t skip = static_cast<std::size_t>(n - n_logits);
     const DeviceMixer& head = model_->hc_head();
     if (!HcMix(head, s_.res + skip * c.HcDim(), false, s_.mixed, nullptr,
-               n_logits, error_msg) ||
-        !Dense(model_->output(), s_.mixed, s_.logits, n_logits, error_msg)) {
+               n_logits, error_msg)) {
+      return false;
+    }
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+      static std::uint64_t hi_seq = 0;
+      float v[16] = {};
+      (void)hipMemcpyAsync(v, s_.mixed, 16 * sizeof(float),
+                           hipMemcpyDeviceToHost, stream_);
+      (void)hipStreamSynchronize(stream_);
+      std::uint64_t h = 1469598103934665603ULL;
+      for (std::size_t i = 0; i < 16; ++i) {
+        std::uint32_t b;
+        std::memcpy(&b, &v[i], sizeof(b));
+        h = (h ^ b) * 1099511628211ULL;
+      }
+      std::fprintf(stderr,
+                   "[hi] seq=%llu nl=%u mixed=%016llx res0=%016llx\n",
+                   static_cast<unsigned long long>(hi_seq++), n_logits,
+                   static_cast<unsigned long long>(h),
+                   static_cast<unsigned long long>(h));
+      std::fflush(stderr);
+    }
+    if (!Dense(model_->output(), s_.mixed, s_.logits, n_logits, error_msg)) {
       return false;
     }
     if (download_logits &&
