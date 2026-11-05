@@ -471,8 +471,17 @@ public:
     }
     if (std::getenv("GUFO_TP_TRACE") != nullptr) { std::fprintf(stderr, "[tptrace-e] runner_prefill pos=%zu off=%zu psize=%zu budget=%zu\n", qfn.position(), offset, prompt.size(), max_input_tokens); }
     const std::size_t remaining = prompt.size() - offset;
+    std::size_t budget = max_input_tokens;
+    if (model_->TpWorldSize() > 1 &&
+        remaining <= model_->PrefillThroughCapacity()) {
+      // The pool's in-pass boundary asked for a partial pass; splitting a
+      // capacity-fitting prompt corrupts the TP2 inject-parts chain (the
+      // fused HcMix consumes a pending combine from the split). Take the
+      // whole tail in one pass.
+      budget = remaining;
+    }
     const std::size_t consumed =
-        StepTokens(offset, max_input_tokens, remaining,
+        StepTokens(offset, budget, remaining,
                    remaining <= model_->PrefillThroughCapacity()
                        ? model_->PrefillThroughCapacity()
                        : model_->PrefillCapacity());
