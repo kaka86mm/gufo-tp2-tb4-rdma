@@ -2785,6 +2785,23 @@ bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
     PrefetchPle(session, prefetch_next_);
     prefetch_next_ = {};
   }
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    static std::uint64_t pe_seq = 0;
+    float v[32] = {};
+    (void)hipMemcpyAsync(v, s_.ple_emb, 32 * sizeof(float),
+                         hipMemcpyDeviceToHost, stream_);
+    (void)hipStreamSynchronize(stream_);
+    std::uint64_t h = 1469598103934665603ULL;
+    for (std::size_t i = 0; i < 32; ++i) {
+      std::uint32_t b;
+      std::memcpy(&b, &v[i], sizeof(b));
+      h = (h ^ b) * 1099511628211ULL;
+    }
+    std::fprintf(stderr, "[pe] seq=%llu n=%u emb=%016llx\n",
+                 static_cast<unsigned long long>(pe_seq++), n,
+                 static_cast<unsigned long long>(h));
+    std::fflush(stderr);
+  }
   const std::uint32_t hc_dim = c.HcDim();
   Q8Input emb;
   if (!Quantize(s_.ple_emb, n, c.PleEmbeddingDim(), &emb, error_msg) ||
