@@ -1235,7 +1235,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
                  static_cast<unsigned long long>(w_seq++), max_tokens, room,
                  cap, forced.has_value() ? static_cast<int>(*forced) : -1,
                  forced.has_value() ? *forced : 0U, drafts, width,
-                 tokens_.size(), static_cast<unsigned>(session_->position_),
+                 tokens_.size(), static_cast<unsigned>(Position()),
                  MtpEnabled() ? 1 : 0);
     std::fflush(stderr);
   }
