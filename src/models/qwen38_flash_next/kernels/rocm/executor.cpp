@@ -4008,6 +4008,12 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                            speculative, error_msg, false, true, capture)) {
         return false;
       }
+      // GDN layers hold half the heads under TP as well: reduce before the
+      // finish lambda consumes the block output (see the attention branch).
+      if (model_->tp_world_size() > 1 &&
+          !AllReduce(s_.block_out, n, error_msg)) {
+        return false;
+      }
     } else if (!Attention(l, session.attention_[il], s_.mixed, s_.block_out, n,
                           &session.control_->position,
                           &session.control_->blocks, start_pos, pool_grid,
