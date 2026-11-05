@@ -3175,20 +3175,22 @@ bool Executor::AllReduce(float* data, std::size_t rows, std::string* error_msg,
     return false;
   }
   if (ar_trace && rows != 0) {
-    const std::size_t samples =
-        std::min<std::size_t>(rows * config().hidden_size, 64);
-    float post_sample[64] = {};
-    (void)hipMemcpyAsync(post_sample, data, samples * sizeof(float),
+    const std::size_t total = rows * config().hidden_size;
+    static std::vector<float> post_full;
+    post_full.assign(total, 0.0F);
+    (void)hipMemcpyAsync(post_full.data(), data, total * sizeof(float),
                          hipMemcpyDeviceToHost, stream_);
     (void)hipStreamSynchronize(stream_);
     std::uint64_t pre_h = 1469598103934665603ULL;
     std::uint64_t post_h = 1469598103934665603ULL;
-    for (std::size_t i = 0; i < samples; ++i) {
+    for (std::size_t i = 0; i < 64; ++i) {
       std::uint32_t b;
-      static_assert(sizeof(b) == sizeof(pre_sample[i]));
       std::memcpy(&b, &pre_sample[i], sizeof(b));
       pre_h = (pre_h ^ b) * 1099511628211ULL;
-      std::memcpy(&b, &post_sample[i], sizeof(b));
+    }
+    for (std::size_t i = 0; i < total; ++i) {
+      std::uint32_t b;
+      std::memcpy(&b, &post_full[i], sizeof(b));
       post_h = (post_h ^ b) * 1099511628211ULL;
     }
     static std::uint64_t ar_seq = 0;
