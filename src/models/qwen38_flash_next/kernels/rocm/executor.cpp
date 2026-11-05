@@ -5390,6 +5390,41 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
                                     std::span<const std::int32_t> drafts,
                                     std::string* error_msg) const {
   const auto rows = predictions.size();
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    static std::uint64_t gp_seq = 0;
+    const auto vocab0 = config().vocab_size;
+    const float* base = VerificationLogits();
+    std::uint64_t h0 = 1469598103934665603ULL, hL = 1469598103934665603ULL;
+    float v[16] = {};
+    if (rows > 0) {
+      (void)hipMemcpyAsync(v, base, 16 * sizeof(float),
+                           hipMemcpyDeviceToHost, stream_);
+      (void)hipStreamSynchronize(stream_);
+      for (std::size_t i = 0; i < 16; ++i) {
+        std::uint32_t b;
+        std::memcpy(&b, &v[i], sizeof(b));
+        h0 = (h0 ^ b) * 1099511628211ULL;
+      }
+      (void)hipMemcpyAsync(
+          v, base + (rows - 1) * static_cast<std::size_t>(vocab0),
+          16 * sizeof(float), hipMemcpyDeviceToHost, stream_);
+      (void)hipStreamSynchronize(stream_);
+      for (std::size_t i = 0; i < 16; ++i) {
+        std::uint32_t b;
+        std::memcpy(&b, &v[i], sizeof(b));
+        hL = (hL ^ b) * 1099511628211ULL;
+      }
+    }
+    std::fprintf(stderr,
+                 "[gp] seq=%llu rows=%zu wide=%d first=%016llx last=%016llx "
+                 "src=%p\n",
+                 static_cast<unsigned long long>(gp_seq++), rows,
+                 selected_logits_ != nullptr ? 1 : 0,
+                 static_cast<unsigned long long>(h0),
+                 static_cast<unsigned long long>(hL),
+                 static_cast<const void*>(base));
+    std::fflush(stderr);
+  }
   if (rows > 7 && rows < wide_rows_ && drafts.size() == rows &&
       selected_logits_ != nullptr) {
     // A wide copy verification: rows of at most seven at a time, each with
