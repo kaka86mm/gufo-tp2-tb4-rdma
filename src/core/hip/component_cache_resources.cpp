@@ -129,7 +129,14 @@ CreateHipComponentCacheResources(std::unique_ptr<cache::Adapter> adapter,
                   " device_heap_after_bytes=" + std::to_string(heap_after));
             }};
     if (std::getenv("GUFO_TP2") != nullptr) {
+      // TP2: registering large host segments displaces the GPU mappings of
+      // the verbs exchange windows on this host and faults the first
+      // prefill. Keep the backing pool empty and skip the v0.30 grow-ahead:
+      // captures are rejected at the executor boundary anyway.
       backing_config = hip::BackingPoolConfig{65536, 4096, 65536, 0};
+      backing->pool = std::make_unique<hip::CommittedBackingPool>(
+          ledger, std::move(backing_config));
+      return;
     }
     backing->pool = std::make_unique<hip::CommittedBackingPool>(
         ledger, std::move(backing_config));
@@ -147,7 +154,9 @@ CreateHipComponentCacheResources(std::unique_ptr<cache::Adapter> adapter,
   result->prepare_prefill = [backing](std::size_t tokens) {
     // Prepare after any fallback capture, alongside actual prefill work.
     // Short turns need a smaller reserve for private states and row tails.
-    backing->pool->GrowAhead((tokens >= 512 ? 2ULL : 1ULL) << 30);
+    if (std::getenv("GUFO_TP2") == nullptr) {
+      backing->pool->GrowAhead((tokens >= 512 ? 2ULL : 1ULL) << 30);
+    }
   };
   result->can_capture = [backing](auto payloads) {
     return backing->pool->CanFit(payloads);

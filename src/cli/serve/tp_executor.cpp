@@ -197,10 +197,7 @@ std::shared_ptr<const sampling::TokenConstraint> RebuildConstraint(
         ParseResponseFormat(&format, source.response_format_responses);
   }
   sampling::SamplingConfig config;
-  (void)ConstrainChatRequest(
-      request, runner, &config, nullptr,
-      source.reasoning ? TextGenerationBackend::InitialOutputState::kReasoning
-                       : TextGenerationBackend::InitialOutputState::kContent);
+  (void)ConstrainChatRequest(request, runner, &config);
   if (config.constraint == nullptr)
     throw std::invalid_argument("the source describes no constraint");
   return config.constraint;
@@ -666,13 +663,6 @@ TextRunnerDescriptor TpMirroredRunner::Descriptor() const {
   // Rolling back an interrupted prefill needs the call to stop mid-pass,
   // where rank 1 would be left inside an exchange; calls here always finish.
   descriptor.capabilities.prefill_rollback = false;
-  if (descriptor.persistence.has_value()) {
-    // Rank 0's files hold its half and name rank 1's: neither a one-host
-    // server nor a lone rank can restore them.
-    constexpr std::string_view kMarker = "tp2=rank0-mirror-v1\n";
-    auto& identity = descriptor.persistence->compatibility_identity;
-    identity.insert(identity.end(), kMarker.begin(), kMarker.end());
-  }
   return descriptor;
 }
 
@@ -830,13 +820,6 @@ std::unique_ptr<TextRunnerState> TpMirroredRunner::CreateState() const {
   return std::make_unique<State>(this, std::move(inner), next_state_id_++);
 }
 
-bool TpMirroredRunner::UsesComponentCache() const {
-  // The component cache leases a fresh runner state per conversation with a
-  // monotonically growing mirror id; rank 1's TpExecutor owns a fixed array
-  // sized at load. The classic continuation pool keeps exactly state_count
-  // states, so under TP2 the mirror never exposes the component cache.
-  return false;
-}
 
 std::unique_ptr<ComponentCacheResources>
 TpMirroredRunner::CreateComponentCacheResources(cache::ResourceLedger& ledger,
@@ -1154,33 +1137,6 @@ void TpMirroredRunner::PrepareCancellation(TextRunnerState& state) const {
       [&] { inner_->PrepareCancellation(mirrored.inner()); });
 }
 
-class TpMirroredRunner::SnapshotHandle final : public TextRunnerSnapshot {
-public:
-  SnapshotHandle(std::shared_ptr<const TpMirroredRunner> owner,
-                 std::unique_ptr<TextRunnerSnapshot> inner, std::uint64_t id,
-                 std::uint64_t producer)
-      : owner(std::move(owner)),
-        inner(std::move(inner)),
-        id(id),
-        producer(producer) {}
-  ~SnapshotHandle() override { owner->Drop(id); }
-  std::size_t PayloadBytes() const noexcept override {
-    return inner->PayloadBytes();
-  }
-  /// Rank 0's hint stands for both ranks: a state reached the same way holds
-  /// the same rows on rank 1.
-  [[nodiscard]] bool PrefersState(
-      const ContinuationState& state) const noexcept override {
-    const auto* mirrored = dynamic_cast<const State*>(&state);
-    return mirrored != nullptr && inner->PrefersState(mirrored->inner());
-  }
-  std::shared_ptr<const TpMirroredRunner> owner;
-  std::unique_ptr<TextRunnerSnapshot> inner;
-  std::uint64_t id;
-  /// The last request that changed the captured state, zero for none.
-  std::uint64_t producer;
-};
-
 std::uint64_t TpMirroredRunner::CacheCall(
     std::uint32_t state, const TpInstruction& instruction,
     const std::function<void()>& local) const {
@@ -1244,201 +1200,6 @@ void TpMirroredRunner::Drop(std::uint64_t id) const noexcept {
   }
 }
 
-std::size_t TpMirroredRunner::SnapshotPayloadBytes(
-    const TextRunnerState& state) const {
-  return inner_->SnapshotPayloadBytes(Mirrored(state).inner());
-}
-
-std::unique_ptr<TextRunnerSnapshot> TpMirroredRunner::Snapshot(
-    const TextRunnerState& state) const {
-  return Capture(state, false);
-}
-
-std::unique_ptr<TextRunnerSnapshot> TpMirroredRunner::SnapshotForPersistence(
-    const TextRunnerState& state) const {
-  return Capture(state, true);
-}
-
-std::unique_ptr<TextRunnerSnapshot> TpMirroredRunner::Capture(
-    const TextRunnerState& state, bool complete) const {
-  const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
-  const auto& mirrored = Mirrored(state);
-  if (next_snapshot_id_ == std::numeric_limits<std::uint64_t>::max()) {
-    throw std::overflow_error("TP snapshot ID exhausted");
-  }
-  const auto id = next_snapshot_id_++;
-  std::uint64_t producer = 0;
-  {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    if (const auto found = producers_.find(mirrored.id());
-        found != producers_.end()) {
-      producer = found->second;
-    }
-  }
-  std::unique_ptr<TextRunnerSnapshot> snapshot;
-  try {
-    (void)CacheCall(
-        mirrored.id(),
-        {.op = TpInstructionOp::kSnapshot,
-         .state = mirrored.id(),
-         .offset = complete ? 1U : 0U,
-         .snapshot_id = id},
-        [&] {
-          snapshot = complete ? inner_->SnapshotForPersistence(mirrored.inner())
-                              : inner_->Snapshot(mirrored.inner());
-          if (!snapshot)
-            throw std::runtime_error("snapshot capture returned null");
-        });
-    return std::make_unique<SnapshotHandle>(shared_from_this(),
-                                            std::move(snapshot), id, producer);
-  } catch (...) {
-    Drop(id);
-    throw;
-  }
-}
-
-void TpMirroredRunner::RestoreOrFork(TextRunnerState& state,
-                                     const TextRunnerSnapshot& snapshot) const {
-  const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
-  const auto* handle = dynamic_cast<const SnapshotHandle*>(&snapshot);
-  if (!handle || handle->owner.get() != this)
-    throw std::invalid_argument("foreign TP snapshot");
-  auto& mirrored = Mirrored(state);
-  {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    const auto lease = leases_.find(mirrored.id());
-    if (lease != leases_.end() && handle->producer != 0 &&
-        handle->producer != lease->second &&
-        unsettled_.contains(handle->producer)) {
-      dependencies_[lease->second].insert(handle->producer);
-    }
-  }
-  const auto sequence = CacheCall(
-      mirrored.id(),
-      {.op = TpInstructionOp::kRestore,
-       .state = mirrored.id(),
-       .snapshot_id = handle->id},
-      [&] { inner_->RestoreOrFork(mirrored.inner(), *handle->inner); });
-  Record(sequence, [&](TpExecutionDigest& digest) {
-    digest.Add(inner_->CheckpointPosition(mirrored.inner()));
-  });
-}
-
-bool TpMirroredRunner::CanReuse(const TextRunnerSnapshot& snapshot) const {
-  // Rank 1 compared both ranks' calls before capturing, so a snapshot is
-  // reusable as soon as it exists, until its producer is rejected; a request
-  // that restores it earlier depends on that verdict.
-  const auto* handle = dynamic_cast<const SnapshotHandle*>(&snapshot);
-  if (handle == nullptr || handle->owner.get() != this) {
-    return false;
-  }
-  const std::lock_guard<std::mutex> lock(mutex_);
-  return !rejected_.contains(handle->producer);
-}
-
-std::size_t TpMirroredRunner::PersistentSnapshotPayloadBytes(
-    const TextRunnerSnapshot& snapshot) const {
-  const auto* handle = dynamic_cast<const SnapshotHandle*>(&snapshot);
-  if (handle == nullptr || handle->owner.get() != this)
-    throw std::invalid_argument("foreign TP snapshot");
-  return kPersistHeaderBytes +
-         inner_->PersistentSnapshotPayloadBytes(*handle->inner);
-}
-
-std::vector<std::uint8_t> TpMirroredRunner::BeginPersist(
-    const TextRunnerSnapshot& snapshot) const {
-  const auto* handle = dynamic_cast<const SnapshotHandle*>(&snapshot);
-  if (handle == nullptr || handle->owner.get() != this)
-    throw std::invalid_argument("foreign TP snapshot");
-  const auto key = RandomNonzero();
-  {
-    const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
-    const std::lock_guard<std::mutex> lock(mutex_);
-    if (!failure_.empty())
-      throw std::runtime_error("TP instruction channel failed: " + failure_);
-    // What rank 1 rejected never reaches the disk. A snapshot of a request
-    // still running is written, and checked again if restored in this
-    // process.
-    if (rejected_.contains(handle->producer))
-      throw std::runtime_error("TP snapshot of a rejected request");
-    // Rank 1 persists its half in the background: the snapshot outlives the
-    // write there, and a failed write only makes a later restore a miss.
-    const TpInstruction instruction{.op = TpInstructionOp::kPersist,
-                                    .snapshot_id = handle->id,
-                                    .file_key = key};
-    std::string error;
-    if (!sink_->Send(0, instruction, nullptr, &error)) {
-      failure_ = "snapshot persist send failed: " + error;
-      throw std::runtime_error(failure_);
-    }
-  }
-  std::vector<std::uint8_t> header(kPersistHeaderBytes);
-  std::copy(kPersistMagic.begin(), kPersistMagic.end(), header.begin());
-  PutLe(header.data() + 8, kPersistFormat, 4);
-  PutLe(header.data() + 16, key, 8);
-  PutLe(header.data() + 24, nonce_, 8);
-  PutLe(header.data() + 32, handle->producer, 8);
-  return header;
-}
-
-std::size_t TpMirroredRunner::SerializePersistentSnapshot(
-    const TextRunnerSnapshot& snapshot,
-    std::span<std::uint8_t> destination) const {
-  const auto bytes = PersistentSnapshotPayloadBytes(snapshot);
-  if (destination.size() < bytes)
-    throw std::invalid_argument("TP persistent snapshot destination too small");
-  const auto header = BeginPersist(snapshot);
-  std::copy(header.begin(), header.end(), destination.begin());
-  const auto& handle = dynamic_cast<const SnapshotHandle&>(snapshot);
-  return header.size() + inner_->SerializePersistentSnapshot(
-                             *handle.inner, destination.subspan(header.size()));
-}
-
-void TpMirroredRunner::StreamPersistentSnapshot(
-    const TextRunnerSnapshot& snapshot, const SnapshotSink& sink) const {
-  const auto header = BeginPersist(snapshot);
-  sink(header);
-  const auto& handle = dynamic_cast<const SnapshotHandle&>(snapshot);
-  inner_->StreamPersistentSnapshot(*handle.inner, sink);
-}
-
-void TpMirroredRunner::RestorePersistentSnapshot(
-    TextRunnerState& state, std::span<const std::uint8_t> payload) const {
-  if (payload.size() < kPersistHeaderBytes ||
-      !std::equal(kPersistMagic.begin(), kPersistMagic.end(),
-                  payload.begin()) ||
-      GetLe(payload.data() + 8, 4) != kPersistFormat)
-    throw std::invalid_argument("not a TP2 disk-cache payload");
-  const auto key = GetLe(payload.data() + 16, 8);
-  const auto nonce = GetLe(payload.data() + 24, 8);
-  const auto producer = GetLe(payload.data() + 32, 8);
-  if (key == 0)
-    throw std::invalid_argument("TP2 disk-cache payload names no file");
-  const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
-  auto& mirrored = Mirrored(state);
-  if (nonce == nonce_) {
-    // Written by this process: as for a snapshot in memory, a rejected
-    // producer makes the file a miss, and one without a verdict yet makes
-    // the restoring request depend on it.
-    const std::lock_guard<std::mutex> lock(mutex_);
-    if (rejected_.contains(producer))
-      throw std::runtime_error("TP snapshot of a request rank 1 rejected");
-    const auto lease = leases_.find(mirrored.id());
-    if (lease != leases_.end() && producer != 0 && producer != lease->second &&
-        unsettled_.contains(producer)) {
-      dependencies_[lease->second].insert(producer);
-    }
-  }
-  (void)CacheCall(mirrored.id(),
-                  {.op = TpInstructionOp::kRestoreDisk,
-                   .state = mirrored.id(),
-                   .file_key = key},
-                  [&] {
-                    inner_->RestorePersistentSnapshot(
-                        mirrored.inner(), payload.subspan(kPersistHeaderBytes));
-                  });
-}
-
 /// One open request on rank 1: what it needs to execute rank 0's calls for it
 /// and to judge them.
 struct TpExecutor::Request {
@@ -1479,13 +1240,10 @@ struct TpExecutor::Request {
 };
 
 TpExecutor::TpExecutor(std::shared_ptr<TextModelRunner> runner,
-                       std::size_t state_count, std::size_t snapshot_budget,
-                       std::shared_ptr<TpCallScope> scope,
-                       std::shared_ptr<TpDiskStore> disk)
+                       std::size_t state_count,
+                       std::shared_ptr<TpCallScope> scope)
     : runner_(std::move(runner)),
-      scope_(std::move(scope)),
-      disk_(std::move(disk)),
-      snapshot_budget_(snapshot_budget) {
+      scope_(std::move(scope)) {
   if (runner_ == nullptr || state_count == 0) {
     throw std::invalid_argument("TP executor needs a runner and a state");
   }
@@ -1496,6 +1254,7 @@ TpExecutor::TpExecutor(std::shared_ptr<TextModelRunner> runner,
       throw std::runtime_error("TP executor state creation failed");
     }
     states_.push_back(std::move(state));
+    state_use_.push_back(0);
   }
   // Rank 0's scheduler prepares its vocabulary before serving; rank 1 would
   // otherwise build its own inside the first constrained request, while rank 0
@@ -1518,11 +1277,53 @@ bool TpExecutor::TakeIndex(const TpControlCommand& command,
 }
 
 TextRunnerState& TpExecutor::StateFor(std::uint32_t id) {
-  if (id >= states_.size()) {
-    throw std::out_of_range("TP instruction names state " + std::to_string(id) +
-                            " of " + std::to_string(states_.size()));
+  // Rank 0's component-cache pool leases a fresh runner state per
+  // conversation, so mirror ids arrive monotonically and grow without bound.
+  // Create the missing states on demand: each id's state is born empty, which
+  // is exactly what rank 0's fresh lease holds.
+  while (states_.size() <= id) {
+    auto state = runner_->CreateState();
+    if (state == nullptr) {
+      throw std::runtime_error("TP executor state creation failed");
+    }
+    states_.push_back(std::move(state));
+    state_use_.push_back(instructions_);
   }
+  state_use_[id] = instructions_;
   return *states_[id];
+}
+
+void TpExecutor::RecycleIdleStates() {
+  // Rank 0's pool recycles its sessions; its mirror ids are monotonic and
+  // never reused, so a state untouched for many instructions is dead. Free
+  // it (its adapter slot and model session follow) before the array leaks
+  // GPU memory conversation by conversation. Keep a recent margin: an idle
+  // but live state is one a very slow request still holds, and releasing it
+  // would only fail that request loudly if rank 0 ever named it again.
+  constexpr std::uint64_t kIdleInstructions = 100000;
+  constexpr std::size_t kKeepRecent = 8;
+  if (states_.size() <= kKeepRecent) {
+    return;
+  }
+  const std::uint64_t cutoff =
+      instructions_ > kIdleInstructions ? instructions_ - kIdleInstructions : 0;
+  for (std::size_t id = 0; id + kKeepRecent < states_.size(); ++id) {
+    if (states_[id] != nullptr && state_use_[id] < cutoff) {
+      // An open request may still name this state: only retire states that
+      // no open request leases (requests hold their states to the end).
+      bool leased = false;
+      for (const auto& [sequence, request] : requests_) {
+        (void)sequence;
+        if (id < request->own.size()) {
+          leased = true;
+          break;
+        }
+      }
+      if (!leased) {
+        states_[id].reset();
+      }
+    }
+  }
 }
 
 TpExecutor::OwnChoice TpExecutor::ChooseGreedy(TextRunnerState& state) const {
@@ -1549,21 +1350,18 @@ bool TpExecutor::EndScope(std::uint64_t index, std::string* error) {
   return true;
 }
 
-void TpExecutor::DropSnapshot(std::uint64_t id) {
-  if (id == 0)
-    throw std::logic_error("unknown snapshot drop ID");
-  // Rank 0 drops the ID of a capture that failed before this rank recorded
-  // it: retire the ID so that rank 0 cannot reuse it.
-  last_snapshot_id_ = std::max(last_snapshot_id_, id);
-  const auto found = snapshots_.find(id);
-  if (found != snapshots_.end()) {
-    snapshot_bytes_ -= found->second->PayloadBytes();
-    snapshots_.erase(found);
-  }
+void TpExecutor::DropSnapshot(std::uint64_t) {
+  // The v0.28-era mirrored snapshot store is gone with the classic cache;
+  // rank 0 no longer sends kSnapshot/kRestore under TP2.
 }
 
 bool TpExecutor::Execute(const TpControlCommand& command,
                          const Respond& respond, std::string* error) {
+  ++instructions_;
+  if ((instructions_ & 0xFFFF) == 0) {
+    RecycleIdleStates();
+  }
+
   if (command.kind == TpControlCommandKind::kSingle) {
     return Open(command, error);
   }
@@ -1674,12 +1472,7 @@ bool TpExecutor::ExecuteIdle(const TpInstruction& instruction,
     if (instruction.op == TpInstructionOp::kDrop) {
       DropSnapshot(instruction.snapshot_id);
     } else if (instruction.op == TpInstructionOp::kPersist) {
-      // Best effort, like rank 0's write: a snapshot rank 1 skipped or a
-      // write it cannot queue only makes a later restore of the file a miss.
-      const auto found = snapshots_.find(instruction.snapshot_id);
-      if (disk_ != nullptr && found != snapshots_.end()) {
-        (void)disk_->PersistAsync(instruction.file_key, runner_, found->second);
-      }
+      // The mirrored disk store is gone with the classic cache.
     } else if (instruction.op == TpInstructionOp::kPromptContext) {
       runner_->SetPromptContext(StateFor(instruction.state), nullptr);
     } else {
@@ -1711,50 +1504,20 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
   std::string call_error;
   try {
     auto& state = StateFor(instruction.state);
+    if (request.own.size() <= instruction.state) {
+      request.own.resize(instruction.state + 1);
+    }
     auto& choice = request.own[instruction.state];
     // Multi-token cycles stop at EOS unless the request ignores it, on both
     // ranks alike.
     state.SetStopAtEos(request.stop_at_eos);
     switch (instruction.op) {
-      case TpInstructionOp::kSnapshot: {
-        if (instruction.snapshot_id <= last_snapshot_id_)
-          throw std::logic_error("reused snapshot ID");
-        last_snapshot_id_ = instruction.snapshot_id;
-        // Rank 0 sent the request's calls so far: capture only a state both
-        // ranks reached the same way, so the snapshot is reusable at once.
-        if (instruction.count != request.count ||
-            instruction.digest != request.digest.value() ||
-            !request.failure.empty())
-          throw std::runtime_error("the ranks diverged before this capture");
-        const auto estimate = runner_->SnapshotPayloadBytes(state);
-        if (estimate > snapshot_budget_ - snapshot_bytes_)
-          throw std::runtime_error("worker snapshot budget exhausted");
-        // A snapshot for the disk cache is complete, as on rank 0: the
-        // writer thread must not read rows the session still shares.
-        auto snapshot = instruction.offset != 0
-                            ? runner_->SnapshotForPersistence(state)
-                            : runner_->Snapshot(state);
-        if (!snapshot)
-          throw std::runtime_error("snapshot capture returned null");
-        const auto bytes = snapshot->PayloadBytes();
-        if (bytes > snapshot_budget_ - snapshot_bytes_)
-          throw std::runtime_error("worker snapshot exceeds reserved budget");
-        snapshots_.emplace(instruction.snapshot_id, std::move(snapshot));
-        snapshot_bytes_ += bytes;
-        break;
-      }
+      case TpInstructionOp::kSnapshot:
       case TpInstructionOp::kDrop:
-        DropSnapshot(instruction.snapshot_id);
-        break;
-      case TpInstructionOp::kRestore: {
-        choice.reset();
-        const auto found = snapshots_.find(instruction.snapshot_id);
-        if (found == snapshots_.end())
-          throw std::logic_error("unknown snapshot ID");
-        runner_->RestoreOrFork(state, *found->second);
-        request.digest.Add(runner_->CheckpointPosition(state));
-        break;
-      }
+      case TpInstructionOp::kRestore:
+        // The v0.28-era mirrored snapshot store is gone with the classic
+        // cache; rank 0 sends none of these under TP2.
+        throw std::logic_error("TP snapshot op is not mirrored anymore");
       case TpInstructionOp::kReuse:
         choice.reset();
         if (!prompt_fits)
@@ -1771,10 +1534,7 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
         break;
       case TpInstructionOp::kRestoreDisk:
         choice.reset();
-        if (disk_ == nullptr)
-          throw std::runtime_error("rank 1 has no disk cache");
-        disk_->Restore(instruction.file_key, *runner_, state);
-        break;
+        throw std::logic_error("rank 1 has no disk cache");
       case TpInstructionOp::kPromptContext:
         DigestTpContext(request.digest, request.images);
         runner_->SetPromptContext(state, request.images);
@@ -1933,7 +1693,10 @@ bool TpExecutor::ExecuteBatch(const TpInstruction& instruction,
     auto& request = *members[index];
     ++request.count;
     DigestTpCall(request.digest, MemberCall(instruction.op, member));
-    auto& choice = request.own[member.state];
+    if (request.own.size() <= member.state) {
+        request.own.resize(member.state + 1);
+      }
+        auto& choice = request.own[member.state];
     if (decode) {
       choice.reset();
       request.sampler.RestoreDrawState(
@@ -2038,6 +1801,9 @@ bool TpExecutor::ExecuteBatch(const TpInstruction& instruction,
     }
     if (request.greedy) {
       try {
+        if (request.own.size() <= member.state) {
+          request.own.resize(member.state + 1);
+        }
         request.own[member.state] = ChooseGreedy(state);
       } catch (const std::exception& exception) {
         request.Note(std::string("rank 1 greedy choice failed: ") +

@@ -253,8 +253,7 @@ bool HcDownF16Gemm(const void* w, const void* x_tiled, __half* out,
 bool AttentionF16Gemm(const void* weights, const __half* input,
                       const float* q_gamma, const float* k_gamma, float* query,
                       float* gate, __half* keys, __half* values,
-                      std::uint32_t n_tokens, std::uint32_t heads,
-                      std::uint32_t kv_heads, const std::uint32_t* position,
+                      std::uint32_t n_tokens, const std::uint32_t* position,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
                       const YarnRope& yarn = {});
@@ -639,6 +638,11 @@ void MoeEpilogueVec4F16(const __half* expert_out, const float* weights,
                         std::uint32_t dim, hipStream_t stream);
 
 /// dst[t] = *row < 0 ? alt[t] : base[*row + t] (rows of `width` floats).
+/// Add the projected embedding once to each projected hidden branch.
+void MtpAddEmbedding(const float* embedding, float* residual,
+                     std::uint32_t n_tokens, std::uint32_t hidden,
+                     std::uint32_t streams, hipStream_t stream);
+
 void MtpHidden(const float* base, const float* alt, const std::int32_t* row,
                float* dst, std::uint32_t n_tokens, std::uint32_t width,
                hipStream_t stream);

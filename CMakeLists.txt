@@ -380,8 +380,7 @@ target_link_libraries(gufo_tp_control PUBLIC gufo_core Threads::Threads)
 target_link_libraries(gufo_tp_control PRIVATE OpenSSL::Crypto)
 
 if(NOT WIN32)
-  target_sources(gufo_serving PRIVATE src/cli/serve/tp_executor.cpp
-    src/cli/serve/tp_disk_store.cpp)
+  target_sources(gufo_serving PRIVATE src/cli/serve/tp_executor.cpp)
   target_link_libraries(gufo_serving PUBLIC gufo_tp_control)
   target_compile_definitions(gufo_serving PUBLIC GUFO_HAS_TP2_CONTROL=1)
 endif()

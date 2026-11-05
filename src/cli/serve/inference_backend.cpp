@@ -441,7 +441,8 @@ struct InferenceBackend::Impl {
               .return_progress = return_progress,
           });
       return std::make_shared<ScheduledGenerationRequest>(
-          state, std::move(scheduled), initial, tool_format, std::move(tp));
+          state, std::move(scheduled), initial, tool_format, std::string(),
+          std::move(tp));
     } catch (...) {
       // Rank 0 made no model call for the request, so it ends on rank 1 with
       // none either.
@@ -588,33 +589,12 @@ bool InferenceBackend::load(
     if (tp_world_size > 1 && tp_rank != 0) {
       // Rank 1 serves nothing itself: it executes rank 0's model calls on as
       // many states as rank 0's pool creates, and builds no pool of its own.
-      // Its disk cache holds its half of what rank 0's cache saves.
-      std::shared_ptr<TpDiskStore> disk;
-      if (DiskCacheEnabled(disk_cache_config)) {
-        const auto persistence = runner->Descriptor().persistence;
-        if (!persistence.has_value()) {
-          SetError(error, "TP worker disk cache needs model fingerprints");
-          return false;
-        }
-        // The same automatic staging as rank 0's continuation disk store.
-        const std::size_t staging =
-            disk_cache_config.staging_capacity_bytes != 0
-                ? disk_cache_config.staging_capacity_bytes
-                : std::min(disk_cache_config.capacity_bytes,
-                           ext::HostSnapshotBudgetBytes() / 4);
-        disk = std::make_shared<TpDiskStore>(
-            TpDiskStore::Options{
-                .directory = disk_cache_config.directory,
-                .capacity_bytes = disk_cache_config.capacity_bytes,
-                .staging_capacity_bytes = staging,
-            },
-            persistence->compatibility_identity, persistence->payload_version);
-      }
+      // The v0.28-era mirrored disk store rode the deleted TextRunnerSnapshot
+      // persistence API; TP2 serves with the disk cache off until the
+      // component store grows a mirrored protocol.
       new_state->tp_executor = std::make_shared<TpExecutor>(
           std::move(runner), session_count,
-          tp_config.control->snapshot_budget_bytes(),
-          std::make_shared<CommunicatorCallScope>(tp_config.communicator),
-          std::move(disk));
+          std::make_shared<CommunicatorCallScope>(tp_config.communicator));
     } else {
       std::shared_ptr<TextModelRunner> pool_runner = runner;
       if (tp_world_size > 1) {

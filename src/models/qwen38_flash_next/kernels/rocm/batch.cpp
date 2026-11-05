@@ -491,7 +491,6 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
       if (!item.session->CheckCancellation(nullptr))
         continue;
       if (!MtpHead(head, item.session->mtp_.h, item.output.token != nullptr,
-                   item.output.confidence != nullptr,
                    item.output.candidates != nullptr,
                    UseDraftSubset(*item.session, item.output.draft_subset)
                        ? item.session

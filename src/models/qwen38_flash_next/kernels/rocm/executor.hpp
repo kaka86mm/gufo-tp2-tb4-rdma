@@ -731,7 +731,7 @@ private:
   /// With `draft`, the logits come from that session's small head and the
   /// returned IDs are remapped to token IDs.
   bool MtpHead(const DeviceMixer& head, const float* res, bool token,
-               bool confidence, bool candidates, const Session* draft,
+               bool candidates, const Session* draft,
                std::string* error_msg) const;
   /// Enqueues one trunk batch (control and token upload through logits).
   bool ForwardBody(Session& session, std::uint32_t n, std::uint32_t n_logits,
@@ -775,9 +775,9 @@ private:
   /// for the next mixer.
   bool LayerBack(std::uint32_t il, std::uint32_t n_tokens) const;
   bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos, bool token,
-               bool confidence, bool candidates, std::string* error_msg,
-               std::uint32_t pool_grid, const float* hidden_source,
-               MtpTrace* trace, bool kv_only, bool draft_subset) const;
+               bool candidates, std::string* error_msg, std::uint32_t pool_grid,
+               const float* hidden_source, MtpTrace* trace, bool kv_only,
+               bool draft_subset) const;
   /// Runs `body` eagerly, or as the session's captured graph for `key`
   /// when `graph` is set. A prefix may leave its work queued so the host
   /// can wait for disk reads while the GPU computes it.

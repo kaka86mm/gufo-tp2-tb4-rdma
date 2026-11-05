@@ -356,8 +356,10 @@ public:
   [[nodiscard]] virtual bool CanReuse(const TextRunnerState&) const {
     return true;
   }
-  [[nodiscard]] virtual bool CanReuse(const TextRunnerSnapshot&) const {
-    return true;
+  /// Builds a standalone runner state outside any pool. TP2's rank-1 mirror
+  /// creates states this way, as many as rank 0's pool leases.
+  [[nodiscard]] virtual std::unique_ptr<TextRunnerState> CreateState() const {
+    throw std::logic_error("runner does not support standalone states");
   }
 
   // TP2 (neuhaus rdma) plan hooks: a TP2 peer runs the step with the same
