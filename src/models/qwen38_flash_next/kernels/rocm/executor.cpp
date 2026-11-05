@@ -2285,7 +2285,7 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   if (std::getenv("GUFO_TP_TRACE") != nullptr) {
     static std::uint64_t cb_seq = 0;
     static std::vector<float> res_full;
-    res_full.assign(static_cast<std::size_t>(n_tokens) * c.hc_dim, 0.0F);
+    res_full.assign(static_cast<std::size_t>(n_tokens) * c.HcDim(), 0.0F);
     (void)hipMemcpyAsync(res_full.data(), res,
                          res_full.size() * sizeof(float),
                          hipMemcpyDeviceToHost, stream_);
