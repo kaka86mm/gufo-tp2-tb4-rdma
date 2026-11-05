@@ -1124,6 +1124,15 @@ void Session::AppendDraft(PendingDecode& pending) {
     pending.draft = static_cast<std::int32_t>(pending.proposals.back().token);
     pending.draft_sampler->Accept(pending.proposals.back().token);
   }
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    static std::uint64_t cd_seq = 0;
+    std::fprintf(stderr,
+                 "[ch] seq=%llu kind=draft draft=%d conf=%.6e gated=%d "
+                 "chain=%zu\n",
+                 static_cast<unsigned long long>(cd_seq++), pending.draft,
+                 pending.draft_confidence, pending.gated ? 1 : 0,
+                 pending.chain.size());
+  }
   pending.chain.push_back(pending.draft);
 }
 
@@ -1141,6 +1150,19 @@ bool Session::AppendLookup(PendingDecode& pending, bool stop_at_eos,
       pending.sampled ? speculative::PromptLookup<>::kSampledMinMatch
                       : speculative::PromptLookup<>::kMinMatch,
       require_resume);
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    static std::uint64_t lk_seq = 0;
+    std::fprintf(stderr,
+                 "[lk] seq=%llu match_len=%zu start=%zu indexed=%zu "
+                 "chain=%zu cap=%zu avail_hint=%zd\n",
+                 static_cast<unsigned long long>(lk_seq++),
+                 static_cast<std::size_t>(match.length),
+                 static_cast<std::size_t>(match.start),
+                 lookup_.IndexedTokens(), pending.chain.size(), cap,
+                 static_cast<std::ptrdiff_t>(
+                     lookup_.IndexedTokens() -
+                     static_cast<std::size_t>(match.start)));
+  }
   if (match.length == 0) {
     return false;
   }
@@ -1151,6 +1173,10 @@ bool Session::AppendLookup(PendingDecode& pending, bool stop_at_eos,
   std::size_t count = 0;
   for (; count < available; ++count) {
     const std::int32_t token = tokens_[match.start + count];
+    if (std::getenv("GUFO_TP_TRACE") != nullptr && count < 2) {
+      std::fprintf(stderr, "[lk] copy tok=%d at=%zu\n", token,
+                   static_cast<std::size_t>(match.start) + count);
+    }
     pending.chain.push_back(token);
     if (pending.sampled) {
       // A point-mass proposal: accepted with the target's p(token), and a
