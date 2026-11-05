@@ -2298,6 +2298,16 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
       std::memcpy(&b, &bv[i], sizeof(b));
       bh = (bh ^ b) * 1099511628211ULL;
     }
+    float xv[16] = {};
+    (void)hipMemcpyAsync(xv, s_.xn, 16 * sizeof(float),
+                         hipMemcpyDeviceToHost, stream_);
+    (void)hipStreamSynchronize(stream_);
+    std::uint64_t xh = 1469598103934665603ULL;
+    for (std::size_t i = 0; i < 16; ++i) {
+      std::uint32_t b;
+      std::memcpy(&b, &xv[i], sizeof(b));
+      xh = (xh ^ b) * 1099511628211ULL;
+    }
     float iv[8] = {};
     (void)hipMemcpyAsync(iv, s_.inject, 8 * sizeof(float),
                          hipMemcpyDeviceToHost, stream_);
@@ -2310,13 +2320,14 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
     }
     std::fprintf(stderr,
                  "[cb] seq=%llu n=%u res_in=%016llx bo=%016llx inj=%016llx "
-                 "bo_ptr=%p injw=%p\n",
+                 "flags=%d%d%d%d%d xn_half_buf=%016llx\n",
                  static_cast<unsigned long long>(cb_seq++), n_tokens,
                  static_cast<unsigned long long>(rh),
                  static_cast<unsigned long long>(bh),
                  static_cast<unsigned long long>(ih),
-                 static_cast<const void*>(s_.block_out),
-                 static_cast<const void*>(inject_w));
+                 moe_pending_ ? 1 : 0, defer_residual_ ? 1 : 0,
+                 res_deferred_ ? 1 : 0, xn_half_ ? 1 : 0,
+                 wide_mixer_ ? 1 : 0, xh);
     std::fflush(stderr);
   }
   inject_fused_ = nullptr;
