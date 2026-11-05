@@ -3931,6 +3931,37 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       return false;
     const DeviceLayer& l = layers[il];
     if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] layer-enter il=%u n=%u\n", il, n); }
+    auto stage_buf_hash = [&](const void* ptr, bool half) -> std::uint64_t {
+      std::uint64_t h = 1469598103934665603ULL;
+      if (half) {
+        __half b32[32] = {};
+        (void)hipMemcpyAsync(b32, ptr, 32 * sizeof(__half),
+                             hipMemcpyDeviceToHost, stream_);
+        (void)hipStreamSynchronize(stream_);
+        for (std::size_t i = 0; i < 32; ++i) {
+          std::uint16_t b;
+          std::memcpy(&b, &b32[i], sizeof(b));
+          h = (h ^ b) * 1099511628211ULL;
+        }
+      } else {
+        float f32[32] = {};
+        (void)hipMemcpyAsync(f32, ptr, 32 * sizeof(float),
+                             hipMemcpyDeviceToHost, stream_);
+        (void)hipStreamSynchronize(stream_);
+        for (std::size_t i = 0; i < 32; ++i) {
+          std::uint32_t b;
+          std::memcpy(&b, &f32[i], sizeof(b));
+          h = (h ^ b) * 1099511628211ULL;
+        }
+      }
+      return h;
+    };
+    auto stage_inject_hash = [&]() -> std::uint64_t {
+      return stage_buf_hash(s_.inject, false);
+    };
+    auto stage_block_out_hash = [&]() -> std::uint64_t {
+      return stage_buf_hash(s_.block_out, false);
+    };
     auto stage_res_hash = [&]() -> std::uint64_t {
       float r[32] = {};
       (void)hipMemcpyAsync(r, s_.res, 32 * sizeof(float),
@@ -4021,7 +4052,11 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       if (!Moe(l, s_.mixed, s_.block_out, rows, error_msg)) {
         return false;
       }
-      if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] moe-done il=%u rows=%u res=%016llx\n", il, rows, (unsigned long long)stage_res_hash()); }
+      if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr,
+                       "[stage] moe-done il=%u rows=%u res=%016llx inj=%016llx bo=%016llx\n",
+                       il, rows, (unsigned long long)stage_res_hash(),
+                       (unsigned long long)stage_inject_hash(),
+                       (unsigned long long)stage_block_out_hash()); }
       // The next layer's mixer follows in this pass (without a PLE step:
       // next_norm is null before a PLE layer).
       Combine(s_.res, next_norm, rows, next_inject,
