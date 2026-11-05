@@ -55,7 +55,11 @@ constexpr std::uint32_t kReadyMagic = 0x47555244U;  // "GURD"
 // starts with the writer's header; the partial follows at kDataOffset. A
 // window holds one prefill batch's partial: 4,224 rows of 2,560 floats.
 constexpr std::size_t kWindowBytes = 48U << 20;
-constexpr std::size_t kWindows = 3;
+// 5 windows: the 3-window reuse distance let a GPU staging write race the
+// NIC's send of an in-flight exchange under sustained decode, producing rare
+// stale reads (the accumulating 1e-4 drift). The extra windows widen the
+// reuse distance for a few MiB of pinned host memory.
+constexpr std::size_t kWindows = 5;
 constexpr std::size_t kBufferBytes = kWindows * kWindowBytes;
 constexpr std::size_t kDataOffset = 64;
 constexpr std::uint32_t kPostedReceives = 4;
