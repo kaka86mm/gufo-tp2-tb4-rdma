@@ -4112,7 +4112,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                  false, no_f32)) {
         return false;
       }
-      if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] f=%llu ffn-hcmix-done il=%u rows=%u res=%016llx inj=%016llx bo=%016llx bov=%s ijv=%s mix=%016llx xn=%016llx\n", il, rows, (unsigned long long)stage_res_hash(), (unsigned long long)stage_inject_hash(), (unsigned long long)stage_block_out_hash(), stage_bo_dump().c_str(), stage_inj_dump().c_str(), (unsigned long long)stage_mixed_hash(), (unsigned long long)stage_xn_hash(), (unsigned long long)fwd_id); }
+      if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] f=%llu ffn-hcmix-done il=%u rows=%u res=%016llx inj=%016llx bo=%016llx bov=%s ijv=%s mix=%016llx xn=%016llx\n", (unsigned long long)fwd_id, il, rows, (unsigned long long)stage_res_hash(), (unsigned long long)stage_inject_hash(), (unsigned long long)stage_block_out_hash(), stage_bo_dump().c_str(), stage_inj_dump().c_str(), (unsigned long long)stage_mixed_hash(), (unsigned long long)stage_xn_hash()); }
       if (!Moe(l, s_.mixed, s_.block_out, rows, error_msg)) {
         return false;
       }
