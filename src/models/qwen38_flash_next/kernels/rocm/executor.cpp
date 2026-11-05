@@ -2338,7 +2338,7 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
     }
     std::fprintf(stderr,
                  "[cb] seq=%llu n=%u res_in=%016llx bo=%016llx inj=%016llx "
-                 "flags=%d%d%d%d%d xn_half_buf=%016llx resf=%016llx\n",
+                 "flags=%d%d%d%d%d xn_half_buf=%016llx resf=%016llx ip=%u\n",
                  static_cast<unsigned long long>(cb_seq++), n_tokens,
                  static_cast<unsigned long long>(rh),
                  static_cast<unsigned long long>(bh),
@@ -2346,7 +2346,7 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
                  moe_pending_ ? 1 : 0, defer_residual_ ? 1 : 0,
                  res_deferred_ ? 1 : 0, xn_half_ ? 1 : 0,
                  wide_mixer_ ? 1 : 0, xh,
-                 static_cast<unsigned long long>(rfh));
+                 static_cast<unsigned long long>(rfh), inject_parts_);
     std::fflush(stderr);
   }
   inject_fused_ = nullptr;
