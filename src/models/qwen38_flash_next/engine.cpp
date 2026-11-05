@@ -1509,6 +1509,29 @@ bool Session::FinishDecode(const DecodeRequest& request,
       ++keep;
       continue;
     }
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+      static std::uint64_t vd_seq = 0;
+      const auto& row =
+          std::span<const float>(verify_logits_).subspan((keep - 1) * vocab, vocab);
+      std::int32_t am = -1;
+      float best = -1e30F, second = -1e30F;
+      for (std::uint32_t i = 0; i < vocab; ++i) {
+        if (row[i] > best) {
+          second = best;
+          best = row[i];
+          am = static_cast<std::int32_t>(i);
+        } else if (row[i] > second) {
+          second = row[i];
+        }
+      }
+      std::fprintf(stderr,
+                   "[vd] seq=%llu keep=%zu draft=%d argmax=%d best=%.6e "
+                   "second=%.6e gap=%.3e accept_hint=%d\n",
+                   static_cast<unsigned long long>(vd_seq++), keep,
+                   chain[keep], am, best, second, best - second,
+                   chain[keep] == am ? 1 : 0);
+      std::fflush(stderr);
+    }
     const auto decision = VerifyDraft(std::span<const float>(verify_logits_)
                                           .subspan((keep - 1) * vocab, vocab),
                                       chain[keep], sampler, is_stop);
