@@ -4015,6 +4015,14 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                           last_attention, false, true, pass_rows)) {
       return false;
     }
+    // Each rank's mixer holds half the heads under TP: its block output is a
+    // partial sum the finish lambda (combine, fused mix, inject parts) reads
+    // before Moe would reduce it. Reduce here so both ranks combine the same
+    // row (MixerPart does this for the paired prefill lanes).
+    if (model_->tp_world_size() > 1 &&
+        !AllReduce(s_.block_out, n, error_msg)) {
+      return false;
+    }
     if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] attn-done il=%u n=%u res=%016llx inj=%016llx\n", il, n, (unsigned long long)stage_res_hash(), (unsigned long long)stage_inject_hash()); }
 
     const float* next_norm =
