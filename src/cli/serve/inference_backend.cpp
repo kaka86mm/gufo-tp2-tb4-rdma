@@ -11,6 +11,9 @@
 #include <optional>
 #include <span>
 #include <string>
+
+#include <cstdio>
+#include <cstdlib>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -567,6 +570,13 @@ bool InferenceBackend::load(
             std::make_shared<CommunicatorCallScope>(tp_config.communicator));
         pool_runner = new_state->tp_runner;
       }
+      if (tp_world_size > 1) {
+        // The mirrored pool takes the classic continuation branch, whose
+        // snapshot restore the component-based Flash-Next runner does not
+        // implement; keep TP2 pools snapshot-free.
+        ram_cache_config.enabled = false;
+        ram_cache_config.capacity_bytes = 0;
+      }
 #else
     std::shared_ptr<TextModelRunner> pool_runner = runner;
 #endif
@@ -683,6 +693,17 @@ bool InferenceBackend::run_worker(std::string* error) {
     if (!state->control->ReceiveCommand(&command, &control_error)) {
       SetError(error, "TP worker command receive failed: " + control_error);
       return false;
+    }
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+      const TpInstruction& ti = command.instruction;
+      std::fprintf(stderr,
+          "[tptrace-c] recv seq=%llu kind=%u op=%u idx=%llu state=%u "
+          "off=%u cnt=%u psize=%u tok=%d snap=%llu nbatch=%zu\n",
+          static_cast<unsigned long long>(command.sequence),
+          static_cast<unsigned>(command.kind), static_cast<unsigned>(ti.op),
+          static_cast<unsigned long long>(ti.index), ti.state, ti.offset,
+          ti.count, ti.prompt_size, ti.token,
+          static_cast<unsigned long long>(ti.snapshot_id), ti.batch.size());
     }
     if (!state->tp_executor->Execute(command, respond, &control_error)) {
       SetError(error, "TP worker: " + control_error);

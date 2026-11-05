@@ -6,6 +6,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <span>
@@ -469,6 +472,7 @@ public:
       throw std::logic_error(
           "Qwen3.8-Flash-Next prefill has no remaining input");
     }
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) { std::fprintf(stderr, "[tptrace-e] runner_prefill pos=%zu off=%zu psize=%zu budget=%zu\n", qfn.position(), offset, prompt.size(), max_input_tokens); }
     const std::size_t remaining = prompt.size() - offset;
     const std::size_t consumed =
         std::min<std::size_t>({max_input_tokens, remaining,

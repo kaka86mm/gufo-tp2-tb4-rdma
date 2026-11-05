@@ -29,6 +29,22 @@
 #include <utility>
 #include <vector>
 
+#include <cstdio>
+#include <cstdlib>
+
+namespace {
+void GufoTpTrace(const char* what, std::uint64_t a, std::uint64_t b,
+                 std::uint64_t c) {
+  static const bool on = std::getenv("GUFO_TP_TRACE") != nullptr;
+  if (on) {
+    std::fprintf(stderr, "[tptrace-v] %s a=%llu b=%llu c=%llu\n", what,
+                 static_cast<unsigned long long>(a),
+                 static_cast<unsigned long long>(b),
+                 static_cast<unsigned long long>(c));
+  }
+}
+}  // namespace
+
 #include "src/models/qwen38_flash_next/distributed/rdma_gid.hpp"
 
 #ifndef MAP_ANONYMOUS
@@ -804,12 +820,14 @@ public:
       return false;
     }
     bound_scope_ = scope_id;
+    GufoTpTrace("scope_begin", scope_id, 0, 0);
     return true;
   }
 
   [[nodiscard]] bool EndOperation(std::uint64_t scope_id,
                                   std::string* error) override {
     std::lock_guard lock(mutex_);
+    GufoTpTrace("scope_end", scope_id, started_, queued_);
     if (poisoned_) {
       PoisonedError(error);
       return false;
@@ -837,6 +855,7 @@ public:
                                              hipStream_t stream,
                                              std::string* error) override {
     std::lock_guard lock(mutex_);
+    GufoTpTrace("exchange", next_operation_, bytes, 0);
     if (!CheckExchange(data, bytes, error)) {
       return nullptr;
     }
@@ -867,6 +886,7 @@ public:
                                   hipStream_t stream,
                                   std::string* error) override {
     std::lock_guard lock(mutex_);
+    GufoTpTrace("start", next_operation_, bytes, started_);
     if (!CheckExchange(data, bytes, error)) {
       return false;
     }
@@ -902,6 +922,7 @@ public:
 
   [[nodiscard]] const float* FinishPartial(std::size_t bytes,
                                            std::string* error) override {
+    GufoTpTrace("finish", bytes, started_, 0);
     {
       std::lock_guard lock(mutex_);
       if (started_ == 0) {
@@ -931,6 +952,7 @@ public:
   [[nodiscard]] bool QueuePartial(std::size_t bytes, QueuedPartial* partial,
                                   std::string* error) override {
     std::lock_guard lock(mutex_);
+    GufoTpTrace("queue", next_operation_, bytes, queued_);
     if (!CheckExchange(static_cast<const float*>(send_device_), bytes, error)) {
       return false;
     }
@@ -1622,6 +1644,7 @@ private:
                                      const ExpectedReceive& expected,
                                      std::string* error) {
     bool received = std::exchange(early_receive_, false);
+    GufoTpTrace("wait", operation, expected.length, received ? 1 : 0);
     if (received && expected.window &&
         (early_immediate_ != expected.immediate ||
          early_length_ != expected.length)) {
@@ -1665,6 +1688,7 @@ private:
       }
       if (completion_channel_ == nullptr) {
         if (std::chrono::steady_clock::now() >= deadline) {
+          GufoTpTrace("ar_timeout", operation, 0, 0);
           SetError(error, "verbs all-reduce timed out");
           return false;
         }
@@ -1686,6 +1710,7 @@ private:
       }
       const auto remaining = deadline - std::chrono::steady_clock::now();
       if (remaining.count() <= 0) {
+        GufoTpTrace("ar_timeout", operation, 0, 0);
         SetError(error, "verbs all-reduce timed out");
         return false;
       }

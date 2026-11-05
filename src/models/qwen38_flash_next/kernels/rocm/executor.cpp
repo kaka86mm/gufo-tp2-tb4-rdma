@@ -6,6 +6,7 @@
 #include <bit>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <gufo/ext/experimental/managed_alloc.hpp>
@@ -3728,6 +3729,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                          .speculative = speculative,
                          .control = session.control_,
                          .emb_row = 0};
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) { std::fprintf(stderr, "[tptrace-e] forwardbody n=%u first_layer=%u end=%u tp_world=%u has_ar=%d\n", n, first_layer, end_layer, model_->tp_world_size(), options_.all_reduce ? 1 : 0); }
   bool normed = false;  ///< xn holds the next mixer's grouped norm of res
   for (std::uint32_t il = first_layer; il < end_layer; ++il) {
     if (!options_.all_reduce) {

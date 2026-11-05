@@ -28,6 +28,9 @@
 #include <unordered_map>
 #include <utility>
 
+#include <cstdio>
+#include <cstdlib>
+
 namespace gufo::server {
 namespace {
 
@@ -853,6 +856,17 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
     return false;
   }
 
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    const TpInstruction& ti = command.instruction;
+    std::fprintf(stderr,
+        "[tptrace-c] send seq=%llu kind=%u op=%u idx=%llu state=%u "
+        "off=%u cnt=%u psize=%u tok=%d snap=%llu nbatch=%zu\n",
+        static_cast<unsigned long long>(command.sequence),
+        static_cast<unsigned>(command.kind), static_cast<unsigned>(ti.op),
+        static_cast<unsigned long long>(ti.index), ti.state, ti.offset,
+        ti.count, ti.prompt_size, ti.token,
+        static_cast<unsigned long long>(ti.snapshot_id), ti.batch.size());
+  }
   std::vector<std::uint8_t> payload;
   payload.reserve(96 + command.prompt_tokens.size() * sizeof(std::uint32_t) +
                   command.client_id.size() + command.prompt_context.size());

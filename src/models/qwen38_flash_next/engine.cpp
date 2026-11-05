@@ -5,6 +5,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+
+#include <cstdio>
+#include <cstdlib>
 #include <gufo/ext/gguf_reader.hpp>
 #include <limits>
 #include <optional>
@@ -932,6 +935,7 @@ bool Session::SyncImpl(std::span<const std::int32_t> prompt,
                        std::unique_ptr<SessionSnapshot>* checkpoint,
                        double* capture_ms, std::span<const std::int32_t> next,
                        const PrefillCapture& capture) {
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) { std::fprintf(stderr, "[tptrace-e] syncimpl_entry prompt=%zu\n", prompt.size()); }
   if (prompt.empty()) {
     AssignError(error_msg, "prompt is empty");
     return false;
@@ -953,6 +957,7 @@ bool Session::SyncImpl(std::span<const std::int32_t> prompt,
     ++common;
   }
   if (common == prompt.size() && common == tokens_.size()) {
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) { std::fprintf(stderr, "[tptrace-e] %s\n", std::string("sync SHORT-CIRCUIT identical common=") + std::to_string(common)); }
     return true;
   }
   if (common != tokens_.size()) {

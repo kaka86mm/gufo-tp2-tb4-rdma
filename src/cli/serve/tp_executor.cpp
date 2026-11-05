@@ -831,7 +831,11 @@ std::unique_ptr<TextRunnerState> TpMirroredRunner::CreateState() const {
 }
 
 bool TpMirroredRunner::UsesComponentCache() const {
-  return inner_->UsesComponentCache();
+  // The component cache leases a fresh runner state per conversation with a
+  // monotonically growing mirror id; rank 1's TpExecutor owns a fixed array
+  // sized at load. The classic continuation pool keeps exactly state_count
+  // states, so under TP2 the mirror never exposes the component cache.
+  return false;
 }
 
 std::unique_ptr<ComponentCacheResources>
@@ -1691,6 +1695,7 @@ bool TpExecutor::ExecuteIdle(const TpInstruction& instruction,
 bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
                              const TpInstruction& instruction,
                              const Respond& respond, std::string* error) {
+  bool fatal_divergence = false;
   ++request.count;
   const bool prompt_fits = instruction.prompt_size <= request.prompt.size();
   const auto prefill_prompt =
@@ -1859,8 +1864,17 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
     // rank 0 skip it too and drop the ID, and neither state changed. A failed
     // disk restore is a cache miss: rank 0's cache resets the state on both
     // ranks and prefills instead.
-    if (instruction.op != TpInstructionOp::kSnapshot &&
-        instruction.op != TpInstructionOp::kRestoreDisk) {
+    if (instruction.op == TpInstructionOp::kSnapshot ||
+        instruction.op == TpInstructionOp::kRestoreDisk) {
+      // graceful above
+    } else if (RunsForward(instruction.op)) {
+      // A forward call that ran on rank 0 but failed here desynchronizes
+      // the exchange sequence: rank 0's collectives would wait out their
+      // timeout with no error. Fail the worker loudly instead.
+      fatal_divergence = true;
+      DigestTpFailure(request.digest);
+      request.Note(call_error);
+    } else {
       DigestTpFailure(request.digest);
       request.Note(call_error);
     }
@@ -1868,6 +1882,12 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
   if (forward && !EndScope(instruction.index, error)) {
     if (!call_error.empty() && error != nullptr) {
       *error = call_error + "; " + *error;
+    }
+    return false;
+  }
+  if (fatal_divergence) {
+    if (error != nullptr) {
+      *error = call_error + " (TP2 ranks diverged; worker stops)";
     }
     return false;
   }
