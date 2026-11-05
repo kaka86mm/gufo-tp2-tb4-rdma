@@ -1129,6 +1129,12 @@ void Session::AppendDraft(PendingDecode& pending) {
 
 bool Session::AppendLookup(PendingDecode& pending, bool stop_at_eos,
                            std::size_t minimum, bool require_resume) {
+  // Prompt-lookup copies are verified by the wide-copy pass whose sweep can
+  // run at a different width per rank; a mismatched copy count desyncs the
+  // pair's token counts. Keep TP2 on pure MTP drafts.
+  if (model_->options_.tp_world_size > 1) {
+    return false;
+  }
   const auto cap = pending.lookup_cap;
   if (pending.chain.size() >= cap) {
     return false;
