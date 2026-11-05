@@ -1080,9 +1080,12 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
   } else if (!impl_->checkpoints.empty()) {
     stop = impl_->checkpoints.front();
   }
-  if (stop < impl_->prefill_offset + max_input_tokens)
+  const bool single_pass =
+      impl_->runner->Descriptor().capabilities.single_pass_prefill;
+  if (stop < impl_->prefill_offset + max_input_tokens && !single_pass)
     max_input_tokens = stop - impl_->prefill_offset;
-  if (!in_pass_prompt && impl_->prefill_offset < snapshot_position)
+  if (!in_pass_prompt && impl_->prefill_offset < snapshot_position &&
+      !single_pass)
     max_input_tokens =
         std::min(max_input_tokens, snapshot_position - impl_->prefill_offset);
 

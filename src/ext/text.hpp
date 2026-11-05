@@ -113,6 +113,10 @@ struct TextRunnerCapabilities {
   std::size_t batched_multi_token_decode_max_width{0};
   bool prefix_reuse{true};
   bool in_pass_checkpoint{false};
+  /// A distributed pair whose prefill must run as one pass per chunk: the
+  /// pool then neither splits a step at a snapshot boundary nor stops at a
+  /// checkpoint to capture it after the pass.
+  bool single_pass_prefill{false};
   bool partial_prefill_retention{false};
   bool prefill_rollback{false};
   /// Prefill continues a prompt exactly only from positions divisible by

@@ -671,6 +671,9 @@ TextRunnerDescriptor TpMirroredRunner::Descriptor() const {
   // Rolling back an interrupted prefill needs the call to stop mid-pass,
   // where rank 1 would be left inside an exchange; calls here always finish.
   descriptor.capabilities.prefill_rollback = false;
+  // Splitting a prefill step at a snapshot boundary poisons the TP2
+  // inject-parts chain; each chunk runs as one pass.
+  descriptor.capabilities.single_pass_prefill = true;
   return descriptor;
 }
 
