@@ -1098,7 +1098,7 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
   auto frontier = !in_pass_prompt && impl_->prefill_offset < snapshot_position
                       ? snapshot_position
                       : impl_->prompt.size();
-  frontier = std::min(frontier, stop);
+  frontier = single_pass ? impl_->prompt.size() : std::min(frontier, stop);
   const auto model_prompt =
       std::span<const TextRunnerToken>(impl_->prompt).first(frontier);
   // Prompt targets captured in place, in order, with the bytes each
