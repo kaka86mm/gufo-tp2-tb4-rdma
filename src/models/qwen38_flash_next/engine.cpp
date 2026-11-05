@@ -1227,6 +1227,18 @@ bool Session::PrepareDecode(const DecodeRequest& request,
                                        model_->options_.max_draft_tokens);
   }
   const std::size_t width = MtpEnabled() && cap > 1 ? 1 + drafts : cap;
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    static std::uint64_t w_seq = 0;
+    std::fprintf(stderr,
+                 "[wd] seq=%llu max_tokens=%zu room=%zu cap=%zu forced=%d "
+                 "fd=%u drafts=%u width=%zu toks=%zu pos=%u mtp=%d\n",
+                 static_cast<unsigned long long>(w_seq++), max_tokens, room,
+                 cap, forced.has_value() ? static_cast<int>(*forced) : -1,
+                 forced.has_value() ? *forced : 0U, drafts, width,
+                 tokens_.size(), static_cast<unsigned>(session_->position_),
+                 MtpEnabled() ? 1 : 0);
+    std::fflush(stderr);
+  }
   if (width == 0) {
     result->stop = true;
     return true;
