@@ -623,6 +623,28 @@ public:
   [[nodiscard]] TextDecodeStep DecodeStep(
       TextRunnerState& state, std::size_t max_tokens,
       sampling::SamplerState& sampler) const override {
+    return DecodeStepPlanned(state, max_tokens, sampler, std::nullopt);
+  }
+
+  [[nodiscard]] std::optional<std::uint32_t> PlanDecodeStep(
+      TextRunnerState& state, std::size_t max_tokens,
+      const sampling::SamplerState& sampler,
+      std::size_t occupancy) const override {
+    if (!use_mtp_ || max_tokens <= 1) {
+      return std::nullopt;
+    }
+    auto& qfn = RequireQwenFlashNextState(state);
+    const auto budget =
+        std::min<std::size_t>(max_tokens, std::uint64_t{max_draft_tokens_} + 1);
+    return qfn.session().PlanDecode(budget, sampler,
+                                    static_cast<std::uint32_t>(occupancy));
+  }
+
+  /// `plan`, when given, fixes the cycle's draft count (a TP2 peer's choice).
+  [[nodiscard]] TextDecodeStep DecodeStepPlanned(
+      TextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler,
+      std::optional<std::uint32_t> plan) const override {
     if (!use_mtp_ || max_tokens == 1) {
       return TextModelRunner::DecodeStep(state, max_tokens, sampler);
     }
@@ -642,7 +664,7 @@ public:
     // The engine bounds the physical block and stops at EOS. Preserve the
     // remaining request budget so its policy can recognize a short tail.
     if (!qfn.session().DecodeStep(max_tokens, working_sampler, &decoded, &error,
-                                  qfn.stop_at_eos())) {
+                                  qfn.stop_at_eos(), 1, plan)) {
       throw std::runtime_error("Qwen3.8-Flash-Next MTP decode failed: " +
                                error);
     }
@@ -698,6 +720,37 @@ public:
 
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
       std::span<const TextRunnerDecode> decodes) const override {
+    return RunDecodeBatch(decodes, nullptr);
+  }
+
+  [[nodiscard]] std::optional<std::uint32_t> PlanDecodeBatch(
+      std::span<const TextRunnerDecode> decodes,
+      std::size_t /*occupancy*/) const override {
+    if (decodes.size() < 2 || !use_mtp_) {
+      return std::nullopt;
+    }
+    std::vector<QwenFlashNextSession::DecodeRequest> requests;
+    requests.reserve(decodes.size());
+    for (const auto& decode : decodes) {
+      requests.push_back(
+          {&RequireQwenFlashNextState(decode.state.get()).session(),
+           std::min<std::size_t>(decode.max_tokens,
+                                 std::uint64_t{max_draft_tokens_} + 1),
+           &decode.sampler.get(), nullptr});
+    }
+    return QwenFlashNextSession::PlanBatch(requests);
+  }
+
+  [[nodiscard]] std::vector<TextDecodeStep> DecodeBatchPlanned(
+      std::span<const TextRunnerDecode> decodes,
+      std::optional<std::uint32_t> plan) const override {
+    return RunDecodeBatch(decodes, &plan);
+  }
+
+  /// `plan`, when given, fixes the batch's draft count (a TP2 peer's choice).
+  [[nodiscard]] std::vector<TextDecodeStep> RunDecodeBatch(
+      std::span<const TextRunnerDecode> decodes,
+      const std::optional<std::uint32_t>* plan) const {
     if (decodes.size() < 2 || !use_mtp_) {
       return TextModelRunner::DecodeBatch(decodes);
     }
@@ -716,10 +769,11 @@ public:
       auto& sampler = samplers.emplace_back(decodes[i].sampler.get());
       before.push_back(session.Statistics());
       requests.push_back({&session, decodes[i].max_tokens, &sampler,
-                          &results[i], state.stop_at_eos(), &outcomes[i]});
+                          &results[i], state.stop_at_eos(), &outcomes[i],
+                          decodes[i].drafts});
     }
     std::string error;
-    (void)QwenFlashNextSession::DecodeBatch(requests, &error);
+    (void)QwenFlashNextSession::DecodeBatch(requests, &error, plan);
     const auto active_count = static_cast<std::size_t>(std::count_if(
         results.begin(), results.end(),
         [](const auto& result) { return !result.tokens.empty(); }));
