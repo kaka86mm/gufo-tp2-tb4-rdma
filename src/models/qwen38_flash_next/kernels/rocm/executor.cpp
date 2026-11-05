@@ -4048,7 +4048,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                  false, no_f32)) {
         return false;
       }
-      if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] ffn-hcmix-done il=%u rows=%u res=%016llx inj=%016llx\n", il, rows, (unsigned long long)stage_res_hash(), (unsigned long long)stage_inject_hash()); }
+      if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] ffn-hcmix-done il=%u rows=%u res=%016llx inj=%016llx bo=%016llx\n", il, rows, (unsigned long long)stage_res_hash(), (unsigned long long)stage_inject_hash(), (unsigned long long)stage_block_out_hash()); }
       if (!Moe(l, s_.mixed, s_.block_out, rows, error_msg)) {
         return false;
       }
