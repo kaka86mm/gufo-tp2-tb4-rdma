@@ -2409,7 +2409,11 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   }
   // A decode batch's next mixer quantizes xn for its down projection: the
   // combine writes those rows as well, or joins that mixer's single launch.
-  if (next != nullptr && gamma != nullptr && FusedMixer(*next, n_tokens)) {
+  // TP2 keeps the combine immediate: the deferred path's fused launch reads
+  // the rank-local fused-mix arena, whose layout differs between ranks and
+  // leaks stale rows into the residual.
+  if (model_->tp_world_size() == 1 && next != nullptr && gamma != nullptr &&
+      FusedMixer(*next, n_tokens)) {
     pending_combine_ = {next,         res,        gamma,
                         s_.block_out, s_.inject,  inject_parts_,
                         s_.xn,        s_.xn_q8_1, n_tokens};
