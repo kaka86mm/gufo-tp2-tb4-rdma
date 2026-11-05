@@ -2707,6 +2707,22 @@ bool Executor::WaitPle(std::string* error_msg) const {
     if (ok) {
       std::copy_n(prefetch_.rows.data(),
                   prefetch_.claimed * config().PleEmbeddingDim(), host_emb_);
+      if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+        static std::uint64_t ple_seq = 0;
+        const std::size_t n = static_cast<std::size_t>(prefetch_.claimed) *
+                               config().PleEmbeddingDim();
+        std::uint64_t h = 1469598103934665603ULL;
+        for (std::size_t i = 0; i < std::min<std::size_t>(n, 256); ++i) {
+          std::uint32_t b;
+          std::memcpy(&b, &host_emb_[i], sizeof(b));
+          h = (h ^ b) * 1099511628211ULL;
+        }
+        std::fprintf(stderr, "[ple] seq=%llu rows=%u hash=%016llx\n",
+                     static_cast<unsigned long long>(ple_seq++),
+                     prefetch_.claimed,
+                     static_cast<unsigned long long>(h));
+        std::fflush(stderr);
+      }
     }
     if (prefetch_.tail)
       ok = ngram_->WaitRead() && ok;
