@@ -1699,18 +1699,40 @@ bool Session::DecodeStep(std::size_t max_tokens,
     if (!pending.gpu_verification)
       verify_logits_.resize(std::max(
           verify_logits_.size(), pending.chain.size() * model_->VocabSize()));
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+      static std::uint64_t wwd_seq = 0;
+      std::fprintf(stderr, "[vw] seq=%llu chain=%zu wide=1 gpu_ver=%d\n",
+                   static_cast<unsigned long long>(wwd_seq++),
+                   pending.chain.size(), pending.gpu_verification ? 1 : 0);
+      std::fflush(stderr);
+    }
     if (!exec.ForwardWide(*session_, pending.chain, error_msg) ||
         !exec.SelectBatchLogits(
             0, static_cast<std::uint32_t>(pending.chain.size()),
             pending.gpu_verification ? nullptr : verify_logits_.data(),
             error_msg))
       return false;
-  } else if (!exec.Forward(
-                 *session_, pending.chain, pending.chain.size(), logits,
-                 pending.speculative ? rocm::Executor::ForwardMode::kVerify
-                                     : rocm::Executor::ForwardMode::kDecode,
-                 error_msg)) {
-    return false;
+  } else {
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+      static std::uint64_t vw_seq = 0;
+      std::fprintf(stderr,
+                   "[vw] seq=%llu chain=%zu wide=%d gpu_ver=%d toks=%zu "
+                   "forced=%d\n",
+                   static_cast<unsigned long long>(vw_seq++),
+                   pending.chain.size(), 0,
+                   pending.gpu_verification ? 1 : 0, tokens_.size(),
+                   forced_drafts.has_value()
+                       ? static_cast<int>(*forced_drafts)
+                       : -1);
+      std::fflush(stderr);
+    }
+    if (!exec.Forward(
+            *session_, pending.chain, pending.chain.size(), logits,
+            pending.speculative ? rocm::Executor::ForwardMode::kVerify
+                                : rocm::Executor::ForwardMode::kDecode,
+            error_msg)) {
+      return false;
+    }
   }
   const bool ok = FinishDecode(request, pending, error_msg);
   valid_ = ok;
