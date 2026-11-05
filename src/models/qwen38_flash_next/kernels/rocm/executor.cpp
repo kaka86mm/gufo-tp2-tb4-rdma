@@ -3959,6 +3959,16 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     auto stage_inject_hash = [&]() -> std::uint64_t {
       return stage_buf_hash(s_.inject, false);
     };
+    auto stage_inj_dump = [&]() -> std::string {
+      float v[4] = {-1, -1, -1, -1};
+      (void)hipMemcpyAsync(v, s_.inject, 4 * sizeof(float),
+                           hipMemcpyDeviceToHost, stream_);
+      (void)hipStreamSynchronize(stream_);
+      char buf[160];
+      std::snprintf(buf, sizeof(buf), "%.6e,%.6e,%.6e,%.6e", v[0], v[1], v[2],
+                    v[3]);
+      return std::string(buf);
+    };
     auto stage_bo_dump = [&]() -> std::string {
       float v[4] = {-1, -1, -1, -1};
       (void)hipMemcpyAsync(v, s_.block_out, 4 * sizeof(float),
@@ -4066,7 +4076,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                  false, no_f32)) {
         return false;
       }
-      if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] ffn-hcmix-done il=%u rows=%u res=%016llx inj=%016llx bo=%016llx bov=%s\n", il, rows, (unsigned long long)stage_res_hash(), (unsigned long long)stage_inject_hash(), (unsigned long long)stage_block_out_hash(), stage_bo_dump().c_str()); }
+      if (std::getenv("GUFO_TP_TRACE") != nullptr) { hipDeviceSynchronize(); std::fprintf(stderr, "[stage] ffn-hcmix-done il=%u rows=%u res=%016llx inj=%016llx bo=%016llx bov=%s ijv=%s\n", il, rows, (unsigned long long)stage_res_hash(), (unsigned long long)stage_inject_hash(), (unsigned long long)stage_block_out_hash(), stage_bo_dump().c_str(), stage_inj_dump().c_str()); }
       if (!Moe(l, s_.mixed, s_.block_out, rows, error_msg)) {
         return false;
       }
