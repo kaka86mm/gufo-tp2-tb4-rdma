@@ -5462,6 +5462,18 @@ bool Executor::MtpForward(Session& session,
                           const float* hidden_source) const {
   DropReadyQ8();
   const auto n = static_cast<std::uint32_t>(tokens.size());
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    static std::uint64_t fwd_seq = 0;
+    std::fprintf(stderr,
+                 "[fwd] seq=%llu n=%u hrow=%d src=%p tok=%d cands=%d "
+                 "kvonly=%d\n",
+                 static_cast<unsigned long long>(fwd_seq++), n, hidden_row,
+                 static_cast<const void*>(hidden_source),
+                 tokens.empty() ? -1 : tokens.front(),
+                 output.candidates != nullptr ? 1 : 0,
+                 output.kv_only ? 1 : 0);
+    std::fflush(stderr);
+  }
   if (session.owner_ != this ||
       std::any_of(tokens.begin(), tokens.end(), [&](auto t) {
         return t < 0 || static_cast<std::uint32_t>(t) >= config().vocab_size;
