@@ -2298,12 +2298,23 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
       std::memcpy(&b, &bv[i], sizeof(b));
       bh = (bh ^ b) * 1099511628211ULL;
     }
+    float iv[8] = {};
+    (void)hipMemcpyAsync(iv, s_.inject, 8 * sizeof(float),
+                         hipMemcpyDeviceToHost, stream_);
+    (void)hipStreamSynchronize(stream_);
+    std::uint64_t ih = 1469598103934665603ULL;
+    for (std::size_t i = 0; i < 8; ++i) {
+      std::uint32_t b;
+      std::memcpy(&b, &iv[i], sizeof(b));
+      ih = (ih ^ b) * 1099511628211ULL;
+    }
     std::fprintf(stderr,
-                 "[cb] seq=%llu n=%u res_in=%016llx bo=%016llx "
+                 "[cb] seq=%llu n=%u res_in=%016llx bo=%016llx inj=%016llx "
                  "bo_ptr=%p injw=%p\n",
                  static_cast<unsigned long long>(cb_seq++), n_tokens,
                  static_cast<unsigned long long>(rh),
                  static_cast<unsigned long long>(bh),
+                 static_cast<unsigned long long>(ih),
                  static_cast<const void*>(s_.block_out),
                  static_cast<const void*>(inject_w));
     std::fflush(stderr);
