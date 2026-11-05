@@ -1420,9 +1420,12 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
     // The draft block's KV caches hold every head, unlike the trunk's rank
     // half (neuhaus TP2): size them with the MTP heads' row width.
     const std::size_t mtp_kv_row = model_->mtp().heads.AttentionKvDim();
-    // Wide copy verification keeps every row for the draft catch-up.
+    // Wide copy verification keeps every row for the draft catch-up:
+    // size with the wide-copy maximum, not just the speculative budget.
     s->mtp_.target_hidden = Alloc<float>(
-        a, static_cast<std::size_t>(options_.max_speculative) * c.HcDim(),
+        a, static_cast<std::size_t>(std::max(options_.max_speculative,
+                                             max_copy_rows())) *
+               c.HcDim(),
         error_msg, &s->allocated_bytes_);
     s->mtp_.k_cache =
         Alloc<__half>(a, static_cast<std::size_t>(max_context) * mtp_kv_row,
@@ -3146,6 +3149,15 @@ bool Executor::AllReduce(float* data, std::size_t rows, std::string* error_msg,
   if (model_->tp_world_size() == 1) {
     return true;
   }
+  static const bool ar_trace = std::getenv("GUFO_TP_TRACE") != nullptr;
+  float pre_sample[64] = {};
+  if (ar_trace && rows != 0) {
+    const std::size_t samples =
+        std::min<std::size_t>(rows * config().hidden_size, 64);
+    (void)hipMemcpyAsync(pre_sample, data, samples * sizeof(float),
+                         hipMemcpyDeviceToHost, stream_);
+    (void)hipStreamSynchronize(stream_);
+  }
   const std::size_t hidden = config().hidden_size;
   if (rows > std::numeric_limits<std::size_t>::max() / hidden ||
       rows * hidden > std::numeric_limits<std::size_t>::max() / sizeof(float)) {
@@ -3161,6 +3173,31 @@ bool Executor::AllReduce(float* data, std::size_t rows, std::string* error_msg,
       *error_msg = "Flash-Next all-reduce failed";
     }
     return false;
+  }
+  if (ar_trace && rows != 0) {
+    const std::size_t samples =
+        std::min<std::size_t>(rows * config().hidden_size, 64);
+    float post_sample[64] = {};
+    (void)hipMemcpyAsync(post_sample, data, samples * sizeof(float),
+                         hipMemcpyDeviceToHost, stream_);
+    (void)hipStreamSynchronize(stream_);
+    std::uint64_t pre_h = 1469598103934665603ULL;
+    std::uint64_t post_h = 1469598103934665603ULL;
+    for (std::size_t i = 0; i < samples; ++i) {
+      std::uint32_t b;
+      static_assert(sizeof(b) == sizeof(pre_sample[i]));
+      std::memcpy(&b, &pre_sample[i], sizeof(b));
+      pre_h = (pre_h ^ b) * 1099511628211ULL;
+      std::memcpy(&b, &post_sample[i], sizeof(b));
+      post_h = (post_h ^ b) * 1099511628211ULL;
+    }
+    static std::uint64_t ar_seq = 0;
+    std::fprintf(stderr,
+                 "[ar] seq=%llu rows=%zu pre=%016llx post=%016llx\n",
+                 static_cast<unsigned long long>(ar_seq++), rows,
+                 static_cast<unsigned long long>(pre_h),
+                 static_cast<unsigned long long>(post_h));
+    std::fflush(stderr);
   }
   if (observe && options_.moe_observer) {
     options_.moe_observer(data, bytes, stream_);
@@ -3517,6 +3554,36 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
             ? DraftLogits(*draft, s_.mixed, s_.logits, error_msg)
             : Dense(model_->output(), s_.mixed, s_.logits, 1, error_msg))) {
     return false;
+  }
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    static std::uint64_t head_seq = 0;
+    float res_s[64] = {}, logits_s[64] = {};
+    const std::size_t res_n =
+        std::min<std::size_t>(config().HcDim(), 64);
+    const std::size_t log_n =
+        std::min<std::size_t>(rows, 64);
+    (void)hipMemcpyAsync(res_s, res, res_n * sizeof(float),
+                         hipMemcpyDeviceToHost, stream_);
+    (void)hipMemcpyAsync(logits_s, s_.logits, log_n * sizeof(float),
+                         hipMemcpyDeviceToHost, stream_);
+    (void)hipStreamSynchronize(stream_);
+    std::uint64_t rh = 1469598103934665603ULL, lh = 1469598103934665603ULL;
+    for (std::size_t i = 0; i < res_n; ++i) {
+      std::uint32_t b;
+      std::memcpy(&b, &res_s[i], sizeof(b));
+      rh = (rh ^ b) * 1099511628211ULL;
+    }
+    for (std::size_t i = 0; i < log_n; ++i) {
+      std::uint32_t b;
+      std::memcpy(&b, &logits_s[i], sizeof(b));
+      lh = (lh ^ b) * 1099511628211ULL;
+    }
+    std::fprintf(stderr, "[head] seq=%llu draft=%d res=%016llx logits=%016llx\n",
+                 static_cast<unsigned long long>(head_seq++),
+                 draft != nullptr ? 1 : 0,
+                 static_cast<unsigned long long>(rh),
+                 static_cast<unsigned long long>(lh));
+    std::fflush(stderr);
   }
   const auto count = std::min<std::uint32_t>(rows, kMtpCandidates);
   if (candidates) {
@@ -5527,6 +5594,28 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
   // The hidden input: kept trunk rows from `hidden_row`, or the block's
   // own carried residual.
   const float* hidden = s_.mtp_h;
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    static std::uint64_t body_seq = 0;
+    float in_s[64] = {};
+    const std::size_t in_n = std::min<std::size_t>(config().HcDim(), 64);
+    (void)hipMemcpyAsync(in_s, s_.mtp_h, in_n * sizeof(float),
+                         hipMemcpyDeviceToHost, stream_);
+    (void)hipStreamSynchronize(stream_);
+    std::uint64_t ih = 1469598103934665603ULL;
+    for (std::size_t i = 0; i < in_n; ++i) {
+      std::uint32_t b;
+      std::memcpy(&b, &in_s[i], sizeof(b));
+      ih = (ih ^ b) * 1099511628211ULL;
+    }
+    std::fprintf(stderr,
+                 "[body] seq=%llu n=%u hrow=%d src=%p in_h=%016llx "
+                 "tok0=%d pos=%u\n",
+                 static_cast<unsigned long long>(body_seq++), n, hidden_row,
+                 static_cast<const void*>(hidden_source),
+                 static_cast<unsigned long long>(ih),
+                 tokens.empty() ? -1 : tokens[0], pos);
+    std::fflush(stderr);
+  }
   if (hidden_source && control_host_->hidden_row >= 0) {
     // Eager catch-up can normalize the trunk rows directly. Graphs use the
     // device-selected source below because their hidden-row index can change
@@ -5693,6 +5782,40 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
       return false;
   }
   const float* last = s_.mtp_res + tail_last;
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    static std::uint64_t last_seq = 0;
+    float res_s[64] = {}, in_s[64] = {}, kv_s[16] = {};
+    (void)hipMemcpyAsync(res_s, last, std::min<std::size_t>(hc_dim, 64) * sizeof(float),
+                         hipMemcpyDeviceToHost, stream_);
+    (void)hipMemcpyAsync(in_s, hidden, std::min<std::size_t>(hc_dim, 64) * sizeof(float),
+                         hipMemcpyDeviceToHost, stream_);
+    (void)hipMemcpyAsync(kv_s, session.mtp_.k_cache + std::size_t{pos} * model_->mtp().heads.AttentionKvDim(),
+                         16 * sizeof(__half), hipMemcpyDeviceToHost, stream_);
+    (void)hipStreamSynchronize(stream_);
+    std::uint64_t rh = 1469598103934665603ULL, ih2 = 1469598103934665603ULL,
+                   kh = 1469598103934665603ULL;
+    for (std::size_t i = 0; i < std::min<std::size_t>(hc_dim, 64); ++i) {
+      std::uint32_t b;
+      std::memcpy(&b, &res_s[i], sizeof(b));
+      rh = (rh ^ b) * 1099511628211ULL;
+      std::memcpy(&b, &in_s[i], sizeof(b));
+      ih2 = (ih2 ^ b) * 1099511628211ULL;
+    }
+    for (std::size_t i = 0; i < 16; ++i) {
+      std::uint16_t b;
+      std::memcpy(&b, &kv_s[i], sizeof(b));
+      kh = (kh ^ b) * 1099511628211ULL;
+    }
+    std::fprintf(stderr,
+                 "[last] seq=%llu n=%u pos=%u hrow=%d in=%016llx res=%016llx "
+                 "kvrow=%016llx\n",
+                 static_cast<unsigned long long>(last_seq++), n, pos,
+                 control_host_->hidden_row,
+                 static_cast<unsigned long long>(ih2),
+                 static_cast<unsigned long long>(rh),
+                 static_cast<unsigned long long>(kh));
+    std::fflush(stderr);
+  }
   if (!Check(hipMemcpyAsync(session.mtp_.h, last, hc_dim * sizeof(float),
                             hipMemcpyDeviceToDevice, stream_),
              "MTP hidden carry", error_msg)) {
