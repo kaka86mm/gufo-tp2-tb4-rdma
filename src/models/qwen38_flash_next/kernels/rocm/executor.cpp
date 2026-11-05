@@ -2282,6 +2282,28 @@ bool Executor::FusedMixer(const DeviceMixer& m, std::uint32_t n_tokens) const {
 void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
                        const float* inject_w, const DeviceMixer* next) const {
   const Config& c = config();
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    static std::uint64_t cb_seq = 0;
+    float rv[8] = {}, bv[8] = {};
+    (void)hipMemcpyAsync(rv, res, 8 * sizeof(float), hipMemcpyDeviceToHost,
+                         stream_);
+    (void)hipMemcpyAsync(bv, s_.block_out, 8 * sizeof(float),
+                         hipMemcpyDeviceToHost, stream_);
+    (void)hipStreamSynchronize(stream_);
+    std::uint64_t rh = 1469598103934665603ULL, bh = 1469598103934665603ULL;
+    for (std::size_t i = 0; i < 8; ++i) {
+      std::uint32_t b;
+      std::memcpy(&b, &rv[i], sizeof(b));
+      rh = (rh ^ b) * 1099511628211ULL;
+      std::memcpy(&b, &bv[i], sizeof(b));
+      bh = (bh ^ b) * 1099511628211ULL;
+    }
+    std::fprintf(stderr, "[cb] seq=%llu n=%u res_in=%016llx bo=%016llx\n",
+                 static_cast<unsigned long long>(cb_seq++), n_tokens,
+                 static_cast<unsigned long long>(rh),
+                 static_cast<unsigned long long>(bh));
+    std::fflush(stderr);
+  }
   inject_fused_ = nullptr;
   // Wide batches hand the next mixer an F16 norm for its epilogue and the
   // same norm quantized into the tiled Q8 layout for its W8A8 down
