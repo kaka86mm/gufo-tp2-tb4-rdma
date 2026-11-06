@@ -675,7 +675,7 @@ void AddRowsBroadcast(const float* addend, float* residual,
 /// publishes `value` in `ready` once every block's copy is visible to the
 /// host. `arrivals` counts finished blocks and must start at zero; the last
 /// block resets it.
-void StagePartial(const float* partial, void* send, std::size_t count,
+void StagePartial(const float* partial, float* send, std::size_t count,
                   std::uint32_t* arrivals, std::uint64_t* ready,
                   std::uint64_t value, hipStream_t stream);
 

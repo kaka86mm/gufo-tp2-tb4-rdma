@@ -3322,8 +3322,8 @@ Executor::TwoRankAllReduce(std::shared_ptr<Communicator> communicator,
               stream);
     const std::size_t rows = bytes / (sizeof(float) * hidden);
     if (rows != 0) {
-            AddF16PairRows(queued.send, queued.peer, data,
-                     static_cast<std::size_t>(rows) * hidden, stream);
+      AddRowsBroadcast(queued.peer, data, static_cast<std::uint32_t>(rows),
+                       hidden, 1, stream);
     }
     return true;
   };
