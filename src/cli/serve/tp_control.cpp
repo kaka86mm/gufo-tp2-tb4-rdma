@@ -351,6 +351,7 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
       instruction.op != TpInstructionOp::kDrop &&
       instruction.op != TpInstructionOp::kPersist &&
       instruction.op != TpInstructionOp::kPromptContext &&
+      instruction.op != TpInstructionOp::kReconcile &&
       instruction.op != TpInstructionOp::kAdvanceBatch &&
       instruction.op != TpInstructionOp::kDecodeBatch) {
     SetError(error,
