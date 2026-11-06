@@ -1895,12 +1895,19 @@ int RunServe(std::span<const char* const> args) {
         served_names);
 #if defined(ENGINE_ENABLE_HIP)
     if (tp_world_size == 2 && tp_rank == 1) {
+      std::fprintf(stderr, "[w] run_worker enter\n");
+      std::fflush(stderr);
       std::string worker_error;
       if (!backend->run_worker(&worker_error)) {
+        std::fprintf(stderr, "[w] run_worker false: %s\n",
+                     worker_error.c_str());
+        std::fflush(stderr);
         server::Logger::Error("server",
                               "event=tp_worker_failed reason=" + worker_error);
         return 1;
       }
+      std::fprintf(stderr, "[w] run_worker TRUE\n");
+      std::fflush(stderr);
       return 0;
     }
 #endif
