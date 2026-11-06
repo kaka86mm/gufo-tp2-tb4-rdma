@@ -4499,6 +4499,61 @@ Executor::Scratch Executor::PairScratch(const Scratch& base) const {
   return s;
 }
 
+namespace {
+/// GPU-side elapsed per pair-part type: an event ring marked open(0/1) and
+/// close(2/3) for mixer/moe, summed at the chunk's end.
+class GpuPartTimer {
+public:
+  static void Record(hipStream_t stream, std::uint32_t kind) {
+    auto& self = Instance();
+    if (self.cursor_ == self.events_.size()) {
+      return;
+    }
+    if (!self.init_) {
+      for (auto& event : self.events_) {
+        (void)hipEventCreateWithFlags(&event, 0);
+      }
+      self.init_ = true;
+    }
+    self.kinds_[self.cursor_] = kind;
+    (void)hipEventRecord(self.events_[self.cursor_], stream);
+    ++self.cursor_;
+  }
+
+  static void Report() {
+    auto& self = Instance();
+    float mixer_us = 0, moe_us = 0;
+    std::size_t i = 0;
+    while (i + 1 < self.cursor_) {
+      if (self.kinds_[i + 1] == self.kinds_[i] + 2) {
+        float ms = 0;
+        if (hipEventElapsedTime(&ms, self.events_[i],
+                                self.events_[i + 1]) == hipSuccess) {
+          (self.kinds_[i] % 2 == 0 ? mixer_us : moe_us) += ms * 1000;
+        }
+        i += 2;
+      } else {
+        ++i;
+      }
+    }
+    std::fprintf(stderr, "[gpt] mixer_gpu_us=%.0f moe_gpu_us=%.0f\n",
+                 mixer_us, moe_us);
+    std::fflush(stderr);
+    self.cursor_ = 0;
+  }
+
+private:
+  static GpuPartTimer& Instance() {
+    static GpuPartTimer timer;
+    return timer;
+  }
+  std::array<hipEvent_t, 512> events_{};
+  std::array<std::uint32_t, 512> kinds_{};
+  std::size_t cursor_{0};
+  bool init_{false};
+};
+}  // namespace
+
 bool Executor::ForwardPair(Session& session,
                            std::span<const std::int32_t> tokens,
                            std::uint32_t lead, std::uint32_t n_logits,
@@ -4814,60 +4869,6 @@ bool Executor::ForwardPair(Session& session,
   return true;
 }
 
-namespace {
-/// GPU-side elapsed per pair-part type: an event ring marked open(0/1) and
-/// close(2/3) for mixer/moe, summed at the chunk's end.
-class GpuPartTimer {
-public:
-  static void Record(hipStream_t stream, std::uint32_t kind) {
-    auto& self = Instance();
-    if (self.cursor_ == self.events_.size()) {
-      return;
-    }
-    if (!self.init_) {
-      for (auto& event : self.events_) {
-        (void)hipEventCreateWithFlags(&event, 0);
-      }
-      self.init_ = true;
-    }
-    self.kinds_[self.cursor_] = kind;
-    (void)hipEventRecord(self.events_[self.cursor_], stream);
-    ++self.cursor_;
-  }
-
-  static void Report() {
-    auto& self = Instance();
-    float mixer_us = 0, moe_us = 0;
-    std::size_t i = 0;
-    while (i + 1 < self.cursor_) {
-      if (self.kinds_[i + 1] == self.kinds_[i] + 2) {
-        float ms = 0;
-        if (hipEventElapsedTime(&ms, self.events_[i],
-                                self.events_[i + 1]) == hipSuccess) {
-          (self.kinds_[i] % 2 == 0 ? mixer_us : moe_us) += ms * 1000;
-        }
-        i += 2;
-      } else {
-        ++i;
-      }
-    }
-    std::fprintf(stderr, "[gpt] mixer_gpu_us=%.0f moe_gpu_us=%.0f\n",
-                 mixer_us, moe_us);
-    std::fflush(stderr);
-    self.cursor_ = 0;
-  }
-
-private:
-  static GpuPartTimer& Instance() {
-    static GpuPartTimer timer;
-    return timer;
-  }
-  std::array<hipEvent_t, 512> events_{};
-  std::array<std::uint32_t, 512> kinds_{};
-  std::size_t cursor_{0};
-  bool init_{false};
-};
-}  // namespace
 
 bool Executor::MixerPart(Session& session, std::uint32_t il,
                          const TrunkBatch& batch, bool normed, bool reduce,
