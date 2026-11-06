@@ -4033,7 +4033,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     return ForwardBody(session, n, n_logits, logits != nullptr, speculative,
                        sparse, start_pos, graph ? graph_pool_grid : pool_grid,
                        first_layer, c.num_layers, error_msg, checkpoints,
-                       graph);
+                       ple_split);
   };
   // The prefix is already queued. Wait once before the suffix so recording
   // its graph can reuse these pinned rows while the eager pass executes.
