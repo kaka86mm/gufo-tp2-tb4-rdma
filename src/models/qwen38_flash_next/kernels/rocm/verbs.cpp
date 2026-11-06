@@ -1008,6 +1008,8 @@ public:
       poisoned_ = true;
       if (first_error_.empty()) {
         first_error_ = "a GPU wait for a queued verbs exchange timed out";
+        std::fprintf(stderr, "[poison] first: %s\n", first_error_.c_str());
+        std::fflush(stderr);
       }
     }
     if (poisoned_) {
@@ -1517,6 +1519,9 @@ private:
           poisoned_ = true;
           if (first_error_.empty()) {
             first_error_ = finished.error;
+            std::fprintf(stderr, "[poison] first: %s\n",
+                         first_error_.c_str());
+            std::fflush(stderr);
           }
         }
         // Counted out before the GPU learns of the arrival, so a scope that
