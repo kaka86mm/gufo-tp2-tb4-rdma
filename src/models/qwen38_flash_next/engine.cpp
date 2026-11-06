@@ -509,7 +509,7 @@ std::uint64_t Session::SnapshotBytes() const {
 }
 
 std::uint64_t Session::PrefillCheckpointBytes(std::uint32_t position) const {
-  if (model_->TpWorldSize() > 1 || !session_->VisionLayout().images.empty())
+  if (!session_->VisionLayout().images.empty())
     return 0;
   return SessionSnapshotHostBytes(position, model_->VocabSize(), 0) +
          model_->executor_->PrefillCheckpointBytes(*session_, position);

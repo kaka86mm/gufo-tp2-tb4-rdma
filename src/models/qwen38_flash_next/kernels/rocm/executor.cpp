@@ -789,11 +789,6 @@ void Executor::ReleasePassCheckpointStorage() const noexcept {
 std::unique_ptr<PrefillCheckpoint> Executor::MakePrefillCheckpoint(
     Session& source, std::span<const std::int32_t> tokens, std::uint32_t prefix,
     std::string* error_msg, std::uint32_t slot, std::uint32_t previous) const {
-  if (model_->tp_world_size() > 1) {
-    AssignError(error_msg,
-                "TP prefill captures use a separate mirrored snapshot");
-    return nullptr;
-  }
   // Any prefix of a text pass: the recurrences store their state when they
   // reach its last row, convolution and PLE histories copy the rows before
   // it, attention splits its query groups there (as a pass ending there
