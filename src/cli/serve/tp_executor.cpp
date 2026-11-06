@@ -1346,11 +1346,7 @@ TextRunnerState& TpExecutor::StateFor(std::uint32_t id) {
   // Create the missing states on demand: each id's state is born empty, which
   // is exactly what rank 0's fresh lease holds.
   while (states_.size() <= id) {
-    auto state = runner_->CreateState();
-    if (state == nullptr) {
-      throw std::runtime_error("TP executor state creation failed");
-    }
-    states_.push_back(std::move(state));
+    states_.push_back(nullptr);
     state_use_.push_back(instructions_);
     state_dead_.push_back(false);
     if (std::getenv("GUFO_TP_TRACE") != nullptr) {
@@ -1360,7 +1356,18 @@ TextRunnerState& TpExecutor::StateFor(std::uint32_t id) {
       std::fflush(stderr);
     }
   }
+  if (states_[id] == nullptr) {
+    // A recycled id: rank 0 named it again, so its pool re-created the state
+    // and its prompt context binding resets the model state. Born empty plus
+    // that binding matches what rank 0 holds.
+    auto state = runner_->CreateState();
+    if (state == nullptr) {
+      throw std::runtime_error("TP executor state creation failed");
+    }
+    states_[id] = std::move(state);
+  }
   state_use_[id] = instructions_;
+  state_dead_[id] = false;
   return *states_[id];
 }
 
