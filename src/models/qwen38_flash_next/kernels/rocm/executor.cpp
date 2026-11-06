@@ -2863,9 +2863,10 @@ void Executor::FinishPrefetch() const {
 bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
                    float* res, bool speculative, std::string* error_msg,
                    bool embeddings_ready,
-                   std::span<PrefillCheckpoint* const> checkpoints) const {
+                   std::span<PrefillCheckpoint* const> checkpoints,
+                   std::uint32_t emb_row) const {
   const Config& c = config();
-  if (!embeddings_ready && !WaitPle(error_msg)) {
+  if (!embeddings_ready && emb_row == 0 && !WaitPle(error_msg)) {
     return false;
   }
   if (!embeddings_ready && !prefetch_next_.empty()) {
@@ -2875,8 +2876,9 @@ bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
   if (std::getenv("GUFO_TP_TRACE") != nullptr) {
     static std::uint64_t pe_seq = 0;
     float v[32] = {};
-    (void)hipMemcpyAsync(v, s_.ple_emb, 32 * sizeof(float),
-                         hipMemcpyDeviceToHost, stream_);
+    (void)hipMemcpyAsync(v, s_.ple_emb + std::size_t{emb_row} *
+                                       c.PleEmbeddingDim(),
+                         32 * sizeof(float), hipMemcpyDeviceToHost, stream_);
     (void)hipStreamSynchronize(stream_);
     std::uint64_t h = 1469598103934665603ULL;
     for (std::size_t i = 0; i < 32; ++i) {
@@ -2891,7 +2893,8 @@ bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
   }
   const std::uint32_t hc_dim = c.HcDim();
   Q8Input emb;
-  if (!Quantize(s_.ple_emb, n, c.PleEmbeddingDim(), &emb, error_msg) ||
+  if (!Quantize(s_.ple_emb + std::size_t{emb_row} * c.PleEmbeddingDim(), n,
+                c.PleEmbeddingDim(), &emb, error_msg) ||
       !Dense(l.ple_key, emb, s_.ple_key, error_msg) ||
       !Dense(l.ple_value, emb, s_.ple_value, error_msg)) {
     return false;
@@ -4742,7 +4745,7 @@ bool Executor::MixerPart(Session& session, std::uint32_t il,
   const DeviceLayer& l = model_->layers()[il];
   const std::uint32_t n = batch.n;
   if (c.IsPleLayer(il) && !Ple(l, session, n, s_.res, batch.speculative,
-                               error_msg, false, {})) {
+                               error_msg, false, {}, batch.emb_row)) {
     return false;
   }
   // The rank's stacked SSM projections share the F16 mix, just as in the

@@ -680,7 +680,8 @@ private:
   bool Ple(const DeviceLayer& l, Session& s, std::uint32_t n_tokens, float* res,
            bool speculative, std::string* error_msg,
            bool embeddings_ready = false,
-           std::span<PrefillCheckpoint* const> checkpoints = {}) const;
+           std::span<PrefillCheckpoint* const> checkpoints = {},
+           std::uint32_t emb_row = 0) const;
   bool LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                        const float* x, float* out, std::uint32_t n_tokens,
                        bool speculative, std::string* error_msg,
