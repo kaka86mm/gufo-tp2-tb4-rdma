@@ -1,5 +1,12 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/verbs.hpp"
 
+// The partial-exchange staging quantizer (kernels.hip.cpp); the half type
+// stays inside the HIP translation unit.
+namespace gufo::models::qwen38_flash_next::rocm {
+void ConvertRowsF32ToF16(const float* in, void* out, std::size_t count,
+                         hipStream_t stream);
+}  // namespace gufo::models::qwen38_flash_next::rocm
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <infiniband/verbs.h>
@@ -54,11 +61,6 @@ constexpr std::uint32_t kReadyMagic = 0x47555244U;  // "GURD"
 // exchange's partial is staged while the previous one is in flight. A window
 // starts with the writer's header; the partial follows at kDataOffset. A
 // window holds one prefill batch's partial: 4,224 rows of 2,560 floats.
-// The partial-exchange staging quantizer (kernels.hip.cpp); the half type
-// stays inside the HIP translation unit.
-void ConvertRowsF32ToF16(const float* in, void* out, std::size_t count,
-                         hipStream_t stream);
-
 constexpr std::size_t kWindowBytes = 48U << 20;
 // 5 windows: the 3-window reuse distance let a GPU staging write race the
 // NIC's send of an in-flight exchange under sustained decode, producing rare
