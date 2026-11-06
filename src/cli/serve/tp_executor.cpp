@@ -1234,7 +1234,8 @@ struct TpExecutor::Request {
         greedy(sampling.can_use_unmodified_argmax() && !begin.constrained),
         stop_at_eos(begin.stop_at_eos),
         sampler(sampling, prompt),
-        own(states) {}
+        own(states),
+        named(states, true) {}
 
   void Note(std::string message) {
     if (failure.empty()) {
@@ -1257,6 +1258,9 @@ struct TpExecutor::Request {
   /// `decode` instruction supplies rank 0's draw state.
   sampling::SamplerState sampler;
   std::vector<std::optional<OwnChoice>> own;
+  /// States this request actually named (own[]'s value flickers on decode);
+  /// the idle-state recycle leases exactly these, not every lower id.
+  std::vector<bool> named;
   TpExecutionDigest digest;
   std::uint64_t count{0};
   std::string failure;
@@ -1337,7 +1341,7 @@ void TpExecutor::RecycleIdleStates() {
       bool leased = false;
       for (const auto& [sequence, request] : requests_) {
         (void)sequence;
-        if (id < request->own.size()) {
+        if (id < request->named.size() && request->named[id]) {
           leased = true;
           break;
         }
@@ -1529,7 +1533,9 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
     auto& state = StateFor(instruction.state);
     if (request.own.size() <= instruction.state) {
       request.own.resize(instruction.state + 1);
+      request.named.resize(instruction.state + 1, false);
     }
+    request.named[instruction.state] = true;
     auto& choice = request.own[instruction.state];
     // Multi-token cycles stop at EOS unless the request ignores it, on both
     // ranks alike.
@@ -1737,7 +1743,9 @@ bool TpExecutor::ExecuteBatch(const TpInstruction& instruction,
     DigestTpCall(request.digest, MemberCall(instruction.op, member));
     if (request.own.size() <= member.state) {
         request.own.resize(member.state + 1);
+        request.named.resize(member.state + 1, false);
       }
+    request.named[member.state] = true;
         auto& choice = request.own[member.state];
     if (decode) {
       choice.reset();
@@ -1845,7 +1853,9 @@ bool TpExecutor::ExecuteBatch(const TpInstruction& instruction,
       try {
         if (request.own.size() <= member.state) {
           request.own.resize(member.state + 1);
+          request.named.resize(member.state + 1, false);
         }
+        request.named[member.state] = true;
         request.own[member.state] = ChooseGreedy(state);
       } catch (const std::exception& exception) {
         request.Note(std::string("rank 1 greedy choice failed: ") +
