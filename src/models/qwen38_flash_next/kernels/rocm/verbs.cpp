@@ -66,7 +66,7 @@ constexpr std::size_t kWindowBytes = 48U << 20;
 // NIC's send of an in-flight exchange under sustained decode, producing rare
 // stale reads (the accumulating 1e-4 drift). The extra windows widen the
 // reuse distance for a few MiB of pinned host memory.
-constexpr std::size_t kWindows = 7;
+constexpr std::size_t kWindows = 5;
 constexpr std::size_t kBufferBytes = kWindows * kWindowBytes;
 constexpr std::size_t kDataOffset = 64;
 constexpr std::uint32_t kPostedReceives = 4;
@@ -83,7 +83,7 @@ constexpr std::uintptr_t kSendAddress = 0x0000700000000000ULL;
 constexpr std::uintptr_t kRecvAddress = kSendAddress + kBufferBytes;
 // Overlapped exchanges started and not yet finished; each has its own
 // readiness event.
-constexpr std::size_t kStartedExchanges = 6;
+constexpr std::size_t kStartedExchanges = 4;
 // Queued exchanges not yet complete; a forward queues one per layer.
 constexpr std::size_t kQueuedExchanges = 4096;
 // A GPU wait gives up well after the exchange thread's own timeout.
