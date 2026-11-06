@@ -1132,6 +1132,8 @@ private:
     poisoned_ = true;
     if (first_error_.empty()) {
       first_error_ = message;
+      std::fprintf(stderr, "[poison] first: %s\n", message.c_str());
+      std::fflush(stderr);
     }
     SetError(error, std::move(message));
   }
