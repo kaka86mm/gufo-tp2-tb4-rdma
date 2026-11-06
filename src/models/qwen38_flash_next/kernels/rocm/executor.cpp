@@ -4614,12 +4614,18 @@ bool Executor::ForwardPair(Session& session,
     UseScratch(lane.scratch);
     inject_parts_ = lane.inject_parts;
   };
+  const bool part_time = std::getenv("GUFO_TIME_TRACE") != nullptr;
+  std::uint64_t t_mixer = 0, t_moe = 0, t_sum = 0;
+  const auto tick = [&] {
+    return std::chrono::steady_clock::now().time_since_epoch().count();
+  };
   const std::uint32_t parts = 2 * c.num_layers;
   // Runs the lane's parts until one ends in a partial, whose sum it starts.
   const auto advance = [&](Lane& lane) {
     while (lane.part < parts) {
       const std::uint32_t part = lane.part++;
       const std::uint32_t il = part / 2;
+      const auto t_part = tick();
       if (part % 2 == 0) {
         if (!session.CheckCancellation(error_msg) ||
             !MixerPart(session, il, lane.batch, lane.normed, false,
@@ -4627,15 +4633,21 @@ bool Executor::ForwardPair(Session& session,
           return false;
         }
         if (!model_->layers()[il].mixer_split) {
+          if (part_time) t_mixer += tick() - t_part;
           continue;
         }
       } else if (!MoePart(il, lane.batch.n, false, error_msg)) {
         return false;
       }
+      if (part_time) {
+        (part % 2 == 0 ? t_mixer : t_moe) += tick() - t_part;
+      }
+      const auto t_sum0 = tick();
       if (!options_.split_reduce.start(s_.block_out, bytes(lane), stream_,
                                        error_msg)) {
         return false;
       }
+      if (part_time) t_sum += tick() - t_sum0;
       in_flight[flying++] = &lane;
       lane.inject_parts = inject_parts_;
       lane.pending = true;
@@ -4697,10 +4709,21 @@ bool Executor::ForwardPair(Session& session,
         continue;
       }
       enter(lane);
-      if (!finish(lane) || !advance(lane)) {
+      const auto t_fin = tick();
+      const bool fin_ok = finish(lane);
+      if (part_time) t_sum += tick() - t_fin;
+      if (!fin_ok || !advance(lane)) {
         return false;
       }
     }
+  }
+  if (part_time) {
+    std::fprintf(stderr,
+                 "[ppt] mixer_us=%llu moe_us=%llu sum_us=%llu\n",
+                 static_cast<unsigned long long>(t_mixer / 1000),
+                 static_cast<unsigned long long>(t_moe / 1000),
+                 static_cast<unsigned long long>(t_sum / 1000));
+    std::fflush(stderr);
   }
 
   // Batch B's logits, as its own Forward would compute them.
