@@ -315,6 +315,10 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
     case TpInstructionOp::kRestoreDisk:
       valid = only(false, false, false, false, false);
       break;
+    case TpInstructionOp::kReconcile:
+      valid = only(false, false, true, false, false) &&
+              instruction.count <= kMaxPromptTokens;
+      break;
     case TpInstructionOp::kPrefill:
       valid =
           only(false, true, true, true, false) && instruction.count != 0 &&
