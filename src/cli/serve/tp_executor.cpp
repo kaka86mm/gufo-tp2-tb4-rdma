@@ -663,6 +663,16 @@ void TpMirroredRunner::Record(
   }
 }
 
+std::optional<std::size_t> TpMirroredRunner::PrefillCheckpointBytes(
+    const TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+    std::size_t offset, std::size_t max_input_tokens,
+    std::size_t boundary) const {
+  // The claim plans boundary split passes; each boundary's state is then
+  // captured live over the mirrored kSnapshot path.
+  return inner_->PrefillCheckpointBytes(state, prompt, offset,
+                                        max_input_tokens, boundary);
+}
+
 TextRunnerDescriptor TpMirroredRunner::Descriptor() const {
   auto descriptor = inner_->Descriptor();
   // An in-pass checkpoint would capture inside a call rank 1 cannot mirror

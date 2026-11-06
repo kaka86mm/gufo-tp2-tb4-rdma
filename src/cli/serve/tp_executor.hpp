@@ -223,6 +223,10 @@ public:
   [[nodiscard]] TextPrefillStep Prefill(
       TextRunnerState& state, std::span<const TextRunnerToken> prompt,
       std::size_t offset, std::size_t max_input_tokens) const override;
+  [[nodiscard]] std::optional<std::size_t> PrefillCheckpointBytes(
+      const TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t max_input_tokens,
+      std::size_t boundary) const override;
   [[nodiscard]] TextDecodeSelection SelectNext(
       TextRunnerState& state, sampling::SamplerState& sampler) const override;
   void Advance(TextRunnerState& state, TextRunnerToken token) const override;
