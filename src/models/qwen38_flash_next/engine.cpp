@@ -1730,7 +1730,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
             *session_, pending.chain, pending.chain.size(), logits,
             pending.speculative ? rocm::Executor::ForwardMode::kVerify
                                 : rocm::Executor::ForwardMode::kDecode,
-            error_msg)) {
+            error_msg, {}, pending.chain)) {
       return false;
     }
   }

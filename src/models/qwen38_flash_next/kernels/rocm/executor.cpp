@@ -2737,11 +2737,32 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
                  tokens,
                  std::span<const std::uint32_t>(host_rows_.data(),
                                                 n * c.ple_heads));
-  const NgramGatherOwner owner{n * c.ple_heads, &session.ngram_counters_};
+  // A ready prefetch whose hint shares this batch's prefix supplies those
+  // rows; only the suffix gathers. The history loop above already ran.
+  std::size_t shared = 0;
+  if (prefetch_.ready && prefetch_.session == &session &&
+      !prefetch_.tokens.empty()) {
+    shared = static_cast<std::size_t>(
+        std::ranges::mismatch(tokens, prefetch_.tokens).in1 - tokens.begin());
+    if (shared > 0) {
+      std::copy_n(prefetch_.rows.data(), shared * c.PleEmbeddingDim(),
+                  host_emb_);
+    }
+    prefetch_.ready = false;
+    prefetch_.tokens.clear();
+  }
+  if (shared == tokens.size()) {
+    ple_pending_ = false;
+    return true;
+  }
+  const auto tail = (n - shared) * c.ple_heads;
+  const NgramGatherOwner owner{tail, &session.ngram_counters_};
   ple_pending_ = ngram_->StartRead(
-      std::span<const std::uint32_t>(host_rows_.data(), n * c.ple_heads),
-      std::span<float>(host_emb_,
-                       static_cast<std::size_t>(n) * c.PleEmbeddingDim()),
+      std::span<const std::uint32_t>(host_rows_.data() + shared * c.ple_heads,
+                                     tail),
+      std::span<float>(host_emb_ + shared * c.PleEmbeddingDim(),
+                       static_cast<std::size_t>(n - shared) *
+                           c.PleEmbeddingDim()),
       std::span(&owner, 1));
   if (!ple_pending_) {
     AssignError(error_msg, "n-gram table read could not start");
@@ -2832,6 +2853,7 @@ void Executor::PrefetchPle(const Session& session,
   // Hashed from the history after this batch, which PleFetch already
   // advanced; the session keeps it until the next batch claims the rows.
   prefetch_.ready = false;
+  prefetch_.session = &session;
   prefetch_.before = session.ngram_;
   prefetch_.after = session.ngram_;
   const std::span<std::uint32_t> rows(host_rows_.data(),
@@ -3913,7 +3935,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     std::span<const std::int32_t>& hint;
     ~NextHint() { hint = {}; }
   } next_hint{prefetch_next_};
-  if (mode == ForwardMode::kPrefill) {
+  if (!next.empty()) {
     prefetch_next_ = next;
   }
   const bool speculative = mode == ForwardMode::kVerify;

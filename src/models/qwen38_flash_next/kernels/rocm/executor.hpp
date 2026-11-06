@@ -1010,6 +1010,7 @@ private:
     bool tail{false};
     NgramHistory before;
     NgramHistory after;
+    const void* session{nullptr};  ///< owner of the hinted history
     std::vector<std::int32_t> tokens;
     std::vector<float> rows;
   };
