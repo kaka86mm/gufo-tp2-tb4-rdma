@@ -1461,7 +1461,8 @@ private:
                        job.bytes / sizeof(float), copy_stream_),
                    true)) ||
                  hipStreamSynchronize(copy_stream_) != hipSuccess) {
-        finished.error = "HIP overlapped staging failed";
+        finished.error = std::string("HIP overlapped staging failed: ") +
+                         std::to_string(static_cast<int>(hipGetLastError()));
       } else {
         // [vt] the transfer half of a partial's latency (wire plus peer);
         // the staging half is the [ppt] finish total minus this.
