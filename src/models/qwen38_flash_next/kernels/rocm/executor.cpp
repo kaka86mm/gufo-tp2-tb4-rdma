@@ -2751,9 +2751,21 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
 
 bool Executor::WaitPle(std::string* error_msg) const {
   bool ok = ple_pending_;
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    std::fprintf(stderr, "[pf] wait-enter pending=%d claimed=%u pfpending=%d pfready=%d\n",
+                 ple_pending_ ? 1 : 0, prefetch_.claimed,
+                 prefetch_.pending ? 1 : 0, prefetch_.ready ? 1 : 0);
+    std::fflush(stderr);
+  }
   if (ok && prefetch_.claimed != 0) {
     FinishPrefetch();
     ok = prefetch_.ready;
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+      std::fprintf(stderr, "[pf] claim-wait ok=%d ready=%d tail=%d\n",
+                   ok ? 1 : 0, prefetch_.ready ? 1 : 0,
+                   prefetch_.tail ? 1 : 0);
+      std::fflush(stderr);
+    }
     if (ok) {
       std::copy_n(prefetch_.rows.data(),
                   prefetch_.claimed * config().PleEmbeddingDim(), host_emb_);
@@ -2808,6 +2820,13 @@ void Executor::PrefetchPle(const Session& session,
   // A paired prefill chunk (PrefillChunk) is the widest batch PleFetch reads.
   if (ple_pending_ || prefetch_.pending || next.empty() ||
       next.size() > PrefillChunk()) {
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+      std::fprintf(stderr, "[pf] skip plep=%d pfp=%d empty=%d big=%d\n",
+                   ple_pending_ ? 1 : 0, prefetch_.pending ? 1 : 0,
+                   next.empty() ? 1 : 0,
+                   next.size() > PrefillChunk() ? 1 : 0);
+      std::fflush(stderr);
+    }
     return;
   }
   // Hashed from the history after this batch, which PleFetch already
@@ -2827,6 +2846,11 @@ void Executor::PrefetchPle(const Session& session,
   prefetch_.pending =
       ngram_->StartRead(rows, std::span<float>(prefetch_.rows.data(), count),
                         std::span(&owner, 1));
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    std::fprintf(stderr, "[pf] start ok=%d n=%zu\n",
+                 prefetch_.pending ? 1 : 0, next.size());
+    std::fflush(stderr);
+  }
 }
 
 void Executor::FinishPrefetch() const {
