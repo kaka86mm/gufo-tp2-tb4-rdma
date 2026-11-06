@@ -1315,12 +1315,30 @@ TextRunnerState& TpExecutor::StateFor(std::uint32_t id) {
     }
     states_.push_back(std::move(state));
     state_use_.push_back(instructions_);
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+      std::fprintf(stderr, "[st] grow id=%zu total=%zu instr=%llu\n", id,
+                   states_.size(),
+                   static_cast<unsigned long long>(instructions_));
+      std::fflush(stderr);
+    }
   }
   state_use_[id] = instructions_;
   return *states_[id];
 }
 
 void TpExecutor::RecycleIdleStates() {
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    std::size_t alive = 0;
+    for (const auto& st : states_) {
+      if (st != nullptr) {
+        ++alive;
+      }
+    }
+    std::fprintf(stderr, "[st] recycle-check total=%zu alive=%zu instr=%llu\n",
+                 states_.size(), alive,
+                 static_cast<unsigned long long>(instructions_));
+    std::fflush(stderr);
+  }
   // Rank 0's pool recycles its sessions; its mirror ids are monotonic and
   // never reused, so a state untouched for many instructions is dead. Free
   // it (its adapter slot and model session follow) before the array leaks
