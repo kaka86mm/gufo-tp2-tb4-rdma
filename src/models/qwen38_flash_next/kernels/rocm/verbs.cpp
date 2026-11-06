@@ -1453,11 +1453,11 @@ private:
       } else if (!device ||
                  hipStreamWaitEvent(copy_stream_, job.ready, 0) != hipSuccess ||
                  (job.bytes != 0 &&
-                  ConvertRowsF32ToF16(
-                      job.data,
-                      SendWindow(job.operation_id) + data_offset_,
-                      job.bytes / sizeof(float), copy_stream_),
-                  false) ||
+                  (ConvertRowsF32ToF16(
+                       job.data,
+                       SendWindow(job.operation_id) + data_offset_,
+                       job.bytes / sizeof(float), copy_stream_),
+                   true)) ||
                  hipStreamSynchronize(copy_stream_) != hipSuccess) {
         finished.error = "HIP overlapped staging failed";
       } else {
