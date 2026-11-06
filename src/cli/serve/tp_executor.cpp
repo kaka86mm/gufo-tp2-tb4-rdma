@@ -272,8 +272,7 @@ bool TpCacheAcknowledged(TpInstructionOp op) noexcept {
   return op == TpInstructionOp::kSnapshot || op == TpInstructionOp::kRestore ||
          op == TpInstructionOp::kReuse ||
          op == TpInstructionOp::kCancelPrepare ||
-         op == TpInstructionOp::kRestoreDisk ||
-         op == TpInstructionOp::kReconcile;
+         op == TpInstructionOp::kRestoreDisk;
 }
 
 void TpControlInstructionSink::Synchronize(std::uint64_t sequence,
@@ -867,17 +866,26 @@ std::unique_ptr<TextRunnerState> TpMirroredRunner::BindComponentState(
 
 void TpMirroredRunner::ReconcileComponentState(TextRunnerState& state,
                                                std::size_t position) const {
-  const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
   auto& mirrored = Mirrored(state);
-  const auto sequence =
-      CacheCall(mirrored.id(),
-                {.op = TpInstructionOp::kReconcile,
-                 .state = mirrored.id(),
-                 .count = ToWire(position, "reconcile position")},
-                [&] { inner_->ReconcileComponentState(mirrored.inner(), position); });
-  Record(sequence, [&](TpExecutionDigest& digest) {
-    digest.Add(inner_->CheckpointPosition(mirrored.inner()));
-  });
+  const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (!failure_.empty()) {
+      throw std::runtime_error("TP instruction channel failed: " + failure_);
+    }
+    // Channel-wide and ordered: the rewind lands on rank 1 before any
+    // instruction that could name the state again.
+    const TpInstruction instruction{.op = TpInstructionOp::kReconcile,
+                                    .state = mirrored.id(),
+                                    .count = ToWire(position,
+                                                    "reconcile position")};
+    std::string error;
+    if (!sink_->Send(0, instruction, nullptr, &error)) {
+      failure_ = error.empty() ? "send failed" : error;
+      throw std::runtime_error("TP instruction send failed: " + failure_);
+    }
+  }
+  inner_->ReconcileComponentState(mirrored.inner(), position);
 }
 
 std::optional<TextDecodeSelection> TpMirroredRunner::PreviewFirstToken(
@@ -1560,6 +1568,9 @@ bool TpExecutor::ExecuteIdle(const TpInstruction& instruction,
       // The mirrored disk store is gone with the classic cache.
     } else if (instruction.op == TpInstructionOp::kPromptContext) {
       runner_->SetPromptContext(StateFor(instruction.state), nullptr);
+    } else if (instruction.op == TpInstructionOp::kReconcile) {
+      runner_->ReconcileComponentState(StateFor(instruction.state),
+                                       instruction.count);
     } else {
       StateFor(instruction.state).Invalidate();
       if (instruction.state >= initial_state_count_ &&
@@ -1635,11 +1646,6 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
       case TpInstructionOp::kRestoreDisk:
         choice.reset();
         throw std::logic_error("rank 1 has no disk cache");
-      case TpInstructionOp::kReconcile:
-        choice.reset();
-        runner_->ReconcileComponentState(state, instruction.count);
-        request.digest.Add(runner_->CheckpointPosition(state));
-        break;
       case TpInstructionOp::kPromptContext:
         DigestTpContext(request.digest, request.images);
         runner_->SetPromptContext(state, request.images);
