@@ -1361,6 +1361,14 @@ void TpExecutor::RecycleIdleStates() {
       continue;
     }
     if (!StateLeased(id)) {
+      if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[st] freed id=%zu dead=%d last_use=%llu instr=%llu\n",
+                     id, dead ? 1 : 0,
+                     static_cast<unsigned long long>(state_use_[id]),
+                     static_cast<unsigned long long>(instructions_));
+        std::fflush(stderr);
+      }
       states_[id].reset();
     }
   }
@@ -1408,7 +1416,7 @@ void TpExecutor::DropSnapshot(std::uint64_t) {
 bool TpExecutor::Execute(const TpControlCommand& command,
                          const Respond& respond, std::string* error) {
   ++instructions_;
-  if ((instructions_ & 0x3FF) == 0) {
+  if ((instructions_ & 0x3F) == 0) {
     RecycleIdleStates();
   }
 
