@@ -1274,6 +1274,7 @@ TpExecutor::TpExecutor(std::shared_ptr<TextModelRunner> runner,
   if (runner_ == nullptr || state_count == 0) {
     throw std::invalid_argument("TP executor needs a runner and a state");
   }
+  initial_state_count_ = state_count;
   states_.reserve(state_count);
   for (std::size_t index = 0; index < state_count; ++index) {
     auto state = runner_->CreateState();
@@ -1282,6 +1283,7 @@ TpExecutor::TpExecutor(std::shared_ptr<TextModelRunner> runner,
     }
     states_.push_back(std::move(state));
     state_use_.push_back(0);
+    state_dead_.push_back(false);
   }
   // Rank 0's scheduler prepares its vocabulary before serving; rank 1 would
   // otherwise build its own inside the first constrained request, while rank 0
@@ -1315,6 +1317,7 @@ TextRunnerState& TpExecutor::StateFor(std::uint32_t id) {
     }
     states_.push_back(std::move(state));
     state_use_.push_back(instructions_);
+    state_dead_.push_back(false);
     if (std::getenv("GUFO_TP_TRACE") != nullptr) {
       std::fprintf(stderr, "[st] grow id=%zu total=%zu instr=%llu\n", id,
                    states_.size(),
@@ -1339,36 +1342,38 @@ void TpExecutor::RecycleIdleStates() {
                  static_cast<unsigned long long>(instructions_));
     std::fflush(stderr);
   }
-  // Rank 0's pool recycles its sessions; its mirror ids are monotonic and
-  // never reused, so a state untouched for many instructions is dead. Free
-  // it (its adapter slot and model session follow) before the array leaks
-  // GPU memory conversation by conversation. Keep a recent margin: an idle
-  // but live state is one a very slow request still holds, and releasing it
-  // would only fail that request loudly if rank 0 ever named it again.
-  constexpr std::uint64_t kIdleInstructions = 2048;
-  constexpr std::size_t kKeepRecent = 8;
-  if (states_.size() <= kKeepRecent) {
-    return;
-  }
+  // Rank 0's pool announces retirement with kInvalidate; ids are monotonic
+  // and never reused, so a dead flag is permanent. Free those as soon as no
+  // open request names the state. The idle margin only backstops states
+  // that somehow retire without an invalidate; it must stay short because
+  // the margin itself is the steady-state leak (one state per margin's
+  // worth of instructions). The pool's initial states are re-prepared with
+  // kPromptContext and are never freed here.
+  constexpr std::uint64_t kIdleInstructions = 512;
   const std::uint64_t cutoff =
       instructions_ > kIdleInstructions ? instructions_ - kIdleInstructions : 0;
-  for (std::size_t id = 0; id + kKeepRecent < states_.size(); ++id) {
-    if (states_[id] != nullptr && state_use_[id] < cutoff) {
-      // An open request may still name this state: only retire states that
-      // no open request leases (requests hold their states to the end).
-      bool leased = false;
-      for (const auto& [sequence, request] : requests_) {
-        (void)sequence;
-        if (id < request->named.size() && request->named[id]) {
-          leased = true;
-          break;
-        }
-      }
-      if (!leased) {
-        states_[id].reset();
-      }
+  for (std::size_t id = initial_state_count_; id < states_.size(); ++id) {
+    if (states_[id] == nullptr) {
+      continue;
+    }
+    const bool dead = id < state_dead_.size() && state_dead_[id];
+    if (!dead && state_use_[id] >= cutoff) {
+      continue;
+    }
+    if (!StateLeased(id)) {
+      states_[id].reset();
     }
   }
+}
+
+bool TpExecutor::StateLeased(std::size_t id) const {
+  for (const auto& [sequence, request] : requests_) {
+    (void)sequence;
+    if (id < request->named.size() && request->named[id]) {
+      return true;
+    }
+  }
+  return false;
 }
 
 TpExecutor::OwnChoice TpExecutor::ChooseGreedy(TextRunnerState& state) const {
@@ -1522,6 +1527,19 @@ bool TpExecutor::ExecuteIdle(const TpInstruction& instruction,
       runner_->SetPromptContext(StateFor(instruction.state), nullptr);
     } else {
       StateFor(instruction.state).Invalidate();
+      if (instruction.state >= initial_state_count_ &&
+          instruction.state < states_.size()) {
+        state_dead_[instruction.state] = true;
+        if (!StateLeased(instruction.state)) {
+          if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+            std::fprintf(stderr, "[st] invalidated+freed id=%u instr=%llu\n",
+                         instruction.state,
+                         static_cast<unsigned long long>(instructions_));
+            std::fflush(stderr);
+          }
+          states_[instruction.state].reset();
+        }
+      }
     }
   } catch (const std::exception& exception) {
     SetError(error, exception.what());

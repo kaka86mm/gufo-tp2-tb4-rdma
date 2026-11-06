@@ -351,6 +351,9 @@ private:
                                std::string* error);
   [[nodiscard]] TextRunnerState& StateFor(std::uint32_t id);
   void RecycleIdleStates();
+  /// True while any open request named this state; freed states must outlive
+  /// every instruction that can still reference them.
+  [[nodiscard]] bool StateLeased(std::size_t id) const;
   /// Rank 1's own greedy choice from the state's current logits.
   [[nodiscard]] OwnChoice ChooseGreedy(TextRunnerState& state) const;
   /// Binds or releases a forward's collective scope; false when the pair's
@@ -363,6 +366,11 @@ private:
   std::vector<std::unique_ptr<TextRunnerState>> states_;
   /// Last instruction index that touched each state, for idle recycling.
   std::vector<std::uint64_t> state_use_;
+  /// Rank 0 announced retirement (kInvalidate) for these states; ids are
+  /// monotonic, so the flag is permanent.
+  std::vector<bool> state_dead_;
+  /// The pool's own initial states, re-prepared via kPromptContext.
+  std::size_t initial_state_count_{0};
   /// Instruction counter for idle recycling bookkeeping.
   std::uint64_t instructions_{0};
   std::unordered_map<std::uint64_t, std::unique_ptr<Request>> requests_;
