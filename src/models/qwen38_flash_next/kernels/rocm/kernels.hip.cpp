@@ -9405,6 +9405,48 @@ void WaitValue(const std::uint64_t* flag, std::uint64_t value,
                      ticks, timed_out);
 }
 
+__global__ void ConvertF32ToF16Kernel(const float* __restrict__ in,
+                                      __half* __restrict__ out,
+                                      std::size_t n) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) {
+    out[i] = __float2half(in[i]);
+  }
+}
+
+void ConvertRowsF32ToF16(const float* in, __half* out, std::size_t count,
+                         hipStream_t stream) {
+  if (count == 0) {
+    return;
+  }
+  const unsigned blocks =
+      static_cast<unsigned>((count + 255) / 256);
+  hipLaunchKernelGGL(ConvertF32ToF16Kernel, dim3(blocks), dim3(256), 0,
+                     stream, in, out, count);
+}
+
+__global__ void AddF16PairKernel(const __half* __restrict__ a,
+                                 const __half* __restrict__ b,
+                                 float* __restrict__ out, std::size_t n) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) {
+    out[i] = __half2float(a[i]) + __half2float(b[i]);
+  }
+}
+
+void AddF16PairRows(const __half* a, const __half* b, float* out,
+                    std::size_t count, hipStream_t stream) {
+  if (count == 0) {
+    return;
+  }
+  const unsigned blocks =
+      static_cast<unsigned>((count + 255) / 256);
+  hipLaunchKernelGGL(AddF16PairKernel, dim3(blocks), dim3(256), 0, stream, a,
+                     b, out, count);
+}
+
 void AddRowsBroadcast(const float* embedding, float* residual,
                       std::uint32_t n_tokens, std::uint32_t hidden,
                       std::uint32_t streams, hipStream_t stream) {

@@ -651,6 +651,12 @@ void MtpHidden(const float* base, const float* alt, const std::int32_t* row,
 /// `hidden`-float addend row over the row's `streams` consecutive slices.
 /// MTP adds its projected embedding to every hidden branch this way; the TP
 /// all-reduce adds the peer's partial with `streams` = 1.
+/// Quantizes `count` floats to halves (the partial-exchange staging).
+void ConvertRowsF32ToF16(const float* in, __half* out, std::size_t count,
+                         hipStream_t stream);
+/// out = float(a) + float(b) over `count` halves; the symmetric partial sum.
+void AddF16PairRows(const __half* a, const __half* b, float* out,
+                    std::size_t count, hipStream_t stream);
 void AddRowsBroadcast(const float* addend, float* residual,
                       std::uint32_t n_tokens, std::uint32_t hidden,
                       std::uint32_t streams, hipStream_t stream);

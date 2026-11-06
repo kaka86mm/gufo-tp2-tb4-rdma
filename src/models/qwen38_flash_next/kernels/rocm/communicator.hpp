@@ -48,15 +48,22 @@ public:
   /// The overlapped form of `ExchangePartial`, so the GPU computes other rows
   /// while a partial is in flight. `StartPartial` queues the exchange of this
   /// rank's partial, complete once `stream` reaches this point, and returns at
-  /// once. `FinishPartial` waits for the oldest queued exchange, which must
-  /// carry `bytes`, and returns the peer's partial. Both forms share one
+  /// once. The partial crosses the wire as halves: staging quantizes it, and
+  /// both ranks sum the same two F16 arrays, so the reduce stays bit-identical
+  /// between them. `FinishPartial` waits for the oldest queued exchange,
+  /// which must carry `bytes` of F32 partial, and returns both halves: the
+  /// peer's and this rank's own staged quantization. Both forms share one
   /// sequence and the rule above; finish every queued exchange before the next
   /// `ExchangePartial` or `EndOperation`.
+  struct PartialPair {
+    const __half* peer{nullptr};
+    const __half* local{nullptr};
+  };
   [[nodiscard]] virtual bool StartPartial(const float* data, std::size_t bytes,
                                           hipStream_t stream,
                                           std::string* error) = 0;
-  [[nodiscard]] virtual const float* FinishPartial(std::size_t bytes,
-                                                   std::string* error) = 0;
+  [[nodiscard]] virtual PartialPair FinishPartial(std::size_t bytes,
+                                                  std::string* error) = 0;
 
   /// The GPU's half of a queued exchange (QueuePartial). Queue on the stream,
   /// in this order: copy the partial to `send` and then publish `value` in

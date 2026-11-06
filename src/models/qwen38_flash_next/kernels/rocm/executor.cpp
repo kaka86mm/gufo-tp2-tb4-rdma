@@ -3351,14 +3351,16 @@ Executor::SplitReduce Executor::TwoRankSplitReduce(
   reduce.finish = [communicator = std::move(communicator), hidden](
                       float* data, std::size_t bytes, hipStream_t stream,
                       std::string* error) {
-    const float* peer = communicator->FinishPartial(bytes, error);
-    if (peer == nullptr) {
+    const auto partials = communicator->FinishPartial(bytes, error);
+    if (partials.peer == nullptr || partials.local == nullptr) {
       return false;
     }
     const std::size_t rows = bytes / (sizeof(float) * hidden);
     if (rows != 0) {
-      AddRowsBroadcast(peer, data, static_cast<std::uint32_t>(rows), hidden, 1,
-                       stream);
+      // Both ranks sum the same staged halves, so the reduce stays
+      // bit-identical while the wire carries half the bytes.
+      AddF16PairRows(partials.local, partials.peer, data, rows * hidden,
+                     stream);
     }
     return true;
   };

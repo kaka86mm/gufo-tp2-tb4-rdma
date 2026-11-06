@@ -922,13 +922,13 @@ public:
     return true;
   }
 
-  [[nodiscard]] const float* FinishPartial(std::size_t bytes,
+  [[nodiscard]] PartialPair FinishPartial(std::size_t bytes,
                                            std::string* error) override {
     {
       std::lock_guard lock(mutex_);
       if (started_ == 0) {
         Poison(error, "no overlapped verbs exchange is in flight");
-        return nullptr;
+        return {};
       }
     }
     Finished finished;
@@ -947,7 +947,8 @@ public:
     if (finished.peer == nullptr) {
       Poison(error, finished.error);
     }
-    return finished.peer;
+    return {.peer = reinterpret_cast<const __half*>(finished.peer),
+            .local = finished.local};
   }
 
   [[nodiscard]] bool QueuePartial(std::size_t bytes, QueuedPartial* partial,
@@ -1022,6 +1023,7 @@ private:
   };
   struct Finished {
     const float* peer{nullptr};
+    const __half* local{nullptr};  ///< this rank's staged F16 partial
     std::size_t bytes{0};
     std::string error;
   };
@@ -1447,9 +1449,12 @@ private:
       } else if (!device ||
                  hipStreamWaitEvent(copy_stream_, job.ready, 0) != hipSuccess ||
                  (job.bytes != 0 &&
-                  hipMemcpyAsync(SendWindow(job.operation_id) + data_offset_,
-                                 job.data, job.bytes, StagingKind(),
-                                 copy_stream_) != hipSuccess) ||
+                  ConvertRowsF32ToF16(
+                      job.data,
+                      reinterpret_cast<__half*>(
+                          SendWindow(job.operation_id) + data_offset_),
+                      job.bytes / sizeof(float), copy_stream_),
+                  false) ||
                  hipStreamSynchronize(copy_stream_) != hipSuccess) {
         finished.error = "HIP overlapped staging failed";
       } else {
@@ -1461,8 +1466,11 @@ private:
         };
         static std::uint64_t vt_peer = 0, vt_jobs = 0;
         const auto vt_t0 = vt_now();
-        finished.peer = Transfer(job.scope_id, job.operation_id, job.bytes,
-                                 &finished.error);
+        finished.local = reinterpret_cast<const __half*>(
+            SendWindow(job.operation_id) + data_offset_);
+        finished.peer =
+            Transfer(job.scope_id, job.operation_id, job.bytes / 2,
+                     &finished.error);
         if (vt) {
           vt_peer += static_cast<std::uint64_t>(vt_now() - vt_t0);
           if (++vt_jobs % 192 == 0) {
