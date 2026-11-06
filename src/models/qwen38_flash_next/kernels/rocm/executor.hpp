@@ -553,6 +553,11 @@ public:
   /// Tokens one prefill Forward takes: two trunk batches with a split
   /// reduce, else one.
   [[nodiscard]] std::uint32_t PrefillChunk() const noexcept {
+    // GUFO_NO_PAIR also halves the chunk: a single 8192 trunk batch exceeds
+    // the TP exchange window, so the plain path needs max_batch chunks.
+    if (std::getenv("GUFO_NO_PAIR") != nullptr) {
+      return options_.max_batch;
+    }
     return options_.split_reduce.start ? 2 * options_.max_batch
                                        : options_.max_batch;
   }
