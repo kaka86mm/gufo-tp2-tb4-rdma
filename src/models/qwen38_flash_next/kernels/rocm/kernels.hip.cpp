@@ -9415,8 +9415,9 @@ __global__ void ConvertF32ToF16Kernel(const float* __restrict__ in,
   }
 }
 
-void ConvertRowsF32ToF16(const float* in, __half* out, std::size_t count,
+void ConvertRowsF32ToF16(const float* in, void* out_bytes, std::size_t count,
                          hipStream_t stream) {
+  auto* out = static_cast<__half*>(out_bytes);
   if (count == 0) {
     return;
   }
@@ -9436,8 +9437,10 @@ __global__ void AddF16PairKernel(const __half* __restrict__ a,
   }
 }
 
-void AddF16PairRows(const __half* a, const __half* b, float* out,
+void AddF16PairRows(const void* a_bytes, const void* b_bytes, float* out,
                     std::size_t count, hipStream_t stream) {
+  const auto* a = static_cast<const __half*>(a_bytes);
+  const auto* b = static_cast<const __half*>(b_bytes);
   if (count == 0) {
     return;
   }

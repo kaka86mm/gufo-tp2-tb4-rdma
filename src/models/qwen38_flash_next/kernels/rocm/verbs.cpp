@@ -1450,8 +1450,7 @@ private:
                  (job.bytes != 0 &&
                   ConvertRowsF32ToF16(
                       job.data,
-                      reinterpret_cast<__half*>(
-                          SendWindow(job.operation_id) + data_offset_),
+                      SendWindow(job.operation_id) + data_offset_,
                       job.bytes / sizeof(float), copy_stream_),
                   false) ||
                  hipStreamSynchronize(copy_stream_) != hipSuccess) {

@@ -3359,9 +3359,8 @@ Executor::SplitReduce Executor::TwoRankSplitReduce(
     if (rows != 0) {
       // Both ranks sum the same staged halves, so the reduce stays
       // bit-identical while the wire carries half the bytes.
-      AddF16PairRows(static_cast<const __half*>(partials.local),
-                     static_cast<const __half*>(partials.peer), data,
-                     rows * hidden, stream);
+      AddF16PairRows(partials.local, partials.peer, data, rows * hidden,
+                     stream);
     }
     return true;
   };
