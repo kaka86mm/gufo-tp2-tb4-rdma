@@ -1740,7 +1740,7 @@ int RunServe(std::span<const char* const> args) {
       // SIGINT or SIGTERM, also while loading. As a container's PID 1 it
       // would otherwise ignore them.
       struct sigaction stop{};
-      stop.sa_handler = [](int) { std::_Exit(0); };
+      stop.sa_handler = [](int signal) { std::_Exit(128 + signal); };
       ::sigemptyset(&stop.sa_mask);
       (void)::sigaction(SIGTERM, &stop, nullptr);
       (void)::sigaction(SIGINT, &stop, nullptr);
