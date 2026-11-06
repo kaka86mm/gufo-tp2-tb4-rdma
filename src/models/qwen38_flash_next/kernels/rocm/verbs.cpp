@@ -1452,16 +1452,23 @@ private:
           finished.peer = Transfer(job.scope_id, job.operation_id, job.bytes,
                                    &finished.error);
         }
-      } else if (!device ||
-                 hipStreamWaitEvent(copy_stream_, job.ready, 0) != hipSuccess ||
-                 (job.bytes != 0 &&
-                  (ConvertRowsF32ToF16(
-                       job.data,
-                       SendWindow(job.operation_id) + data_offset_,
-                       job.bytes / sizeof(float), copy_stream_),
-                   true)) ||
-                 hipStreamSynchronize(copy_stream_) != hipSuccess) {
-        finished.error = std::string("HIP overlapped staging failed: ") +
+      } else if (!device) {
+        finished.error = "HIP overlapped staging failed: no device";
+      } else if (hipStreamWaitEvent(copy_stream_, job.ready, 0) !=
+                 hipSuccess) {
+        finished.error = "HIP overlapped staging failed: wait-event " +
+                         std::to_string(static_cast<int>(hipGetLastError()));
+      } else if (job.bytes != 0) {
+        ConvertRowsF32ToF16(job.data,
+                            SendWindow(job.operation_id) + data_offset_,
+                            job.bytes / sizeof(float), copy_stream_);
+        const auto staged = hipStreamSynchronize(copy_stream_);
+        if (staged != hipSuccess) {
+          finished.error = "HIP overlapped staging failed: sync " +
+                           std::to_string(static_cast<int>(staged));
+        }
+      } else if (hipStreamSynchronize(copy_stream_) != hipSuccess) {
+        finished.error = "HIP overlapped staging failed: empty sync " +
                          std::to_string(static_cast<int>(hipGetLastError()));
       } else {
         // [vt] the transfer half of a partial's latency (wire plus peer);
