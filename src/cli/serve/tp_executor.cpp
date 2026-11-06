@@ -1235,7 +1235,7 @@ struct TpExecutor::Request {
         stop_at_eos(begin.stop_at_eos),
         sampler(sampling, prompt),
         own(states),
-        named(states, true) {}
+        named(states, false) {}
 
   void Note(std::string message) {
     if (failure.empty()) {
