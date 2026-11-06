@@ -92,7 +92,16 @@ enum class TpInstructionOp : std::uint8_t {
   /// one; zero lets each member use its own `drafts`). Sent with
   /// sequence 0; each member names its request and carries its budget and
   /// draw state, like `kDecode`.
+  /// `DecodeBatch` over `batch`: one multi-token cycle for every member, with
+  /// the batch's draft count from `batch_drafts` (the plan rank 0 chose, plus
+  /// one; zero lets each member use its own `drafts`). Sent with sequence 0;
+  /// each member names its request and carries its budget and draw state,
+  /// like kDecode.
   kDecodeBatch = 15,
+  /// `ReconcileComponentState(state, count)`: rank 0's pool rewinds the
+  /// state to the reused prefix position `count` before a kReuse; rank 1
+  /// replays the same rewind so both halves sit at the prefix.
+  kReconcile = 16,
 };
 
 /// One member of a batched instruction: a request, the state it leases, and

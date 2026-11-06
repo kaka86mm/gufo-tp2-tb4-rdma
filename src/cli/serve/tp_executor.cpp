@@ -56,6 +56,8 @@ void SetError(std::string* error, std::string message) {
       return "disk restore";
     case TpInstructionOp::kDecodeBatch:
       return "batched decode";
+    case TpInstructionOp::kReconcile:
+      return "reconcile";
     case TpInstructionOp::kEnd:
       return "end";
     case TpInstructionOp::kNone:
@@ -270,7 +272,8 @@ bool TpCacheAcknowledged(TpInstructionOp op) noexcept {
   return op == TpInstructionOp::kSnapshot || op == TpInstructionOp::kRestore ||
          op == TpInstructionOp::kReuse ||
          op == TpInstructionOp::kCancelPrepare ||
-         op == TpInstructionOp::kRestoreDisk;
+         op == TpInstructionOp::kRestoreDisk ||
+         op == TpInstructionOp::kReconcile;
 }
 
 void TpControlInstructionSink::Synchronize(std::uint64_t sequence,
@@ -859,7 +862,17 @@ std::unique_ptr<TextRunnerState> TpMirroredRunner::BindComponentState(
 
 void TpMirroredRunner::ReconcileComponentState(TextRunnerState& state,
                                                std::size_t position) const {
-  inner_->ReconcileComponentState(Mirrored(state).inner(), position);
+  const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
+  auto& mirrored = Mirrored(state);
+  const auto sequence =
+      CacheCall(mirrored.id(),
+                {.op = TpInstructionOp::kReconcile,
+                 .state = mirrored.id(),
+                 .count = ToWire(position, "reconcile position")},
+                [&] { inner_->ReconcileComponentState(mirrored.inner(), position); });
+  Record(sequence, [&](TpExecutionDigest& digest) {
+    digest.Add(inner_->CheckpointPosition(mirrored.inner()));
+  });
 }
 
 std::optional<TextDecodeSelection> TpMirroredRunner::PreviewFirstToken(
@@ -1617,6 +1630,11 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
       case TpInstructionOp::kRestoreDisk:
         choice.reset();
         throw std::logic_error("rank 1 has no disk cache");
+      case TpInstructionOp::kReconcile:
+        choice.reset();
+        runner_->ReconcileComponentState(state, instruction.count);
+        request.digest.Add(runner_->CheckpointPosition(state));
+        break;
       case TpInstructionOp::kPromptContext:
         DigestTpContext(request.digest, request.images);
         runner_->SetPromptContext(state, request.images);
