@@ -3779,19 +3779,26 @@ __global__ void AddRowsBroadcastKernel(const float* addend, float* residual,
 // the last block to finish publishes `value`, so the host that reads it also
 // sees the whole partial.
 __global__ void StagePartialKernel(const float* __restrict__ partial,
-                                   float* __restrict__ send, std::size_t count,
+                                   void* __restrict__ send_bytes,
+                                   std::size_t count,
                                    std::uint32_t* arrivals,
                                    std::uint64_t* ready, std::uint64_t value) {
+  // Staged as halves: the wire carries half the bytes, and both ranks sum
+  // the same two quantized partials.
+  __half* __restrict__ send = static_cast<__half*>(send_bytes);
   const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
   const std::size_t first =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const std::size_t vectors = count / 4;
   for (std::size_t i = first; i < vectors; i += stride) {
-    reinterpret_cast<float4*>(send)[i] =
-        reinterpret_cast<const float4*>(partial)[i];
+    const float4 v = reinterpret_cast<const float4*>(partial)[i];
+    __half2* __restrict__ out =
+        reinterpret_cast<__half2*>(send) + i * 2;
+    out[0] = __floats2half2_rn(v.x, v.y);
+    out[1] = __floats2half2_rn(v.z, v.w);
   }
   for (std::size_t i = vectors * 4 + first; i < count; i += stride) {
-    send[i] = partial[i];
+    send[i] = __float2half(partial[i]);
   }
   __threadfence_system();
   __syncthreads();
@@ -10228,7 +10235,7 @@ void MtpTopCandidates(const float* logits, std::uint32_t* ids,
                                       stream);
 }
 
-void StagePartial(const float* partial, float* send, std::size_t count,
+void StagePartial(const float* partial, void* send, std::size_t count,
                   std::uint32_t* arrivals, std::uint64_t* ready,
                   std::uint64_t value, hipStream_t stream) {
   const std::size_t threads = std::max<std::size_t>(1, count / 4);
