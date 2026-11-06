@@ -1452,11 +1452,9 @@ private:
       if (!poisoned.empty()) {
         finished.error = std::move(poisoned);
       } else if (job.queued) {
-          if (WaitReady(job.operation_id + 1, &finished.error)) {
-          // The staged partial is halves; the wire carries half the bytes.
-          finished.peer =
-              Transfer(job.scope_id, job.operation_id, job.bytes / 2,
-                       &finished.error);
+        if (WaitReady(job.operation_id + 1, &finished.error)) {
+          finished.peer = Transfer(job.scope_id, job.operation_id, job.bytes,
+                                   &finished.error);
         }
       } else {
         // Staging: wait for the partial, quantize it into the send window.
