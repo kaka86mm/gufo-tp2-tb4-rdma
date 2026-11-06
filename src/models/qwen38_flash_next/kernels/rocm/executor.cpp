@@ -4615,7 +4615,7 @@ bool Executor::ForwardPair(Session& session,
     inject_parts_ = lane.inject_parts;
   };
   const bool part_time = std::getenv("GUFO_TIME_TRACE") != nullptr;
-  std::uint64_t t_mixer = 0, t_moe = 0, t_sum = 0;
+  std::uint64_t t_mixer = 0, t_moe = 0, t_start = 0, t_finish = 0;
   const auto tick = [&] {
     return std::chrono::steady_clock::now().time_since_epoch().count();
   };
@@ -4647,7 +4647,7 @@ bool Executor::ForwardPair(Session& session,
                                        error_msg)) {
         return false;
       }
-      if (part_time) t_sum += tick() - t_sum0;
+      if (part_time) t_start += tick() - t_sum0;
       in_flight[flying++] = &lane;
       lane.inject_parts = inject_parts_;
       lane.pending = true;
@@ -4711,7 +4711,7 @@ bool Executor::ForwardPair(Session& session,
       enter(lane);
       const auto t_fin = tick();
       const bool fin_ok = finish(lane);
-      if (part_time) t_sum += tick() - t_fin;
+      if (part_time) t_finish += tick() - t_fin;
       if (!fin_ok || !advance(lane)) {
         return false;
       }
@@ -4719,10 +4719,11 @@ bool Executor::ForwardPair(Session& session,
   }
   if (part_time) {
     std::fprintf(stderr,
-                 "[ppt] mixer_us=%llu moe_us=%llu sum_us=%llu\n",
+                 "[ppt] mixer_us=%llu moe_us=%llu start_us=%llu finish_us=%llu\n",
                  static_cast<unsigned long long>(t_mixer / 1000),
                  static_cast<unsigned long long>(t_moe / 1000),
-                 static_cast<unsigned long long>(t_sum / 1000));
+                 static_cast<unsigned long long>(t_start / 1000),
+                 static_cast<unsigned long long>(t_finish / 1000));
     std::fflush(stderr);
   }
 
