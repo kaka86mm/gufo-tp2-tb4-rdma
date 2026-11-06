@@ -155,6 +155,11 @@ bool NgramTable::ReadCached(std::uint32_t row, float* dst) {
 bool NgramTable::ReadOne(std::uint32_t row, float* dst,
                          std::vector<std::uint8_t>& buf, NgramCounters* owner) {
   if (row >= rows_) {
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+      std::fprintf(stderr, "[ngr] row-out-of-range row=%u rows=%llu\n", row,
+                   static_cast<unsigned long long>(rows_));
+      std::fflush(stderr);
+    }
     return false;
   }
   if (ReadCached(row, dst)) {
@@ -194,6 +199,14 @@ bool NgramTable::ReadOne(std::uint32_t row, float* dst,
       continue;
     }
     if (n == 0) {
+      if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[ngr] read-fail row=%u begin=%llu len=%zu needed=%zu "
+                     "ec=%d msg=%s\n",
+                     row, static_cast<unsigned long long>(begin), length,
+                     needed, ec.value(), ec.message().c_str());
+        std::fflush(stderr);
+      }
       return false;
     }
     got += n;
