@@ -3246,7 +3246,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       return std::size_t{first + row} * heads.AttentionQDim();
     };
     return (dense_rows == rows ||
-            WmmaCausalAttention(
+            (model_->tp_world_size() > 1 ? WmmaCausalAttentionTP : WmmaCausalAttention)(
                 s_.q + at(dense_rows), s_.attn_gate + at(dense_rows), s.k_cache,
                 s.v_cache,
                 mask ? mask + std::size_t{first + dense_rows} * mask_words_
@@ -3255,7 +3255,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                 pos + dense_rows, heads.attn, heads.attn_kv, heads.attn_dim,
                 c.compress_ratio, stream_, last)) &&
            (dense_rows == 0 || (last && dense_rows != rows) ||
-            WmmaCausalAttention(s_.q + at(0), s_.attn_gate + at(0), s.k_cache,
+            (model_->tp_world_size() > 1 ? WmmaCausalAttentionTP : WmmaCausalAttention)(s_.q + at(0), s_.attn_gate + at(0), s.k_cache,
                                 s.v_cache, nullptr, mask_words_, s_.ctx + at(0),
                                 dense_rows, pos, heads.attn, heads.attn_kv,
                                 heads.attn_dim, c.compress_ratio, stream_,
