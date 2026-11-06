@@ -1453,8 +1453,26 @@ private:
                  hipStreamSynchronize(copy_stream_) != hipSuccess) {
         finished.error = "HIP overlapped staging failed";
       } else {
+        // [vt] the transfer half of a partial's latency (wire plus peer);
+        // the staging half is the [ppt] finish total minus this.
+        const bool vt = std::getenv("GUFO_TIME_TRACE") != nullptr;
+        const auto vt_now = [] {
+          return std::chrono::steady_clock::now().time_since_epoch().count();
+        };
+        static std::uint64_t vt_peer = 0, vt_jobs = 0;
+        const auto vt_t0 = vt_now();
         finished.peer = Transfer(job.scope_id, job.operation_id, job.bytes,
                                  &finished.error);
+        if (vt) {
+          vt_peer += static_cast<std::uint64_t>(vt_now() - vt_t0);
+          if (++vt_jobs % 192 == 0) {
+            std::fprintf(stderr, "[vt] jobs=%llu peer_us=%llu\n",
+                         static_cast<unsigned long long>(vt_jobs),
+                         static_cast<unsigned long long>(vt_peer / 1000000));
+            std::fflush(stderr);
+            vt_peer = 0;
+          }
+        }
       }
       const bool failed = finished.peer == nullptr;
       if (failed || job.queued) {
