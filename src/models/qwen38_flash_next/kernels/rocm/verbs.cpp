@@ -1456,38 +1456,40 @@ private:
           finished.peer = Transfer(job.scope_id, job.operation_id, job.bytes,
                                    &finished.error);
         }
-      } else if (!device) {
-        finished.error = "HIP overlapped staging failed: no device";
-        std::fprintf(stderr, "[stag] no-device job bytes=%zu op=%llu\n",
-                     job.bytes,
-                     static_cast<unsigned long long>(job.operation_id));
-        std::fflush(stderr);
-      } else if (hipStreamWaitEvent(copy_stream_, job.ready, 0) !=
-                 hipSuccess) {
-        finished.error = "HIP overlapped staging failed: wait-event " +
-                         std::to_string(static_cast<int>(hipGetLastError()));
-        std::fprintf(stderr, "[stag] wait-event=%d op=%llu\n",
-                     static_cast<int>(hipGetLastError()),
-                     static_cast<unsigned long long>(job.operation_id));
-        std::fflush(stderr);
-      } else if (job.bytes != 0) {
-        ConvertRowsF32ToF16(job.data,
-                            SendWindow(job.operation_id) + data_offset_,
-                            job.bytes / sizeof(float), copy_stream_);
-        const auto staged = hipStreamSynchronize(copy_stream_);
-        if (staged != hipSuccess) {
-          finished.error = "HIP overlapped staging failed: sync " +
-                           std::to_string(static_cast<int>(staged));
-          std::fprintf(stderr, "[stag] sync=%d bytes=%zu elems=%zu op=%llu\n",
-                       static_cast<int>(staged), job.bytes,
-                       job.bytes / sizeof(float),
-                       static_cast<unsigned long long>(job.operation_id));
-          std::fflush(stderr);
-        }
-      } else if (hipStreamSynchronize(copy_stream_) != hipSuccess) {
-        finished.error = "HIP overlapped staging failed: empty sync " +
-                         std::to_string(static_cast<int>(hipGetLastError()));
       } else {
+        // Staging: wait for the partial, quantize it into the send window.
+        bool staged = false;
+        if (!device) {
+          finished.error = "HIP overlapped staging failed: no device";
+        } else if (hipStreamWaitEvent(copy_stream_, job.ready, 0) !=
+                   hipSuccess) {
+          finished.error =
+              "HIP overlapped staging failed: wait-event " +
+              std::to_string(static_cast<int>(hipGetLastError()));
+        } else if (job.bytes != 0) {
+          ConvertRowsF32ToF16(job.data,
+                              SendWindow(job.operation_id) + data_offset_,
+                              job.bytes / sizeof(float), copy_stream_);
+          const auto ok = hipStreamSynchronize(copy_stream_);
+          if (ok != hipSuccess) {
+            finished.error = "HIP overlapped staging failed: sync " +
+                             std::to_string(static_cast<int>(ok));
+          } else {
+            staged = true;
+          }
+        } else if (hipStreamSynchronize(copy_stream_) != hipSuccess) {
+          finished.error =
+              "HIP overlapped staging failed: empty sync " +
+              std::to_string(static_cast<int>(hipGetLastError()));
+        } else {
+          staged = true;
+        }
+        if (staged) {
+          finished.local = SendWindow(job.operation_id) + data_offset_;
+          finished.peer =
+              Transfer(job.scope_id, job.operation_id, job.bytes / 2,
+                       &finished.error);
+        }
         // [vt] the transfer half of a partial's latency (wire plus peer);
         // the staging half is the [ppt] finish total minus this.
         const bool vt = std::getenv("GUFO_TIME_TRACE") != nullptr;
@@ -1496,11 +1498,6 @@ private:
         };
         static std::uint64_t vt_peer = 0, vt_jobs = 0;
         const auto vt_t0 = vt_now();
-        finished.local =
-            SendWindow(job.operation_id) + data_offset_;
-        finished.peer =
-            Transfer(job.scope_id, job.operation_id, job.bytes / 2,
-                     &finished.error);
         if (vt) {
           vt_peer += static_cast<std::uint64_t>(vt_now() - vt_t0);
           if (++vt_jobs % 192 == 0) {
