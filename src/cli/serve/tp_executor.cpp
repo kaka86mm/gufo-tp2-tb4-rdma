@@ -1323,7 +1323,7 @@ void TpExecutor::RecycleIdleStates() {
   // GPU memory conversation by conversation. Keep a recent margin: an idle
   // but live state is one a very slow request still holds, and releasing it
   // would only fail that request loudly if rank 0 ever named it again.
-  constexpr std::uint64_t kIdleInstructions = 100000;
+  constexpr std::uint64_t kIdleInstructions = 2048;
   constexpr std::size_t kKeepRecent = 8;
   if (states_.size() <= kKeepRecent) {
     return;
@@ -1381,7 +1381,7 @@ void TpExecutor::DropSnapshot(std::uint64_t) {
 bool TpExecutor::Execute(const TpControlCommand& command,
                          const Respond& respond, std::string* error) {
   ++instructions_;
-  if ((instructions_ & 0xFFFF) == 0) {
+  if ((instructions_ & 0x3FF) == 0) {
     RecycleIdleStates();
   }
 
