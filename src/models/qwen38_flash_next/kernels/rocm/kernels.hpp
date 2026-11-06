@@ -612,16 +612,7 @@ bool WmmaCausalAttentionTP(const float* q, const float* gate,
                          std::uint32_t start_pos, std::uint32_t heads,
                          std::uint32_t kv_heads, std::uint32_t d,
                          std::uint32_t ratio, hipStream_t stream,
-                         bool last_only = false);
-
-bool WmmaCausalAttentionTP(const float* q, const float* gate,
-                         const __half* k_cache, const __half* v_cache,
-                         const std::uint32_t* mask, std::uint32_t mask_words,
-                         float* out, std::uint32_t n_tokens,
-                         std::uint32_t start_pos, std::uint32_t heads,
-                         std::uint32_t kv_heads, std::uint32_t d,
-                         std::uint32_t ratio, hipStream_t stream,
-                         bool last_only = false);
+                         bool last_only);
 
 
 /// counts[e] = number of (token, slot) pairs routed to expert e.
