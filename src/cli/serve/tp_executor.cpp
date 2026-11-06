@@ -1349,7 +1349,7 @@ void TpExecutor::RecycleIdleStates() {
   // the margin itself is the steady-state leak (one state per margin's
   // worth of instructions). The pool's initial states are re-prepared with
   // kPromptContext and are never freed here.
-  constexpr std::uint64_t kIdleInstructions = 512;
+  constexpr std::uint64_t kIdleInstructions = 256;
   const std::uint64_t cutoff =
       instructions_ > kIdleInstructions ? instructions_ - kIdleInstructions : 0;
   for (std::size_t id = initial_state_count_; id < states_.size(); ++id) {
