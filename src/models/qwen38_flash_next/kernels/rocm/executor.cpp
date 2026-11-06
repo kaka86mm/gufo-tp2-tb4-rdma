@@ -2866,8 +2866,16 @@ bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
                    std::span<PrefillCheckpoint* const> checkpoints,
                    std::uint32_t emb_row) const {
   const Config& c = config();
+  const auto t_ple0 = std::chrono::steady_clock::now().time_since_epoch().count();
   if (!embeddings_ready && emb_row == 0 && !WaitPle(error_msg)) {
     return false;
+  }
+  if (std::getenv("GUFO_TIME_TRACE") != nullptr) {
+    std::fprintf(stderr, "[t] plewait n=%u us=%lld\n", n,
+                 static_cast<long long>(
+                     (std::chrono::steady_clock::now().time_since_epoch().count() -
+                      t_ple0) / 1000));
+    std::fflush(stderr);
   }
   if (!embeddings_ready && !prefetch_next_.empty()) {
     PrefetchPle(session, prefetch_next_);
@@ -3985,6 +3993,11 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
         false, session.position_, end, session.blocks_,
         end > c.indexer_top_k ? end / c.compress_ratio : session.blocks_);
   }
+  const bool time_trace = std::getenv("GUFO_TIME_TRACE") != nullptr;
+  const auto t_now = [&] {
+    return std::chrono::steady_clock::now().time_since_epoch().count();
+  };
+  const auto t0 = t_now();
   const auto ngram = session.ngram_;
   if (c.ple_layer >= 0) {
     if (ngram_ == nullptr) {
@@ -3993,6 +4006,11 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     }
     if (!PleFetch(session, tokens, speculative, error_msg)) {
       return false;
+    }
+    if (time_trace) {
+      std::fprintf(stderr, "[t] plefetch n=%u us=%lld\n", n,
+                   static_cast<long long>((t_now() - t0) / 1000));
+      std::fflush(stderr);
     }
   }
   try {
