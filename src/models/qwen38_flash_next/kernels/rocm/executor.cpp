@@ -2624,6 +2624,47 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   return true;
 }
 
+
+// Divergence discriminator: whether the n-gram gather's row indices (pure
+// function of history + tokens) or the gathered content itself diverges.
+namespace {
+void NgramTraceRows(const char* site, const void* session,
+                    const NgramHistory& hist,
+                    std::span<const std::int32_t> tokens,
+                    std::span<const std::uint32_t> rows) {
+  if (std::getenv("GUFO_TP_TRACE") == nullptr) {
+    return;
+  }
+  static std::uint64_t seq = 0;
+  std::uint64_t rh = 1469598103934665603ULL;
+  for (std::uint32_t r : rows) {
+    std::uint32_t b;
+    std::memcpy(&b, &r, sizeof(b));
+    rh = (rh ^ b) * 1099511628211ULL;
+  }
+  std::uint64_t th = 1469598103934665603ULL;
+  for (std::int32_t t : tokens) {
+    std::uint32_t b;
+    std::memcpy(&b, &t, sizeof(b));
+    th = (th ^ b) * 1099511628211ULL;
+  }
+  std::uint64_t hh = 1469598103934665603ULL;
+  for (std::int32_t v : hist.prev) {
+    std::uint32_t b;
+    std::memcpy(&b, &v, sizeof(b));
+    hh = (hh ^ b) * 1099511628211ULL;
+  }
+  std::fprintf(stderr,
+               "[ngi] seq=%llu site=%s st=%p n=%zu tok=%016llx "
+               "hist=%016llx rows=%016llx nrows=%zu\n",
+               static_cast<unsigned long long>(seq++), site, session,
+               tokens.size(), static_cast<unsigned long long>(th),
+               static_cast<unsigned long long>(hh),
+               static_cast<unsigned long long>(rh), rows.size());
+  std::fflush(stderr);
+}
+}  // namespace
+
 bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
                         bool speculative, std::string* error_msg) const {
   if (ple_pending_ && !WaitPle(error_msg)) {
@@ -2647,6 +2688,9 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
         HashNgramRows(
             c, session.ngram_, tokens,
             std::span<std::uint32_t>(host_rows_.data(), n * c.ple_heads));
+        NgramTraceRows("claim-full", &session, session.ngram_, tokens,
+                       std::span<const std::uint32_t>(host_rows_.data(),
+                                                      n * c.ple_heads));
       }
       if (shared == tokens.size())
         return true;
@@ -2657,6 +2701,8 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
       const auto rows = rest.size() * c.ple_heads;
       HashNgramRows(c, session.ngram_, rest,
                     std::span<std::uint32_t>(host_rows_.data(), rows));
+      NgramTraceRows("claim-tail", &session, session.ngram_, rest,
+                     std::span<const std::uint32_t>(host_rows_.data(), rows));
       const NgramGatherOwner owner{rows, &session.ngram_counters_};
       prefetch_.tail = ngram_->StartRead(
           std::span<const std::uint32_t>(host_rows_.data(), rows),
@@ -2687,6 +2733,10 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
     HashNgramRows(c, session.ngram_, tokens,
                   std::span<std::uint32_t>(host_rows_.data(), n * c.ple_heads));
   }
+  NgramTraceRows(speculative ? "spec" : "fresh", &session, session.ngram_,
+                 tokens,
+                 std::span<const std::uint32_t>(host_rows_.data(),
+                                                n * c.ple_heads));
   const NgramGatherOwner owner{n * c.ple_heads, &session.ngram_counters_};
   ple_pending_ = ngram_->StartRead(
       std::span<const std::uint32_t>(host_rows_.data(), n * c.ple_heads),
@@ -2731,6 +2781,19 @@ bool Executor::WaitPle(std::string* error_msg) const {
     prefetch_.tail = false;
   } else if (ok) {
     ok = ngram_->WaitRead();
+    if (ok && std::getenv("GUFO_TP_TRACE") != nullptr) {
+      static std::uint64_t pg_seq = 0;
+      std::uint64_t h = 1469598103934665603ULL;
+      for (std::size_t i = 0; i < 32; ++i) {
+        std::uint32_t b;
+        std::memcpy(&b, &host_emb_[i], sizeof(b));
+        h = (h ^ b) * 1099511628211ULL;
+      }
+      std::fprintf(stderr, "[pg] seq=%llu emb=%016llx\n",
+                   static_cast<unsigned long long>(pg_seq++),
+                   static_cast<unsigned long long>(h));
+      std::fflush(stderr);
+    }
   }
   ple_pending_ = false;
   if (!ok) {
@@ -2797,8 +2860,8 @@ bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
       std::memcpy(&b, &v[i], sizeof(b));
       h = (h ^ b) * 1099511628211ULL;
     }
-    std::fprintf(stderr, "[pe] seq=%llu n=%u emb=%016llx\n",
-                 static_cast<unsigned long long>(pe_seq++), n,
+    std::fprintf(stderr, "[pe] seq=%llu st=%p n=%u emb=%016llx\n",
+                 static_cast<unsigned long long>(pe_seq++), &session, n,
                  static_cast<unsigned long long>(h));
     std::fflush(stderr);
   }
