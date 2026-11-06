@@ -1557,7 +1557,8 @@ bool TpExecutor::ExecuteIdle(const TpInstruction& instruction,
   if (instruction.op != TpInstructionOp::kInvalidate &&
       instruction.op != TpInstructionOp::kDrop &&
       instruction.op != TpInstructionOp::kPersist &&
-      instruction.op != TpInstructionOp::kPromptContext) {
+      instruction.op != TpInstructionOp::kPromptContext &&
+      instruction.op != TpInstructionOp::kReconcile) {
     SetError(error, "TP worker received a model call outside a request");
     return false;
   }
