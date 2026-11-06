@@ -1454,10 +1454,18 @@ private:
         }
       } else if (!device) {
         finished.error = "HIP overlapped staging failed: no device";
+        std::fprintf(stderr, "[stag] no-device job bytes=%zu op=%llu\n",
+                     job.bytes,
+                     static_cast<unsigned long long>(job.operation_id));
+        std::fflush(stderr);
       } else if (hipStreamWaitEvent(copy_stream_, job.ready, 0) !=
                  hipSuccess) {
         finished.error = "HIP overlapped staging failed: wait-event " +
                          std::to_string(static_cast<int>(hipGetLastError()));
+        std::fprintf(stderr, "[stag] wait-event=%d op=%llu\n",
+                     static_cast<int>(hipGetLastError()),
+                     static_cast<unsigned long long>(job.operation_id));
+        std::fflush(stderr);
       } else if (job.bytes != 0) {
         ConvertRowsF32ToF16(job.data,
                             SendWindow(job.operation_id) + data_offset_,
@@ -1466,6 +1474,11 @@ private:
         if (staged != hipSuccess) {
           finished.error = "HIP overlapped staging failed: sync " +
                            std::to_string(static_cast<int>(staged));
+          std::fprintf(stderr, "[stag] sync=%d bytes=%zu elems=%zu op=%llu\n",
+                       static_cast<int>(staged), job.bytes,
+                       job.bytes / sizeof(float),
+                       static_cast<unsigned long long>(job.operation_id));
+          std::fflush(stderr);
         }
       } else if (hipStreamSynchronize(copy_stream_) != hipSuccess) {
         finished.error = "HIP overlapped staging failed: empty sync " +
