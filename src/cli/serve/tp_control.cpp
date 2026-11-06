@@ -1139,7 +1139,7 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
         !ReadU32(command_prompt_, &offset, &instruction.lookahead, error) ||
         !ReadU32(command_prompt_, &offset, &instruction.drafts, error) ||
         !ReadU32(command_prompt_, &offset, &batch_size, error) ||
-        op > static_cast<std::uint32_t>(TpInstructionOp::kDecodeBatch) ||
+        op > static_cast<std::uint32_t>(TpInstructionOp::kReconcile) ||
         batch_size > kMaxBatchMembers) {
       return reject("TP control instruction is invalid");
     }
