@@ -568,7 +568,8 @@ public:
   [[nodiscard]] std::uint32_t PairLead(std::uint32_t n) const noexcept {
     constexpr std::uint32_t kPairMinTokens = 384;
     constexpr std::uint32_t kPairGrid = 128;
-    if (!options_.split_reduce.start || n < kPairMinTokens ||
+    if (std::getenv("GUFO_NO_PAIR") != nullptr ||
+        !options_.split_reduce.start || n < kPairMinTokens ||
         n > PrefillChunk()) {
       return 0;
     }
