@@ -947,8 +947,7 @@ public:
     if (finished.peer == nullptr) {
       Poison(error, finished.error);
     }
-    return {.peer = reinterpret_cast<const __half*>(finished.peer),
-            .local = finished.local};
+    return {.peer = finished.peer, .local = finished.local};
   }
 
   [[nodiscard]] bool QueuePartial(std::size_t bytes, QueuedPartial* partial,
@@ -1023,7 +1022,7 @@ private:
   };
   struct Finished {
     const float* peer{nullptr};
-    const __half* local{nullptr};  ///< this rank's staged F16 partial
+    const void* local{nullptr};  ///< this rank's staged F16 partial
     std::size_t bytes{0};
     std::string error;
   };
@@ -1466,8 +1465,8 @@ private:
         };
         static std::uint64_t vt_peer = 0, vt_jobs = 0;
         const auto vt_t0 = vt_now();
-        finished.local = reinterpret_cast<const __half*>(
-            SendWindow(job.operation_id) + data_offset_);
+        finished.local =
+            SendWindow(job.operation_id) + data_offset_;
         finished.peer =
             Transfer(job.scope_id, job.operation_id, job.bytes / 2,
                      &finished.error);

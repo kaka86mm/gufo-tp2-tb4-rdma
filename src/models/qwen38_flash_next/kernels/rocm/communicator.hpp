@@ -56,8 +56,9 @@ public:
   /// sequence and the rule above; finish every queued exchange before the next
   /// `ExchangePartial` or `EndOperation`.
   struct PartialPair {
-    const __half* peer{nullptr};
-    const __half* local{nullptr};
+    /// The F16 halves as raw bits; the reduce casts them.
+    const void* peer{nullptr};
+    const void* local{nullptr};
   };
   [[nodiscard]] virtual bool StartPartial(const float* data, std::size_t bytes,
                                           hipStream_t stream,
