@@ -4536,8 +4536,24 @@ public:
         ++i;
       }
     }
-    std::fprintf(stderr, "[gpt] mixer_gpu_us=%.0f moe_gpu_us=%.0f\n",
-                 mixer_us, moe_us);
+    float gdn_us = 0, attn_us = 0;
+    i = 0;
+    while (i + 1 < self.cursor_) {
+      if (self.kinds_[i] >= 4 && self.kinds_[i + 1] == self.kinds_[i] + 2) {
+        float ms = 0;
+        if (hipEventElapsedTime(&ms, self.events_[i],
+                                self.events_[i + 1]) == hipSuccess) {
+          (self.kinds_[i] == 4 ? gdn_us : attn_us) += ms * 1000;
+        }
+        i += 2;
+      } else {
+        ++i;
+      }
+    }
+    std::fprintf(stderr,
+                 "[gpt] mixer_gpu_us=%.0f moe_gpu_us=%.0f gdn_gpu_us=%.0f "
+                 "attn_gpu_us=%.0f\n",
+                 mixer_us, moe_us, gdn_us, attn_us);
     std::fflush(stderr);
     self.cursor_ = 0;
   }
@@ -4891,19 +4907,34 @@ bool Executor::MixerPart(Session& session, std::uint32_t il,
              half_only)) {
     return false;
   }
+  const bool sub_time = std::getenv("GUFO_TIME_TRACE") != nullptr;
   if (l.linear) {
     (void)checkpoint;
     const auto capture = GdnCheckpoint{};
+    if (sub_time) {
+      GpuPartTimer::Record(stream_, 4);
+    }
     if (!LinearAttention(l, session.linear_[il], s_.mixed, s_.block_out, n,
                          batch.speculative, error_msg, false, true, capture)) {
       return false;
     }
-  } else if (!Attention(l, session.attention_[il], s_.mixed, s_.block_out, n,
-                        &batch.control->position, &batch.control->blocks,
-                        batch.start_pos, batch.pool_grid, session.max_context_,
-                        batch.sparse, error_msg, last_only, false, true,
-                        PassCheckpoints{})) {
-    return false;
+    if (sub_time) {
+      GpuPartTimer::Record(stream_, 6);
+    }
+  } else {
+    if (sub_time) {
+      GpuPartTimer::Record(stream_, 6);
+    }
+    if (!Attention(l, session.attention_[il], s_.mixed, s_.block_out, n,
+                   &batch.control->position, &batch.control->blocks,
+                   batch.start_pos, batch.pool_grid, session.max_context_,
+                   batch.sparse, error_msg, last_only, false, true,
+                   PassCheckpoints{})) {
+      return false;
+    }
+    if (sub_time) {
+      GpuPartTimer::Record(stream_, 8);
+    }
   }
   return !reduce || !l.mixer_split ||
          AllReduce(s_.block_out, n, error_msg, false);
