@@ -3576,12 +3576,7 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
     }
     side_pending_ = true;
   }
-  // Every exit, including errors, orders the main stream after the shared
-  // expert: its side-stream writes must not race the next pass.
-  struct JoinGuard {
-    const Executor* executor;
-    ~JoinGuard() { (void)executor->JoinSide(nullptr); }
-  } join_guard{this};
+
   if (!shared_ok) {
     return false;
   }
