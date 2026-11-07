@@ -680,11 +680,11 @@ TextRunnerDescriptor TpMirroredRunner::Descriptor() const {
   // An in-pass checkpoint would capture inside a call rank 1 cannot mirror
   // yet; the scheduler then splits the pass at the boundary and snapshots.
   descriptor.capabilities.in_pass_checkpoint = false;
-  // Live-state prefix reuse: the pool re-leases the still-resident state,
-  // kPromptContext rebinds, kReconcile rewinds the mirror to the shared
-  // prefix, and kReuse revalidates it. Retained-snapshot reuse across
-  // recycled states still needs the mirrored component protocol.
-
+  // Prefix reuse across requests needs the pool's retained snapshots and a
+  // matching reconcile/reuse stream; the mirror does not retain them yet,
+  // and a half-mirrored reuse diverges the exchange stream (size mismatch).
+  // Reuse stays off until the snapshot retention mirrors.
+  descriptor.capabilities.prefix_reuse = false;
   // Rolling back an interrupted prefill needs the call to stop mid-pass,
   // where rank 1 would be left inside an exchange; calls here always finish.
   descriptor.capabilities.prefill_rollback = false;
