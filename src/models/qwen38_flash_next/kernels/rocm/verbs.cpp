@@ -1,10 +1,10 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/verbs.hpp"
 
-// The partial-exchange staging quantizer (kernels.hip.cpp); the half type
+// The partial-exchange staging quantizer (kernels.hip.cpp); the block type
 // stays inside the HIP translation unit.
 namespace gufo::models::qwen38_flash_next::rocm {
-void ConvertRowsF32ToF16(const float* in, void* out, std::size_t count,
-                         hipStream_t stream);
+void QuantizeRowsQ8(const float* in, void* out_blocks, std::size_t count,
+                    hipStream_t stream);
 }  // namespace gufo::models::qwen38_flash_next::rocm
 
 #include <arpa/inet.h>
@@ -1467,9 +1467,10 @@ private:
               "HIP overlapped staging failed: wait-event " +
               std::to_string(static_cast<int>(hipGetLastError()));
         } else if (job.bytes != 0) {
-          ConvertRowsF32ToF16(job.data,
-                              SendWindow(job.operation_id) + data_offset_,
-                              job.bytes / sizeof(float), copy_stream_);
+          // 34 bytes per 32 floats: 26.6% of F32 on the wire.
+          QuantizeRowsQ8(job.data,
+                         SendWindow(job.operation_id) + data_offset_,
+                         job.bytes / sizeof(float), copy_stream_);
           const auto ok = hipStreamSynchronize(copy_stream_);
           if (ok != hipSuccess) {
             finished.error = "HIP overlapped staging failed: sync " +
@@ -1486,9 +1487,9 @@ private:
         }
         if (staged) {
           finished.local = SendWindow(job.operation_id) + data_offset_;
-          finished.peer =
-              Transfer(job.scope_id, job.operation_id, job.bytes / 2,
-                       &finished.error);
+            finished.peer = Transfer(
+              job.scope_id, job.operation_id,
+              job.bytes / 32 * 34, &finished.error);
         }
         // [vt] the transfer half of a partial's latency (wire plus peer);
         // the staging half is the [ppt] finish total minus this.

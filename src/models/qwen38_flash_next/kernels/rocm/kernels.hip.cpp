@@ -10245,6 +10245,79 @@ void WaitValue(const std::uint64_t* flag, std::uint64_t value,
                      ticks, timed_out);
 }
 
+struct Q8ExchangeBlock {
+  __half d;
+  std::int8_t qs[32];
+};
+
+__global__ void QuantizeQ8Kernel(const float* __restrict__ in,
+                                 Q8ExchangeBlock* __restrict__ out,
+                                 std::size_t blocks) {
+  const std::size_t block =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (block >= blocks) {
+    return;
+  }
+  const float* src = in + block * 32;
+  float amax = 0.0F;
+  for (int i = 0; i < 32; ++i) {
+    amax = fmaxf(amax, fabsf(src[i]));
+  }
+  const float d = amax / 127.0F;
+  out[block].d = __float2half(d);
+  if (d != 0.0F) {
+    for (int i = 0; i < 32; ++i) {
+      out[block].qs[i] =
+          static_cast<std::int8_t>(lroundf(src[i] / d));
+    }
+  } else {
+    for (int i = 0; i < 32; ++i) {
+      out[block].qs[i] = 0;
+    }
+  }
+}
+
+void QuantizeRowsQ8(const float* in, void* out_bytes, std::size_t count,
+                    hipStream_t stream) {
+  if (count == 0) {
+    return;
+  }
+  const std::size_t blocks = count / 32;
+  const unsigned grid = static_cast<unsigned>((blocks + 255) / 256);
+  hipLaunchKernelGGL(QuantizeQ8Kernel, dim3(grid), dim3(256), 0, stream, in,
+                     static_cast<Q8ExchangeBlock*>(out_bytes), blocks);
+}
+
+__global__ void AddQ8PairKernel(const Q8ExchangeBlock* __restrict__ a,
+                                const Q8ExchangeBlock* __restrict__ b,
+                                float* __restrict__ out, std::size_t blocks) {
+  const std::size_t block =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (block >= blocks) {
+    return;
+  }
+  const float da = __half2float(a[block].d);
+  const float db = __half2float(b[block].d);
+  float* dst = out + block * 32;
+  for (int i = 0; i < 32; ++i) {
+    dst[i] = da * static_cast<float>(a[block].qs[i]) +
+             db * static_cast<float>(b[block].qs[i]);
+  }
+}
+
+void AddQ8PairRows(const void* a_bytes, const void* b_bytes, float* out,
+                   std::size_t count, hipStream_t stream) {
+  if (count == 0) {
+    return;
+  }
+  const std::size_t blocks = count / 32;
+  const unsigned grid = static_cast<unsigned>((blocks + 255) / 256);
+  hipLaunchKernelGGL(AddQ8PairKernel, dim3(grid), dim3(256), 0, stream,
+                     static_cast<const Q8ExchangeBlock*>(a_bytes),
+                     static_cast<const Q8ExchangeBlock*>(b_bytes), out,
+                     blocks);
+}
+
 __global__ void ConvertF32ToF16Kernel(const float* __restrict__ in,
                                       __half* __restrict__ out,
                                       std::size_t n) {

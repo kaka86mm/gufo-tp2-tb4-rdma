@@ -3357,10 +3357,10 @@ Executor::SplitReduce Executor::TwoRankSplitReduce(
     }
     const std::size_t rows = bytes / (sizeof(float) * hidden);
     if (rows != 0) {
-      // Both ranks sum the same staged halves, so the reduce stays
-      // bit-identical while the wire carries half the bytes.
-      AddF16PairRows(partials.local, partials.peer, data, rows * hidden,
-                     stream);
+      // Both ranks sum the same staged Q8 blocks, so the reduce stays
+      // bit-identical while the wire carries a quarter of the bytes.
+      AddQ8PairRows(partials.local, partials.peer, data, rows * hidden,
+                    stream);
     }
     return true;
   };
