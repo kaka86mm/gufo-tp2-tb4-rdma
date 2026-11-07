@@ -662,13 +662,6 @@ void MtpHidden(const float* base, const float* alt, const std::int32_t* row,
 /// all-reduce adds the peer's partial with `streams` = 1.
 /// Quantizes `count` floats to halves (the partial-exchange staging). The
 /// halves are raw bits: the half type is not visible in host TUs.
-/// Block-quantizes `count` floats (multiple of 32) as Q8_0-style blocks:
-/// fp16 scale + 32 int8 per block, 34 bytes per 32 floats.
-void QuantizeRowsQ8(const float* in, void* out_blocks, std::size_t count,
-                    hipStream_t stream);
-/// out = dequant(a) + dequant(b) over Q8 blocks covering `count` floats.
-void AddQ8PairRows(const void* a_blocks, const void* b_blocks, float* out,
-                   std::size_t count, hipStream_t stream);
 void ConvertRowsF32ToF16(const float* in, void* out, std::size_t count,
                          hipStream_t stream);
 /// out = float(a) + float(b) over `count` halves; the symmetric partial sum.
