@@ -269,9 +269,6 @@ private:
   mutable std::uint64_t mirror_bytes_{0};
   /// States whose prefill ran but whose frontier is not snapshotted yet.
   mutable std::unordered_map<std::uint32_t, bool> prefill_dirty_;
-  /// States serving a request that began with a live-reused prefix; their
-  /// frontiers are not mirrored (the snapshot would not restore cleanly).
-  mutable std::unordered_map<std::uint32_t, bool> live_reused_;
   bool mirror_snapshots_enabled_{false};
   class CallScope;
   /// An open request's share of the instruction stream.

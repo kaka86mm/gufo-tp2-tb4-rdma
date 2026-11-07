@@ -899,13 +899,6 @@ void TpMirroredRunner::PreparePrefixReuse(
                  .state = mirrored.id(),
                  .prompt_size = ToWire(prefix.size(), "reuse prefix")},
                 [&] { inner_->PreparePrefixReuse(mirrored.inner(), prefix); });
-  {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    // A prefill over a live-reused prefix leaves the speculative machinery
-    // in a state whose snapshot does not restore cleanly on both ranks;
-    // v1 mirrors cold-prompt frontiers only, so such repeats reprefill.
-    live_reused_[mirrored.id()] = true;
-  }
   Record(sequence, [&](TpExecutionDigest& digest) {
     digest.Add(inner_->CheckpointPosition(mirrored.inner()));
   });
@@ -926,10 +919,6 @@ TextPrefillStep TpMirroredRunner::Prefill(
     std::size_t offset, std::size_t max_input_tokens) const {
   const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
   auto& mirrored = Mirrored(state);
-  if (offset == 0) {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    live_reused_[mirrored.id()] = false;
-  }
   std::size_t restored = 0;
   if (mirror_snapshots_enabled_ && offset == 0 && max_input_tokens > 0) {
     // The pool planned a cold prefill, but the mirror may already hold this
@@ -987,16 +976,8 @@ TextPrefillStep TpMirroredRunner::Prefill(
   // an instruction, so the digest stays comparable and the pool's offset
   // accounting still reaches the frontier.
   step.consumed_tokens += restored;
-  if (step.decode_ready) {
-    bool reused = false;
-    {
-      const std::lock_guard<std::mutex> lock(mutex_);
-      reused = live_reused_[mirrored.id()];
-      live_reused_[mirrored.id()] = false;
-    }
-    if (!reused)
-      MaybeSnapshotFrontier(mirrored);
-  }
+  if (step.decode_ready)
+    MaybeSnapshotFrontier(mirrored);
   return step;
 }
 
@@ -1333,7 +1314,11 @@ void TpMirroredRunner::MaybeSnapshotFrontier(const State& mirrored) const {
     mirror_entries_[id] = MirrorEntry{handle, mirrored.id(), position, bytes};
     auto& ring = mirror_rings_[mirrored.id()];
     ring.push_back(id);
-    while (ring.size() > 2) {
+    // A pool slot serves whichever conversation leases it, so a short ring
+    // evicts a conversation's snapshots as soon as the slot turns over
+    // twice; eight per state keeps a working set of conversations covered
+    // within the mirror budget.
+    while (ring.size() > 8) {
       retire.push_back(ring.front());
       ring.erase(ring.begin());
     }
@@ -1360,32 +1345,70 @@ std::size_t TpMirroredRunner::RestoreMirroredFrontier(
     std::size_t max_input_tokens) const {
   if (prompt.empty() || prompt.size() > max_input_tokens)
     return 0;  // a chunked budget cannot report the restored tokens back
-  std::shared_ptr<void> handle;
-  std::uint64_t id = 0;
+  std::vector<std::uint64_t> candidates;
   {
     const std::lock_guard<std::mutex> lock(mutex_);
+    // This state's own boundary first, then any state's: several
+    // conversations can tokenize to the same length, so every
+    // position match is a candidate until the tokens compare equal.
     if (const auto own = mirror_snapshots_.find({mirrored.id(),
                                                  prompt.size()});
         own != mirror_snapshots_.end()) {
-      id = own->second;
-    } else {
-      // Any state's identical prompt serves: the engine restores across
-      // sessions, and rank 1's reconcile names the snapshot id.
-      for (const auto& [candidate, entry] : mirror_entries_)
-        if (entry.position == prompt.size()) {
-          id = candidate;
-          break;
-        }
+      candidates.push_back(own->second);
     }
-    if (id == 0)
+    for (const auto& [candidate, entry] : mirror_entries_)
+      if (entry.position == prompt.size() &&
+          std::find(candidates.begin(), candidates.end(), candidate) ==
+              candidates.end())
+        candidates.push_back(candidate);
+    if (candidates.empty())
       return 0;
-    handle = mirror_entries_.at(id).handle;
   }
-  if (!inner_->FrontierSnapshotMatches(handle, prompt))
+  std::shared_ptr<void> handle;
+  std::uint64_t id = 0;
+  for (const auto candidate : candidates) {
+    std::shared_ptr<void> held;
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      const auto entry = mirror_entries_.find(candidate);
+      if (entry == mirror_entries_.end())
+        continue;
+      held = entry->second.handle;
+    }
+    if (inner_->FrontierSnapshotMatches(held, prompt)) {
+      handle = std::move(held);
+      id = candidate;
+      break;
+    }
+  }
+  if (id == 0) {
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+      std::fprintf(stderr,
+                   "[mirror] r0 restore-nomatch state=%u pos=%zu tried=%zu\n",
+                   mirrored.id(), prompt.size(), candidates.size());
+    }
     return 0;
+  }
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    std::fprintf(stderr, "[mirror] r0 restore-lookup state=%u pos=%zu id=%llu\n",
+                 mirrored.id(), prompt.size(),
+                 static_cast<unsigned long long>(id));
+  }
+  if (!inner_->FrontierSnapshotMatches(handle, prompt)) {
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+      std::fprintf(stderr, "[mirror] r0 restore-mismatch id=%llu\n",
+                   static_cast<unsigned long long>(id));
+    }
+    return 0;
+  }
   std::string error;
-  if (!inner_->RestoreFrontierSnapshot(mirrored.inner(), handle, &error))
+  if (!inner_->RestoreFrontierSnapshot(mirrored.inner(), handle, &error)) {
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+      std::fprintf(stderr, "[mirror] r0 restore-failed id=%llu err=%s\n",
+                   static_cast<unsigned long long>(id), error.c_str());
+    }
     return 0;  // the ordinary cold prefill still serves this request
+  }
   // Rank 1 replays the same restore before this request's first model call.
   SendReconcile(mirrored, prompt.size(), id);
   return prompt.size();
