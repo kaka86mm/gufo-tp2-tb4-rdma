@@ -607,11 +607,10 @@ bool InferenceBackend::load(
         pool_runner = new_state->tp_runner;
       }
       if (tp_world_size > 1) {
-        // The mirrored pool takes the classic continuation branch, whose
-        // snapshot restore the component-based Flash-Next runner does not
-        // implement; keep TP2 pools snapshot-free.
-        ram_cache_config.enabled = false;
-        ram_cache_config.capacity_bytes = 0;
+        // Live frontiers re-lease the still-resident state, whose engine
+        // history both ranks hold identically; the suffix prefill stays
+        // symmetric. Retained checkpoints stay off (their restore is
+        // rank0-only), so a non-live miss full-reprefills on both ranks.
       }
 #else
     std::shared_ptr<TextModelRunner> pool_runner = runner;
