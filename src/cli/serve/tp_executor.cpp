@@ -690,6 +690,7 @@ TextRunnerDescriptor TpMirroredRunner::Descriptor() const {
   descriptor.capabilities.prefill_rollback = false;
   // Splitting a prefill step at a snapshot boundary poisons the TP2
   // inject-parts chain; each chunk runs as one pass.
+  descriptor.capabilities.single_pass_prefill = true;
   return descriptor;
 }
 
