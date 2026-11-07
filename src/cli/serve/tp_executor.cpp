@@ -881,26 +881,7 @@ std::unique_ptr<TextRunnerState> TpMirroredRunner::BindComponentState(
 
 void TpMirroredRunner::ReconcileComponentState(TextRunnerState& state,
                                                std::size_t position) const {
-  auto& mirrored = Mirrored(state);
-  const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
-  {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    if (!failure_.empty()) {
-      throw std::runtime_error("TP instruction channel failed: " + failure_);
-    }
-    // Channel-wide and ordered: the rewind lands on rank 1 before any
-    // instruction that could name the state again.
-    const TpInstruction instruction{.op = TpInstructionOp::kReconcile,
-                                    .state = mirrored.id(),
-                                    .count = ToWire(position,
-                                                    "reconcile position")};
-    std::string error;
-    if (!sink_->Send(0, instruction, nullptr, &error)) {
-      failure_ = error.empty() ? "send failed" : error;
-      throw std::runtime_error("TP instruction send failed: " + failure_);
-    }
-  }
-  inner_->ReconcileComponentState(mirrored.inner(), position);
+  SendReconcile(Mirrored(state), position, 0);
 }
 
 std::optional<TextDecodeSelection> TpMirroredRunner::PreviewFirstToken(
@@ -918,6 +899,13 @@ void TpMirroredRunner::PreparePrefixReuse(
                  .state = mirrored.id(),
                  .prompt_size = ToWire(prefix.size(), "reuse prefix")},
                 [&] { inner_->PreparePrefixReuse(mirrored.inner(), prefix); });
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    // A prefill over a live-reused prefix leaves the speculative machinery
+    // in a state whose snapshot does not restore cleanly on both ranks;
+    // v1 mirrors cold-prompt frontiers only, so such repeats reprefill.
+    live_reused_[mirrored.id()] = true;
+  }
   Record(sequence, [&](TpExecutionDigest& digest) {
     digest.Add(inner_->CheckpointPosition(mirrored.inner()));
   });
@@ -938,6 +926,27 @@ TextPrefillStep TpMirroredRunner::Prefill(
     std::size_t offset, std::size_t max_input_tokens) const {
   const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
   auto& mirrored = Mirrored(state);
+  if (offset == 0) {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    live_reused_[mirrored.id()] = false;
+  }
+  std::size_t restored = 0;
+  if (mirror_snapshots_enabled_ && offset == 0 && max_input_tokens > 0) {
+    // The pool planned a cold prefill, but the mirror may already hold this
+    // exact prompt: restore it on both ranks and feed only the suffix.
+    try {
+      restored = RestoreMirroredFrontier(mirrored, prompt, max_input_tokens);
+    } catch (...) {
+      restored = 0;  // the ordinary cold prefill still serves this request
+    }
+  }
+  if (restored >= prompt.size()) {
+    TextPrefillStep step;
+    step.consumed_tokens = prompt.size();
+    step.decode_ready = true;
+    return step;
+  }
+  offset += restored;
   if (offset >= prompt.size() || max_input_tokens == 0) {
     // Nothing to prefill: runners reject the call before any model work, so
     // there is nothing for rank 1 to join.
@@ -974,9 +983,19 @@ TextPrefillStep TpMirroredRunner::Prefill(
   Record(sent.sequence, [&](TpExecutionDigest& digest) {
     DigestTpPrefill(digest, step, inner_->CheckpointPosition(mirrored.inner()));
   });
-  {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    prefill_dirty_[mirrored.id()] = true;
+  // The restored prefix is rank 0 bookkeeping only: rank 1 never ran it as
+  // an instruction, so the digest stays comparable and the pool's offset
+  // accounting still reaches the frontier.
+  step.consumed_tokens += restored;
+  if (step.decode_ready) {
+    bool reused = false;
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      reused = live_reused_[mirrored.id()];
+      live_reused_[mirrored.id()] = false;
+    }
+    if (!reused)
+      MaybeSnapshotFrontier(mirrored);
   }
   return step;
 }
@@ -990,7 +1009,6 @@ void TpMirroredRunner::Advance(TextRunnerState& state,
                                TextRunnerToken token) const {
   const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
   auto& mirrored = Mirrored(state);
-  MaybeSnapshotFrontier(mirrored);
   const auto sent = Send(mirrored.id(), {.op = TpInstructionOp::kAdvance,
                                          .state = mirrored.id(),
                                          .token = TokenToWire(token)});
@@ -1025,7 +1043,6 @@ TextDecodeStep TpMirroredRunner::DecodeStep(
     return TextModelRunner::DecodeStep(state, max_tokens, sampler);
   }
   auto& mirrored = Mirrored(state);
-  MaybeSnapshotFrontier(mirrored);
   const auto count = ToWire(max_tokens, "decode budget");
   const auto draw = sampler.SaveDrawState();
   // Rank 0's draft count fixes the cycle width on both ranks: rank 1's own
@@ -1088,8 +1105,7 @@ std::vector<TextDecodeStep> TpMirroredRunner::DecodeBatch(
   inner.reserve(decodes.size());
   for (const auto& decode : decodes) {
     auto& mirrored = Mirrored(decode.state.get());
-    MaybeSnapshotFrontier(mirrored);
-    const auto draw = decode.sampler.get().SaveDrawState();
+      const auto draw = decode.sampler.get().SaveDrawState();
     instruction.batch.push_back(
         {.state = mirrored.id(),
          .count = ToWire(decode.max_tokens, "decode budget"),
@@ -1267,13 +1283,6 @@ bool TpMirroredRunner::CanServeRewind(const TextRunnerState& state,
 void TpMirroredRunner::MaybeSnapshotFrontier(const State& mirrored) const {
   if (!mirror_snapshots_enabled_)
     return;
-  {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    const auto dirty = prefill_dirty_.find(mirrored.id());
-    if (dirty == prefill_dirty_.end() || !dirty->second)
-      return;
-    dirty->second = false;
-  }
   std::uint64_t bytes = 0;
   std::string error;
   std::shared_ptr<void> handle;
@@ -1287,11 +1296,19 @@ void TpMirroredRunner::MaybeSnapshotFrontier(const State& mirrored) const {
   if (handle == nullptr)
     return;
   const auto position = inner_->CheckpointPosition(mirrored.inner());
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    std::fprintf(stderr, "[mirror] r0 capture state=%u pos=%zu bytes=%llu\n",
+                 mirrored.id(), position,
+                 static_cast<unsigned long long>(bytes));
+    std::fflush(stderr);
+  }
   if (position == 0)
     return;
   {
     const std::lock_guard<std::mutex> lock(mutex_);
-    if (mirror_bytes_ + bytes > snapshot_budget_ && !mirror_snapshots_.empty())
+    const std::uint64_t mirror_budget =
+        std::min<std::uint64_t>(snapshot_budget_, std::uint64_t{6} << 30);
+    if (mirror_bytes_ + bytes > mirror_budget && !mirror_snapshots_.empty())
       return;  // over budget: keep what rank 1 already holds instead
   }
   const std::uint64_t id = next_snapshot_id_++;
@@ -1313,6 +1330,7 @@ void TpMirroredRunner::MaybeSnapshotFrontier(const State& mirrored) const {
         existing != mirror_snapshots_.end())
       retire.push_back(existing->second);
     mirror_snapshots_[key] = id;
+    mirror_entries_[id] = MirrorEntry{handle, mirrored.id(), position, bytes};
     auto& ring = mirror_rings_[mirrored.id()];
     ring.push_back(id);
     while (ring.size() > 2) {
@@ -1320,11 +1338,81 @@ void TpMirroredRunner::MaybeSnapshotFrontier(const State& mirrored) const {
       ring.erase(ring.begin());
     }
     mirror_bytes_ += bytes;
+    for (const auto dropped : retire) {
+      const auto entry = mirror_entries_.find(dropped);
+      if (entry == mirror_entries_.end())
+        continue;
+      mirror_bytes_ -= entry->second.bytes;
+      if (const auto keyed =
+              mirror_snapshots_.find({entry->second.state,
+                                      entry->second.position});
+          keyed != mirror_snapshots_.end() && keyed->second == dropped)
+        mirror_snapshots_.erase(keyed);
+      mirror_entries_.erase(entry);
+    }
   }
-  for (const auto dropped : retire) {
-    if (dropped != id)
-      Drop(dropped);
+  for (const auto dropped : retire)
+    Drop(dropped);
+}
+
+std::size_t TpMirroredRunner::RestoreMirroredFrontier(
+    const State& mirrored, std::span<const TextRunnerToken> prompt,
+    std::size_t max_input_tokens) const {
+  if (prompt.empty() || prompt.size() > max_input_tokens)
+    return 0;  // a chunked budget cannot report the restored tokens back
+  std::shared_ptr<void> handle;
+  std::uint64_t id = 0;
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (const auto own = mirror_snapshots_.find({mirrored.id(),
+                                                 prompt.size()});
+        own != mirror_snapshots_.end()) {
+      id = own->second;
+    } else {
+      // Any state's identical prompt serves: the engine restores across
+      // sessions, and rank 1's reconcile names the snapshot id.
+      for (const auto& [candidate, entry] : mirror_entries_)
+        if (entry.position == prompt.size()) {
+          id = candidate;
+          break;
+        }
+    }
+    if (id == 0)
+      return 0;
+    handle = mirror_entries_.at(id).handle;
   }
+  if (!inner_->FrontierSnapshotMatches(handle, prompt))
+    return 0;
+  std::string error;
+  if (!inner_->RestoreFrontierSnapshot(mirrored.inner(), handle, &error))
+    return 0;  // the ordinary cold prefill still serves this request
+  // Rank 1 replays the same restore before this request's first model call.
+  SendReconcile(mirrored, prompt.size(), id);
+  return prompt.size();
+}
+
+void TpMirroredRunner::SendReconcile(const State& mirrored,
+                                     std::size_t position,
+                                     std::uint64_t snapshot_id) const {
+  const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (!failure_.empty())
+      throw std::runtime_error("TP instruction channel failed: " + failure_);
+    // Channel-wide and ordered: the rewind lands on rank 1 before any
+    // instruction that could name the state again.
+    const TpInstruction instruction{.op = TpInstructionOp::kReconcile,
+                                    .state = mirrored.id(),
+                                    .count = ToWire(position,
+                                                    "reconcile position"),
+                                    .snapshot_id = snapshot_id};
+    std::string error;
+    if (!sink_->Send(0, instruction, nullptr, &error)) {
+      failure_ = error.empty() ? "send failed" : error;
+      throw std::runtime_error("TP instruction send failed: " + failure_);
+    }
+  }
+  inner_->ReconcileComponentState(mirrored.inner(), position);
 }
 
 void TpMirroredRunner::Drop(std::uint64_t id) const noexcept {
@@ -1691,7 +1779,29 @@ bool TpExecutor::ExecuteIdle(const TpInstruction& instruction,
       auto& state = StateFor(instruction.state);
       const auto position = static_cast<std::size_t>(instruction.count);
       const auto current = runner_->CheckpointPosition(state);
-      if (position != 0 && current != position) {
+      if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[mirror] r1 reconcile state=%u pos=%zu current=%zu\n",
+                     instruction.state, position,
+                     static_cast<std::size_t>(current));
+        std::fflush(stderr);
+      }
+      if (instruction.snapshot_id != 0) {
+        // A mirrored frontier restore names the snapshot whatever state
+        // captured it; the engine restores across sessions. Rank 0's target
+        // is the pool's reset slot, so reset here too: retained rollback
+        // scratch otherwise leaves the draft head reading stale hidden rows
+        // and the next cycle's proposal diverges.
+        const auto named = snapshots_by_id_.find(instruction.snapshot_id);
+        if (named == snapshots_by_id_.end())
+          throw std::runtime_error("rank 1 lacks the named mirror snapshot");
+        state.Invalidate();
+        std::string named_error;
+        if (!runner_->RestoreFrontierSnapshot(state, named->second.handle,
+                                              &named_error))
+          throw std::runtime_error("rank 1 named restore failed: " +
+                                   named_error);
+      } else if (position != 0 && current != position) {
         // Rank 0's pool restored a retained checkpoint: replay the rewind
         // from the mirrored frontier snapshot, whether this session advanced
         // past the boundary or was recycled since.
@@ -1771,8 +1881,17 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
         if (handle == nullptr)
           throw std::runtime_error("rank 1 frontier capture failed: " +
                                    capture_error);
-        StoreSnapshot(instruction.snapshot_id, instruction.state,
-                      runner_->CheckpointPosition(state), std::move(handle));
+        const auto stored_at = runner_->CheckpointPosition(state);
+        if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+          std::fprintf(stderr,
+                       "[mirror] r1 stored state=%u pos=%zu id=%llu\n",
+                       instruction.state, stored_at,
+                       static_cast<unsigned long long>(
+                           instruction.snapshot_id));
+          std::fflush(stderr);
+        }
+        StoreSnapshot(instruction.snapshot_id, instruction.state, stored_at,
+                      std::move(handle));
         break;
       }
       case TpInstructionOp::kDrop:

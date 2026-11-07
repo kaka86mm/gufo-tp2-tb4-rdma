@@ -1535,8 +1535,9 @@ bool ComponentTextCache::Lease::TryReserveSnapshot(
     return false;
   if (!boundary || boundary > impl_->prompt.size() ||
       (bytes > impl_->cache->budget &&
-       (!impl_->cache->queue || purpose == SnapshotPurpose::kHistory)))
+       (!impl_->cache->queue || purpose == SnapshotPurpose::kHistory))) {
     return false;
+  }
   if (tokens.empty())
     tokens = std::span<const cache::Token>(impl_->prompt).first(boundary);
   // A capture within the disk step has nowhere to go when the RAM cache is

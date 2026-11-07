@@ -292,17 +292,34 @@ public:
       const TextRunnerState& state, std::uint64_t* bytes,
       std::string* error) const override {
     const auto& qfn = RequireQwenFlashNextState(state);
-    auto snapshot = qfn.session().SaveSnapshot(error);
+    // Materialized: the rows live in the snapshot's own pageable payload, so
+    // a restore uploads everything on both ranks (no borrowed prefix to
+    // retain differently per side) and no pinned registration competes with
+    // the verbs exchange windows.
+    auto snapshot = qfn.session().SaveSnapshot(error,
+                                               QwenFlashNextSession::SnapshotMode::kMaterialized);
     if (snapshot == nullptr)
       return nullptr;
-    // Borrowed device rows dominate; the host header is tokens, logits and
-    // the mutable state the executor copied into the payload.
-    std::uint64_t total = snapshot->DeviceBytes();
-    total += std::uint64_t{qfn.position()} * sizeof(std::int32_t) +
-             std::uint64_t{model_->VocabSize()} * sizeof(float) + 1024;
+    std::uint64_t total = snapshot->SizeBytes();
     if (bytes != nullptr)
       *bytes = total;
     return std::shared_ptr<void>(std::move(snapshot));
+  }
+
+  bool FrontierSnapshotMatches(
+      const std::shared_ptr<void>& snapshot,
+      std::span<const TextRunnerToken> prompt) const override {
+    if (snapshot == nullptr || prompt.empty())
+      return false;
+    const auto held =
+        static_cast<const SessionSnapshot*>(snapshot.get())->Tokens();
+    if (held.size() != prompt.size() ||
+        held.size() * sizeof(std::int32_t) < held.size())
+      return false;
+    return std::equal(held.begin(), held.end(), prompt.begin(),
+                      [](std::int32_t token, TextRunnerToken other) {
+                        return token == static_cast<std::int32_t>(other);
+                      });
   }
 
   bool RestoreFrontierSnapshot(TextRunnerState& state,

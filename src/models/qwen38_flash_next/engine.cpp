@@ -587,6 +587,21 @@ bool Session::OwnsSnapshot(const SessionSnapshot& snapshot) const noexcept {
   return snapshot.deferred_ && session_->OwnsSnapshot(*snapshot.deferred_);
 }
 
+std::span<const std::int32_t> SessionSnapshot::Tokens() const noexcept {
+  if (data_ == nullptr || size_ < sizeof(SessionSnapshotHeader))
+    return {};
+  SessionSnapshotHeader header{};
+  std::memcpy(&header, data_.get(), sizeof(header));
+  const auto* tokens = reinterpret_cast<const std::int32_t*>(
+      data_.get() + sizeof(header) + header.image_identity_bytes);
+  if (header.token_count == 0 ||
+      static_cast<std::uint64_t>(header.token_count) * sizeof(std::int32_t) +
+              sizeof(header) + header.image_identity_bytes >
+          size_)
+    return {};
+  return {tokens, header.token_count};
+}
+
 std::uint64_t SessionSnapshot::DeviceBytes() const {
   return deferred_ ? deferred_->DeviceBytes() : 0;
 }

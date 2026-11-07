@@ -604,14 +604,14 @@ bool InferenceBackend::load(
                 tp_config.control, new_state->response_broker),
             tp_config.control->snapshot_budget_bytes(),
             std::make_shared<CommunicatorCallScope>(tp_config.communicator),
-            ram_cache_config.enabled);
+            true);
         pool_runner = new_state->tp_runner;
       }
       if (tp_world_size > 1) {
-        // Live frontiers re-lease the still-resident state, and retained
-        // checkpoints rewind through the mirrored frontier snapshots: the
-        // pool restores only boundaries the mirror holds (same state), so
-        // any other miss still full-reprefills on both ranks.
+        // Live frontiers re-lease the still-resident state, and exact
+        // repeats restore through the mirrored frontier snapshots inside
+        // the prefill call: the pool stays snapshot-free (its host backing
+        // displaces the verbs windows), so other misses full-reprefill.
       }
 #else
     std::shared_ptr<TextModelRunner> pool_runner = runner;

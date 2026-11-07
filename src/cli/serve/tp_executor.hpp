@@ -250,9 +250,17 @@ private:
   /// Pool slots are persistent: a re-leased slot keeps its mirrored state
   /// id, so rank 1 maps the lease onto the slot's existing session.
   mutable std::unordered_map<const void*, std::uint32_t> slot_state_ids_;
+  /// One retained frontier snapshot, on both ranks, by rank 0's id.
+  struct MirrorEntry {
+    std::shared_ptr<void> handle;
+    std::uint32_t state{0};
+    std::size_t position{0};
+    std::uint64_t bytes{0};
+  };
+  /// Rank 1 holds the same ids; registration follows its acknowledgement,
+  /// and rank 1 never evicts on its own, so this stays a subset of its store.
+  mutable std::unordered_map<std::uint64_t, MirrorEntry> mirror_entries_;
   /// Boundaries rank 1 holds a frontier snapshot for, to the snapshot id.
-  /// Registration follows rank 1's acknowledgement, and rank 1 never evicts
-  /// on its own, so this set stays a subset of rank 1's store.
   mutable std::map<std::pair<std::uint32_t, std::size_t>, std::uint64_t>
       mirror_snapshots_;
   /// Per state, the retained snapshot ids, oldest first (bounded ring).
@@ -261,6 +269,9 @@ private:
   mutable std::uint64_t mirror_bytes_{0};
   /// States whose prefill ran but whose frontier is not snapshotted yet.
   mutable std::unordered_map<std::uint32_t, bool> prefill_dirty_;
+  /// States serving a request that began with a live-reused prefix; their
+  /// frontiers are not mirrored (the snapshot would not restore cleanly).
+  mutable std::unordered_map<std::uint32_t, bool> live_reused_;
   bool mirror_snapshots_enabled_{false};
   class CallScope;
   /// An open request's share of the instruction stream.
@@ -279,6 +290,14 @@ private:
   /// after a prefill, within the mirror budget; the pool's rewind gate then
   /// knows rank 1 can replay this boundary.
   void MaybeSnapshotFrontier(const State& mirrored) const;
+  /// Restores a frontier snapshot whose prompt is exactly this request's;
+  /// returns the restored token count, zero when none matches.
+  [[nodiscard]] std::size_t RestoreMirroredFrontier(
+      const State& mirrored, std::span<const TextRunnerToken> prompt,
+      std::size_t max_input_tokens) const;
+  /// Sends a rewind reconcile, optionally naming the snapshot to replay.
+  void SendReconcile(const State& mirrored, std::size_t position,
+                     std::uint64_t snapshot_id) const;
 
   /// Whether rank 1 can mirror the multi-token cycles of the request `state`
   /// is leased to: always without a constraint, else when rank 1 rebuilt it.

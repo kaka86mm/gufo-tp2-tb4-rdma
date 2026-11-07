@@ -242,7 +242,10 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
                            instruction.op == TpInstructionOp::kRestore ||
                            instruction.op == TpInstructionOp::kDrop ||
                            instruction.op == TpInstructionOp::kPersist;
-  if (snapshot_op != (instruction.snapshot_id != 0)) {
+  // A reconcile rewinds by position alone, or names the mirror snapshot to
+  // replay; every other snapshot op must carry exactly one id.
+  if (instruction.op != TpInstructionOp::kReconcile &&
+      snapshot_op != (instruction.snapshot_id != 0)) {
     SetError(error, "TP instruction snapshot ID is invalid");
     return false;
   }

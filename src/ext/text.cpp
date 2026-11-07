@@ -46,6 +46,12 @@ bool TextModelRunner::CanServeRewind(const TextRunnerState&,
   return true;
 }
 
+bool TextModelRunner::FrontierSnapshotMatches(const std::shared_ptr<void>&,
+                                              std::span<const TextRunnerToken>)
+    const {
+  return false;
+}
+
 void TextModelRunner::AdvanceBatch(
     std::span<const TextRunnerAdvance> advances) const {
   for (const auto& advance : advances) {

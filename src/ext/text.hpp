@@ -515,6 +515,10 @@ public:
   /// cache consults it before restoring a retained checkpoint.
   [[nodiscard]] virtual bool CanServeRewind(
       const TextRunnerState& state, std::size_t position) const;
+  /// Whether the snapshot holds exactly this prompt at its frontier.
+  [[nodiscard]] virtual bool FrontierSnapshotMatches(
+      const std::shared_ptr<void>& snapshot,
+      std::span<const TextRunnerToken> prompt) const;
   [[nodiscard]] virtual bool HasDecodeFrontier(const TextRunnerState&) const {
     return true;
   }

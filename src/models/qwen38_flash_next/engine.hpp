@@ -460,6 +460,8 @@ public:
   [[nodiscard]] std::uint64_t DeviceBytes() const;
   /// Materializes borrowed rows; may throw on a failed device transfer.
   [[nodiscard]] std::span<const std::uint8_t> bytes() const;
+  /// The context tokens the snapshot holds, without materializing rows.
+  [[nodiscard]] std::span<const std::int32_t> Tokens() const noexcept;
   [[nodiscard]] bool CopyTo(std::span<std::uint8_t> destination) const noexcept;
 
 private:

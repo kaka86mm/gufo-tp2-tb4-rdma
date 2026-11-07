@@ -337,6 +337,14 @@ struct TextRunnerPool::Request::Impl {
     count = LegalStop(count, false);
     if (count == 0)
       count = prompt.size();
+    // A single-pass prefill never stands on the rounded-down boundary (the
+    // pass runs to the prompt end), so the armed target would be unreachable
+    // forever. Arm the complete prompt: the pool restores an exact prompt
+    // boundary for an unchanged retry without alignment.
+    if (runner->Descriptor().capabilities.single_pass_prefill &&
+        prefill_offset < prompt.size()) {
+      count = prompt.size();
+    }
     // A newly consumed image needs its own stable checkpoint. Otherwise the
     // next assistant turn can invalidate the complete prompt's framing and
     // force the image through prefill again from the older text frontier.
@@ -381,17 +389,24 @@ struct TextRunnerPool::Request::Impl {
       // aligned prompt tail too, or a longer request loses all reuse when
       // Acquire rejects the exact unaligned prompt checkpoint. Advancing this
       // target still captures the complete prompt for unchanged retries.
+      const bool single_pass =
+          runner->Descriptor().capabilities.single_pass_prefill;
       if (count > prefill_offset && count < prompt.size()) {
         count = std::max(Aligned(count), prefill_offset);
-      } else if (const auto aligned = Aligned(count);
-                 aligned > prefill_offset && aligned < count &&
-                 lease->TryReserveSnapshot(
-                     lease->CaptureBytes(aligned), aligned, retain_fallback,
-                     SnapshotPurpose::kContinuation,
-                     std::span<const TextRunnerToken>(prompt).first(aligned))) {
-        // A disabled cache (or a refused disk-only capture) must not prepare
-        // checkpoint scratch or split a pass for a fallback it cannot keep.
-        count = aligned;
+      } else if (!single_pass) {
+        // A single-pass prefill runs past an intermediate aligned target
+        // without standing on it; the pool's exact-retry exemption keeps the
+        // complete-prompt snapshot enough for an unchanged retry.
+        const auto aligned = Aligned(count);
+        if (aligned > prefill_offset && aligned < count &&
+            lease->TryReserveSnapshot(
+                lease->CaptureBytes(aligned), aligned, retain_fallback,
+                SnapshotPurpose::kContinuation,
+                std::span<const TextRunnerToken>(prompt).first(aligned))) {
+          // A disabled cache (or a refused disk-only capture) must not prepare
+          // checkpoint scratch or split a pass for a fallback it cannot keep.
+          count = aligned;
+        }
       }
     }
     snapshot_tokens.reserve(prompt.size());
@@ -518,9 +533,8 @@ struct TextRunnerPool::Request::Impl {
   }
 
   void StartPromptSnapshot(bool wait) noexcept {
-    if (prompt_snapshot_attempted || prefill_offset != snapshot_tokens.size()) {
+    if (prompt_snapshot_attempted || prefill_offset != snapshot_tokens.size())
       return;
-    }
     prompt_snapshot_attempted = true;
 
     TextRunnerCapabilities capabilities;
@@ -591,6 +605,11 @@ struct TextRunnerPool::Request::Impl {
   void FinishPromptSnapshot() noexcept {
     try {
       prompt_snapshot = snapshot_future.get();
+    } catch (const std::exception& error) {
+      Logger::Info("cache",
+                   "schema=component-cache-v1 event=capture_exception reason=" +
+                       std::string(error.what()));
+      prompt_snapshot.reset();
     } catch (...) {
       prompt_snapshot.reset();
     }
