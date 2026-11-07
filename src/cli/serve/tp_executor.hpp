@@ -243,6 +243,9 @@ public:
 private:
   class State;
   class SnapshotHandle;
+  /// Pool slots are persistent: a re-leased slot keeps its mirrored state
+  /// id, so rank 1 maps the lease onto the slot's existing session.
+  std::unordered_map<const void*, std::uint32_t> slot_state_ids_;
   class CallScope;
   /// An open request's share of the instruction stream.
   struct Request {

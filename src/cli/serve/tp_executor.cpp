@@ -862,7 +862,15 @@ std::unique_ptr<TextRunnerState> TpMirroredRunner::BindComponentState(
     return nullptr;
   }
   const std::lock_guard<std::mutex> lock(mutex_);
-  return std::make_unique<State>(this, std::move(inner), next_state_id_++);
+  // The pool's slot objects are persistent, and the engine session a bind
+  // wraps is the slot's: a re-leased slot must keep its mirrored id so rank
+  // 1 maps the lease onto the same session with its full history instead of
+  // a fresh one.
+  const auto inserted = slot_state_ids_.try_emplace(&slot, next_state_id_);
+  if (inserted.second) {
+    ++next_state_id_;
+  }
+  return std::make_unique<State>(this, std::move(inner), inserted.first->second);
 }
 
 void TpMirroredRunner::ReconcileComponentState(TextRunnerState& state,
