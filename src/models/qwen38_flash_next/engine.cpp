@@ -1050,6 +1050,12 @@ bool Session::SyncImpl(
     if (std::getenv("GUFO_TP_TRACE") != nullptr) { std::fprintf(stderr, "[tptrace-e] %s\n", std::string("sync SHORT-CIRCUIT identical common=") + std::to_string(common)); }
     return true;
   }
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    std::fprintf(stderr,
+                 "[sy] tokens=%zu prompt=%zu common=%zu valid=%d\n",
+                 tokens_.size(), prompt.size(), common, valid_ ? 1 : 0);
+    std::fflush(stderr);
+  }
   if (common != tokens_.size()) {
     Reset();
     common = 0;
