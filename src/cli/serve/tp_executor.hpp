@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -144,7 +145,8 @@ public:
       std::shared_ptr<TextModelRunner> inner,
       std::shared_ptr<TpInstructionSink> sink,
       std::size_t snapshot_budget = std::numeric_limits<std::size_t>::max(),
-      std::shared_ptr<TpCallScope> scope = {});
+      std::shared_ptr<TpCallScope> scope = {},
+      bool mirror_snapshots = false);
 
   /// Opens `sequence`, the request rank 1 was just told about. Its model calls
   /// are those on the state the pool leases to it, which `SetPromptContext`
@@ -212,6 +214,8 @@ public:
       cache::Adapter& adapter, cache::Slot& slot) const override;
   void ReconcileComponentState(TextRunnerState& state,
                                std::size_t position) const override;
+  [[nodiscard]] bool CanServeRewind(const TextRunnerState& state,
+                                    std::size_t position) const override;
   [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
       TextRunnerState& state, sampling::SamplerState& sampler) const override;
   void PreparePrefixReuse(
@@ -246,6 +250,18 @@ private:
   /// Pool slots are persistent: a re-leased slot keeps its mirrored state
   /// id, so rank 1 maps the lease onto the slot's existing session.
   mutable std::unordered_map<const void*, std::uint32_t> slot_state_ids_;
+  /// Boundaries rank 1 holds a frontier snapshot for, to the snapshot id.
+  /// Registration follows rank 1's acknowledgement, and rank 1 never evicts
+  /// on its own, so this set stays a subset of rank 1's store.
+  mutable std::map<std::pair<std::uint32_t, std::size_t>, std::uint64_t>
+      mirror_snapshots_;
+  /// Per state, the retained snapshot ids, oldest first (bounded ring).
+  mutable std::unordered_map<std::uint32_t, std::vector<std::uint64_t>>
+      mirror_rings_;
+  mutable std::uint64_t mirror_bytes_{0};
+  /// States whose prefill ran but whose frontier is not snapshotted yet.
+  mutable std::unordered_map<std::uint32_t, bool> prefill_dirty_;
+  bool mirror_snapshots_enabled_{false};
   class CallScope;
   /// An open request's share of the instruction stream.
   struct Request {
@@ -259,6 +275,10 @@ private:
     std::uint64_t index{0};
   };
   void Drop(std::uint64_t id) const noexcept;
+  /// Captures the state's frontier on both ranks at the first advancing call
+  /// after a prefill, within the mirror budget; the pool's rewind gate then
+  /// knows rank 1 can replay this boundary.
+  void MaybeSnapshotFrontier(const State& mirrored) const;
 
   /// Whether rank 1 can mirror the multi-token cycles of the request `state`
   /// is leased to: always without a constraint, else when rank 1 rebuilt it.
@@ -383,6 +403,17 @@ private:
   std::unordered_map<std::uint64_t, std::unique_ptr<Request>> requests_;
   std::uint64_t next_index_{0};
   void DropSnapshot(std::uint64_t id);
+  /// A frontier snapshot rank 1 holds for a later rewind, by rank 0's id.
+  struct StoredSnapshot {
+    std::shared_ptr<void> handle;
+    std::uint32_t state{0};
+    std::size_t position{0};
+  };
+  void StoreSnapshot(std::uint64_t id, std::uint32_t state,
+                     std::size_t position, std::shared_ptr<void> handle);
+  std::unordered_map<std::uint64_t, StoredSnapshot> snapshots_by_id_;
+  std::map<std::pair<std::uint32_t, std::size_t>, std::uint64_t>
+      snapshot_keys_;
 };
 
 }  // namespace gufo::server

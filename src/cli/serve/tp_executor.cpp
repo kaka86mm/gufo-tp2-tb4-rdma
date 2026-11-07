@@ -420,11 +420,13 @@ private:
 TpMirroredRunner::TpMirroredRunner(std::shared_ptr<TextModelRunner> inner,
                                    std::shared_ptr<TpInstructionSink> sink,
                                    std::size_t snapshot_budget,
-                                   std::shared_ptr<TpCallScope> scope)
+                                   std::shared_ptr<TpCallScope> scope,
+                                   bool mirror_snapshots)
     : inner_(std::move(inner)),
       sink_(std::move(sink)),
       snapshot_budget_(snapshot_budget),
-      scope_(std::move(scope)) {
+      scope_(std::move(scope)),
+      mirror_snapshots_enabled_(mirror_snapshots) {
   if (inner_ == nullptr || sink_ == nullptr) {
     throw std::invalid_argument("TP mirrored runner needs a runner and a sink");
   }
@@ -691,6 +693,10 @@ TextRunnerDescriptor TpMirroredRunner::Descriptor() const {
   // Splitting a prefill step at a snapshot boundary poisons the TP2
   // inject-parts chain; each chunk runs as one pass.
   descriptor.capabilities.single_pass_prefill = true;
+  // Retained checkpoints rewind through mirrored frontier snapshots, which
+  // exist per state at the prompt boundary only: the pool restores only
+  // into the capturing slot and only mirror-covered boundaries.
+  descriptor.capabilities.same_state_rewind_only = true;
   return descriptor;
 }
 
@@ -968,6 +974,10 @@ TextPrefillStep TpMirroredRunner::Prefill(
   Record(sent.sequence, [&](TpExecutionDigest& digest) {
     DigestTpPrefill(digest, step, inner_->CheckpointPosition(mirrored.inner()));
   });
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    prefill_dirty_[mirrored.id()] = true;
+  }
   return step;
 }
 
@@ -980,6 +990,7 @@ void TpMirroredRunner::Advance(TextRunnerState& state,
                                TextRunnerToken token) const {
   const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
   auto& mirrored = Mirrored(state);
+  MaybeSnapshotFrontier(mirrored);
   const auto sent = Send(mirrored.id(), {.op = TpInstructionOp::kAdvance,
                                          .state = mirrored.id(),
                                          .token = TokenToWire(token)});
@@ -1014,6 +1025,7 @@ TextDecodeStep TpMirroredRunner::DecodeStep(
     return TextModelRunner::DecodeStep(state, max_tokens, sampler);
   }
   auto& mirrored = Mirrored(state);
+  MaybeSnapshotFrontier(mirrored);
   const auto count = ToWire(max_tokens, "decode budget");
   const auto draw = sampler.SaveDrawState();
   // Rank 0's draft count fixes the cycle width on both ranks: rank 1's own
@@ -1076,6 +1088,7 @@ std::vector<TextDecodeStep> TpMirroredRunner::DecodeBatch(
   inner.reserve(decodes.size());
   for (const auto& decode : decodes) {
     auto& mirrored = Mirrored(decode.state.get());
+    MaybeSnapshotFrontier(mirrored);
     const auto draw = decode.sampler.get().SaveDrawState();
     instruction.batch.push_back(
         {.state = mirrored.id(),
@@ -1242,6 +1255,76 @@ std::uint64_t TpMirroredRunner::CacheCall(
     throw;
   }
   return sequence;
+}
+
+bool TpMirroredRunner::CanServeRewind(const TextRunnerState& state,
+                                      std::size_t position) const {
+  const auto& mirrored = Mirrored(state);
+  const std::lock_guard<std::mutex> lock(mutex_);
+  return mirror_snapshots_.count({mirrored.id(), position}) != 0;
+}
+
+void TpMirroredRunner::MaybeSnapshotFrontier(const State& mirrored) const {
+  if (!mirror_snapshots_enabled_)
+    return;
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    const auto dirty = prefill_dirty_.find(mirrored.id());
+    if (dirty == prefill_dirty_.end() || !dirty->second)
+      return;
+    dirty->second = false;
+  }
+  std::uint64_t bytes = 0;
+  std::string error;
+  std::shared_ptr<void> handle;
+  try {
+    handle = inner_->CaptureFrontierSnapshot(mirrored.inner(), &bytes, &error);
+  } catch (...) {
+    // A failed capture only loses this turn's rewind: the pool's gate then
+    // treats the boundary as a miss.
+    return;
+  }
+  if (handle == nullptr)
+    return;
+  const auto position = inner_->CheckpointPosition(mirrored.inner());
+  if (position == 0)
+    return;
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (mirror_bytes_ + bytes > snapshot_budget_ && !mirror_snapshots_.empty())
+      return;  // over budget: keep what rank 1 already holds instead
+  }
+  const std::uint64_t id = next_snapshot_id_++;
+  try {
+    (void)CacheCall(mirrored.id(),
+                    {.op = TpInstructionOp::kSnapshot,
+                     .state = mirrored.id(),
+                     .snapshot_id = id},
+                    [] {});
+  } catch (...) {
+    // Rank 1 could not capture: both ranks treat the snapshot as skipped.
+    return;
+  }
+  std::vector<std::uint64_t> retire;
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    const std::pair<std::uint32_t, std::size_t> key{mirrored.id(), position};
+    if (const auto existing = mirror_snapshots_.find(key);
+        existing != mirror_snapshots_.end())
+      retire.push_back(existing->second);
+    mirror_snapshots_[key] = id;
+    auto& ring = mirror_rings_[mirrored.id()];
+    ring.push_back(id);
+    while (ring.size() > 2) {
+      retire.push_back(ring.front());
+      ring.erase(ring.begin());
+    }
+    mirror_bytes_ += bytes;
+  }
+  for (const auto dropped : retire) {
+    if (dropped != id)
+      Drop(dropped);
+  }
 }
 
 void TpMirroredRunner::Drop(std::uint64_t id) const noexcept {
@@ -1459,9 +1542,28 @@ bool TpExecutor::EndScope(std::uint64_t index, std::string* error) {
   return true;
 }
 
-void TpExecutor::DropSnapshot(std::uint64_t) {
-  // The v0.28-era mirrored snapshot store is gone with the classic cache;
-  // rank 0 no longer sends kSnapshot/kRestore under TP2.
+void TpExecutor::StoreSnapshot(std::uint64_t id, std::uint32_t state,
+                               std::size_t position,
+                               std::shared_ptr<void> handle) {
+  DropSnapshot(id);
+  const std::pair<std::uint32_t, std::size_t> key{state, position};
+  if (const auto existing = snapshot_keys_.find(key);
+      existing != snapshot_keys_.end())
+    DropSnapshot(existing->second);
+  snapshot_keys_[key] = id;
+  snapshots_by_id_[id] = StoredSnapshot{std::move(handle), state, position};
+}
+
+void TpExecutor::DropSnapshot(std::uint64_t id) {
+  const auto found = snapshots_by_id_.find(id);
+  if (found == snapshots_by_id_.end())
+    return;
+  const std::pair<std::uint32_t, std::size_t> key{found->second.state,
+                                                  found->second.position};
+  const auto keyed = snapshot_keys_.find(key);
+  if (keyed != snapshot_keys_.end() && keyed->second == id)
+    snapshot_keys_.erase(keyed);
+  snapshots_by_id_.erase(found);
 }
 
 bool TpExecutor::Execute(const TpControlCommand& command,
@@ -1586,8 +1688,26 @@ bool TpExecutor::ExecuteIdle(const TpInstruction& instruction,
     } else if (instruction.op == TpInstructionOp::kPromptContext) {
       runner_->SetPromptContext(StateFor(instruction.state), nullptr);
     } else if (instruction.op == TpInstructionOp::kReconcile) {
-      runner_->ReconcileComponentState(StateFor(instruction.state),
-                                       instruction.count);
+      auto& state = StateFor(instruction.state);
+      const auto position = static_cast<std::size_t>(instruction.count);
+      const auto current = runner_->CheckpointPosition(state);
+      if (position != 0 && current != position) {
+        // Rank 0's pool restored a retained checkpoint: replay the rewind
+        // from the mirrored frontier snapshot, whether this session advanced
+        // past the boundary or was recycled since.
+        const auto found =
+            snapshot_keys_.find({instruction.state, position});
+        if (found == snapshot_keys_.end())
+          throw std::runtime_error(
+              "rank 1 lacks the mirrored rewind snapshot");
+        const auto& stored = snapshots_by_id_.at(found->second);
+        std::string restore_error;
+        if (!runner_->RestoreFrontierSnapshot(state, stored.handle,
+                                              &restore_error))
+          throw std::runtime_error("rank 1 rewind restore failed: " +
+                                   restore_error);
+      }
+      runner_->ReconcileComponentState(state, position);
     } else {
       StateFor(instruction.state).Invalidate();
       if (instruction.state >= initial_state_count_ &&
@@ -1640,11 +1760,24 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
     // ranks alike.
     state.SetStopAtEos(request.stop_at_eos);
     switch (instruction.op) {
-      case TpInstructionOp::kSnapshot:
+      case TpInstructionOp::kSnapshot: {
+        // The engine's borrowed snapshot holds the same frontier rank 0's
+        // pool captured: identical rows by the digest the call carries.
+        choice.reset();
+        std::uint64_t bytes = 0;
+        std::string capture_error;
+        auto handle = runner_->CaptureFrontierSnapshot(state, &bytes,
+                                                       &capture_error);
+        if (handle == nullptr)
+          throw std::runtime_error("rank 1 frontier capture failed: " +
+                                   capture_error);
+        StoreSnapshot(instruction.snapshot_id, instruction.state,
+                      runner_->CheckpointPosition(state), std::move(handle));
+        break;
+      }
       case TpInstructionOp::kDrop:
       case TpInstructionOp::kRestore:
-        // The v0.28-era mirrored snapshot store is gone with the classic
-        // cache; rank 0 sends none of these under TP2.
+        // kDrop arrives on the idle channel; kRestore stayed a v0.28 op.
         throw std::logic_error("TP snapshot op is not mirrored anymore");
       case TpInstructionOp::kReuse:
         choice.reset();

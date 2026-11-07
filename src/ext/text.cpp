@@ -26,6 +26,26 @@ std::optional<TextRunnerRamCacheOptions> ParseRamCacheOption(
   return TextRunnerRamCacheOptions{.capacity_bytes = bytes};
 }
 
+std::shared_ptr<void> TextModelRunner::CaptureFrontierSnapshot(
+    const TextRunnerState&, std::uint64_t* bytes, std::string*) const {
+  if (bytes != nullptr)
+    *bytes = 0;
+  return nullptr;
+}
+
+bool TextModelRunner::RestoreFrontierSnapshot(TextRunnerState&,
+                                              const std::shared_ptr<void>&,
+                                              std::string* error) const {
+  if (error != nullptr)
+    *error = "runner does not support frontier snapshots";
+  return false;
+}
+
+bool TextModelRunner::CanServeRewind(const TextRunnerState&,
+                                     std::size_t) const {
+  return true;
+}
+
 void TextModelRunner::AdvanceBatch(
     std::span<const TextRunnerAdvance> advances) const {
   for (const auto& advance : advances) {

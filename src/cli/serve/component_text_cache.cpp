@@ -212,9 +212,12 @@ struct ComponentTextCache::Impl {
   std::array<std::shared_ptr<DurableCapture>, 2 * kPersistenceDepth>
       pending_durable;
   std::size_t disk_capacity{}, disk_step{};
-  // The cache's own RAM budget. The ledger limit adds what the slots pinned.
-  // Zero when the RAM cache is off.
+  /// The cache's own RAM budget. The ledger limit adds what the slots pinned.
+  /// Zero when the RAM cache is off.
   std::size_t budget{};
+  /// Restores rewind only the slot that captured the checkpoint, and only
+  /// when the mirror holds the same boundary (see TpMirroredRunner).
+  bool same_state_rewind_{false};
   // RAM backing committed only to copy captures on their way to disk.
   std::size_t disk_backing{};
   bool ram_enabled{true};
@@ -236,6 +239,9 @@ struct ComponentTextCache::Impl {
         index(ledger),
         retention(ledger, index, &events),
         ram_enabled(ram_on) {
+    // A mirrored pair restores only what rank 1 can replay in lockstep.
+    same_state_rewind_ =
+        this->runner->Descriptor().capabilities.same_state_rewind_only;
     metadata = ledger.Reserve(cache::ResourceCategory::kMetadata, sizeof(Impl))
                    .Convert();
     crypto::Sha256Hasher hash;
@@ -1025,6 +1031,32 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
         live = location;
       }
     }
+    if (!entry && impl_->same_state_rewind_) {
+      // A mirrored rewind replays only into the slot that captured it: steer
+      // the free entry owning the deepest compatible checkpoint before the
+      // ordinary cold selection, which would land anywhere.
+      for (const auto& candidate : found.candidates) {
+        if (!candidate.checkpoint)
+          continue;
+        std::optional<cache::BorrowedLocation> owner;
+        for (const auto& c : candidate.checkpoint->Components()) {
+          for (const auto& chunk : c.chunks)
+            owner = chunk.Storage().BorrowedFrom();
+          if (!owner && c.tail)
+            owner = c.tail->BorrowedFrom();
+          if (owner)
+            break;
+        }
+        if (!owner || owner->slot.value == 0 ||
+            owner->slot.value > impl_->entries.size())
+          continue;
+        auto& owner_entry = *impl_->entries.at(owner->slot.value - 1);
+        if (owner_entry.busy)
+          continue;
+        entry = &owner_entry;
+        break;  // candidates are deepest first
+      }
+    }
     if (!entry) {
       // A frontier far beyond every checkpoint of its prompt is the only
       // copy of that work, as for a conversation larger than the RAM budget
@@ -1176,6 +1208,13 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           (candidate.boundary % alignment != 0 &&
            candidate.boundary < prompt.size()))
         continue;
+      if (impl_->same_state_rewind_ && candidate.checkpoint &&
+          !impl_->runner->CanServeRewind(*request.state,
+                                         candidate.boundary)) {
+        // Rank 1 holds no frontier snapshot for this boundary of the
+        // selected state; a restore would leave the ranks apart.
+        continue;
+      }
       try {
         if (candidate.checkpoint) {
           const auto& checkpoint = *candidate.checkpoint;

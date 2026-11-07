@@ -119,6 +119,10 @@ struct TextRunnerCapabilities {
   bool single_pass_prefill{false};
   bool partial_prefill_retention{false};
   bool prefill_rollback{false};
+  /// A mirrored pair rewinds only through frontier snapshots rank 1 also
+  /// holds: the pool then restores a retained checkpoint only into the slot
+  /// that captured it, and only when the mirror kept the same boundary.
+  bool same_state_rewind_only{false};
   /// Prefill continues a prompt exactly only from positions divisible by
   /// this. Intermediate pass ends and published prompt checkpoints are
   /// rounded down to it, except the complete prompt, which only an
@@ -496,6 +500,21 @@ public:
   [[nodiscard]] virtual std::unique_ptr<TextRunnerState> BindComponentState(
       cache::Adapter&, cache::Slot&) const = 0;
   virtual void ReconcileComponentState(TextRunnerState&, std::size_t) const = 0;
+  /// Captures the state's current frontier as an opaque snapshot a mirrored
+  /// pair can restore later; null when the runner cannot capture one.
+  /// `bytes` receives the snapshot's memory cost for budget accounting.
+  [[nodiscard]] virtual std::shared_ptr<void> CaptureFrontierSnapshot(
+      const TextRunnerState& state, std::uint64_t* bytes,
+      std::string* error) const;
+  /// Replaces the state's context with a snapshot `CaptureFrontierSnapshot`
+  /// returned, at the snapshot's frontier.
+  [[nodiscard]] virtual bool RestoreFrontierSnapshot(
+      TextRunnerState& state, const std::shared_ptr<void>& snapshot,
+      std::string* error) const;
+  /// Whether a rewind to `position` can replay on every rank. The component
+  /// cache consults it before restoring a retained checkpoint.
+  [[nodiscard]] virtual bool CanServeRewind(
+      const TextRunnerState& state, std::size_t position) const;
   [[nodiscard]] virtual bool HasDecodeFrontier(const TextRunnerState&) const {
     return true;
   }

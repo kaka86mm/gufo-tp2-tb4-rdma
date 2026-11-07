@@ -603,14 +603,15 @@ bool InferenceBackend::load(
             std::make_shared<TpControlInstructionSink>(
                 tp_config.control, new_state->response_broker),
             tp_config.control->snapshot_budget_bytes(),
-            std::make_shared<CommunicatorCallScope>(tp_config.communicator));
+            std::make_shared<CommunicatorCallScope>(tp_config.communicator),
+            ram_cache_config.enabled);
         pool_runner = new_state->tp_runner;
       }
       if (tp_world_size > 1) {
-        // Live frontiers re-lease the still-resident state, whose engine
-        // history both ranks hold identically; the suffix prefill stays
-        // symmetric. Retained checkpoints stay off (their restore is
-        // rank0-only), so a non-live miss full-reprefills on both ranks.
+        // Live frontiers re-lease the still-resident state, and retained
+        // checkpoints rewind through the mirrored frontier snapshots: the
+        // pool restores only boundaries the mirror holds (same state), so
+        // any other miss still full-reprefills on both ranks.
       }
 #else
     std::shared_ptr<TextModelRunner> pool_runner = runner;

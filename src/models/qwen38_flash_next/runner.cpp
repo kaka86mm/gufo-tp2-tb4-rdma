@@ -288,6 +288,40 @@ public:
     RequireQwenFlashNextState(state).set_position(position);
   }
 
+  std::shared_ptr<void> CaptureFrontierSnapshot(
+      const TextRunnerState& state, std::uint64_t* bytes,
+      std::string* error) const override {
+    const auto& qfn = RequireQwenFlashNextState(state);
+    auto snapshot = qfn.session().SaveSnapshot(error);
+    if (snapshot == nullptr)
+      return nullptr;
+    // Borrowed device rows dominate; the host header is tokens, logits and
+    // the mutable state the executor copied into the payload.
+    std::uint64_t total = snapshot->DeviceBytes();
+    total += std::uint64_t{qfn.position()} * sizeof(std::int32_t) +
+             std::uint64_t{model_->VocabSize()} * sizeof(float) + 1024;
+    if (bytes != nullptr)
+      *bytes = total;
+    return std::shared_ptr<void>(std::move(snapshot));
+  }
+
+  bool RestoreFrontierSnapshot(TextRunnerState& state,
+                               const std::shared_ptr<void>& snapshot,
+                               std::string* error) const override {
+    auto& qfn = RequireQwenFlashNextState(state);
+    if (snapshot == nullptr) {
+      if (error != nullptr)
+        *error = "frontier snapshot handle is empty";
+      return false;
+    }
+    const auto& restored =
+        *static_cast<const SessionSnapshot*>(snapshot.get());
+    if (!qfn.session().RestoreSnapshot(restored, error))
+      return false;
+    qfn.set_position(qfn.session().Position());
+    return true;
+  }
+
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
     return {
         .model_id = model_->ModelName(),
