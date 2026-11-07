@@ -866,6 +866,12 @@ public:
                                              hipStream_t stream,
                                              std::string* error) override {
     std::lock_guard lock(mutex_);
+    if (const char* xt = std::getenv("GUFO_TIME_TRACE")) {
+      (void)xt;
+      std::fprintf(stderr, "[xt] start op=%llu bytes=%zu kind=exchange\n",
+                   static_cast<unsigned long long>(next_operation_), bytes);
+      std::fflush(stderr);
+    }
     if (!CheckExchange(data, bytes, error)) {
       return nullptr;
     }
@@ -896,6 +902,12 @@ public:
                                   hipStream_t stream,
                                   std::string* error) override {
     std::lock_guard lock(mutex_);
+    if (const char* xt = std::getenv("GUFO_TIME_TRACE")) {
+      (void)xt;
+      std::fprintf(stderr, "[xt] start op=%llu bytes=%zu kind=partial\n",
+                   static_cast<unsigned long long>(next_operation_), bytes);
+      std::fflush(stderr);
+    }
     if (!CheckExchange(data, bytes, error)) {
       return false;
     }
