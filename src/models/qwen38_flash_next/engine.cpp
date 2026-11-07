@@ -572,6 +572,7 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshotImpl(
           snapshot->data_)) {
     return nullptr;
   }
+  model_->executor_->DumpDraftAnchors(state, "save");
   return snapshot;
 }
 
@@ -706,6 +707,14 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
   // The restored keys keep the factor they were saved with; the next Feed or
   // decode moves the session to the factor its positions need.
   model_->executor_->AdoptYarnFactor(*session_, header.yarn_factor);
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    std::fprintf(stderr,
+                 "[rs] pos=%u mtp=%u hb=%u hrows=%u hidden_base=%u\n",
+                 info.position, info.hidden_rows > 0 ? 1U : 0U,
+                 hidden_base_, info.hidden_rows, hidden_base_);
+    std::fflush(stderr);
+  }
+  model_->executor_->DumpDraftAnchors(*session_, "after-restore");
   return true;
 }
 
@@ -757,6 +766,11 @@ bool Session::DraftReplay(std::int32_t next_token,
   replay->assign(tokens_.begin() + mp + 1, tokens_.end());
   replay->push_back(next_token);
   *hidden_row = static_cast<std::int32_t>(mp - hidden_base_);
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    std::fprintf(stderr, "[dcu] size=%u mp=%u hb=%u hrow=%d replay=%zu\n",
+                 size, mp, hidden_base_, *hidden_row, replay->size());
+    std::fflush(stderr);
+  }
   return true;
 }
 
@@ -929,6 +943,11 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     hidden_base_ = static_cast<std::uint32_t>(
         tokens_.size() + n -
         std::min<std::size_t>(kept, exec.max_speculative()));
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+      std::fprintf(stderr, "[hbp] hb=%u kept=%zu n=%u\n", hidden_base_, kept,
+                   n);
+      std::fflush(stderr);
+    }
     tokens_.insert(tokens_.end(), chunk_rows.begin(), chunk_rows.end());
     for (auto i = next_boundary; i < last_boundary; ++i) {
       const auto* capture = live ? nullptr : captures[i - next_boundary].get();
@@ -1452,6 +1471,10 @@ bool Session::FinishDecode(const DecodeRequest& request,
   if (!pending.speculative) {
     draft_length_.ObserveArToken();
     hidden_base_ = base;
+    if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+      std::fprintf(stderr, "[hbv] ar base=%u\n", base);
+      std::fflush(stderr);
+    }
     tokens_.push_back(anchor);
     sampler.Accept(static_cast<sampling::TokenId>(anchor));
     result->tokens.push_back(anchor);
@@ -1622,6 +1645,10 @@ bool Session::FinishDecode(const DecodeRequest& request,
                 logits_.begin());
   }
   hidden_base_ = base;
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    std::fprintf(stderr, "[hbv] keep=%u base=%u k=%u\n", keep, base, k);
+    std::fflush(stderr);
+  }
   tokens_.insert(tokens_.end(), chain.begin(), chain.begin() + keep);
   result->tokens.assign(chain.begin(), chain.begin() + keep);
   stats_.cycles += 1;

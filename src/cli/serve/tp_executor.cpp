@@ -1548,6 +1548,13 @@ TextRunnerState& TpExecutor::StateFor(std::uint32_t id) {
   }
   state_use_[id] = instructions_;
   state_dead_[id] = false;
+  if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+    std::fprintf(stderr, "[st] serve id=%zu pos=%llu instr=%llu\n", id,
+                 static_cast<unsigned long long>(runner_->CheckpointPosition(
+                     *states_[id])),
+                 static_cast<unsigned long long>(instructions_));
+    std::fflush(stderr);
+  }
   return *states_[id];
 }
 
@@ -1566,12 +1573,13 @@ void TpExecutor::RecycleIdleStates() {
   }
   // Rank 0's pool announces retirement with kInvalidate; ids are monotonic
   // and never reused, so a dead flag is permanent. Free those as soon as no
-  // open request names the state. The idle margin only backstops states
-  // that somehow retire without an invalidate; it must stay short because
-  // the margin itself is the steady-state leak (one state per margin's
-  // worth of instructions). The pool's initial states are re-prepared with
-  // kPromptContext and are never freed here.
-  constexpr std::uint64_t kIdleInstructions = 64;
+  // open request names the state. The idle margin is a backstop only: with
+  // slot-stable ids the state count is bounded by the pool's slots, and the
+  // pool keeps a slot's live frontier resident for unbounded time - a short
+  // margin recycled sessions rank 0 still live-reuses (its kReconcile then
+  // names content rank 1 no longer holds, and the ranks diverge). The
+  // margin therefore only catches pathological runaway ids.
+  constexpr std::uint64_t kIdleInstructions = 1 << 20;
   const std::uint64_t cutoff =
       instructions_ > kIdleInstructions ? instructions_ - kIdleInstructions : 0;
   for (std::size_t id = 0; id < states_.size(); ++id) {
@@ -1774,7 +1782,18 @@ bool TpExecutor::ExecuteIdle(const TpInstruction& instruction,
     } else if (instruction.op == TpInstructionOp::kPersist) {
       // The mirrored disk store is gone with the classic cache.
     } else if (instruction.op == TpInstructionOp::kPromptContext) {
-      runner_->SetPromptContext(StateFor(instruction.state), nullptr);
+      auto& bound = StateFor(instruction.state);
+      if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+        std::fprintf(stderr, "[pc] idle pre pos=%llu\n",
+                     static_cast<unsigned long long>(
+                         runner_->CheckpointPosition(bound)));
+      }
+      runner_->SetPromptContext(bound, nullptr);
+      if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+        std::fprintf(stderr, "[pc] idle post pos=%llu\n",
+                     static_cast<unsigned long long>(
+                         runner_->CheckpointPosition(bound)));
+      }
     } else if (instruction.op == TpInstructionOp::kReconcile) {
       auto& state = StateFor(instruction.state);
       const auto position = static_cast<std::size_t>(instruction.count);
@@ -1917,7 +1936,17 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
         throw std::logic_error("rank 1 has no disk cache");
       case TpInstructionOp::kPromptContext:
         DigestTpContext(request.digest, request.images);
+        if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+          std::fprintf(stderr, "[pc] req pre pos=%llu\n",
+                       static_cast<unsigned long long>(
+                           runner_->CheckpointPosition(state)));
+        }
         runner_->SetPromptContext(state, request.images);
+        if (std::getenv("GUFO_TP_TRACE") != nullptr) {
+          std::fprintf(stderr, "[pc] req post pos=%llu\n",
+                       static_cast<unsigned long long>(
+                           runner_->CheckpointPosition(state)));
+        }
         break;
       case TpInstructionOp::kInvalidate:
         choice.reset();

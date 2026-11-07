@@ -514,6 +514,10 @@ public:
                                             std::uint32_t hidden_rows) const;
   [[nodiscard]] std::uint64_t PrefillCheckpointBytes(
       const Session& session, std::uint32_t position) const;
+  /// Trace-only: dumps the draft anchors both ranks must agree on after a
+  /// snapshot save/restore (positions, hidden carry, kept-hidden ring,
+  /// draft KV row).
+  void DumpDraftAnchors(const Session& session, const char* tag) const;
   [[nodiscard]] bool SaveSnapshot(
       const Session& session, std::uint32_t hidden_rows,
       std::span<std::uint8_t> payload, std::string* error_msg,

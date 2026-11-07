@@ -5516,6 +5516,78 @@ std::uint64_t Executor::PrefillCheckpointBytes(const Session& session,
                          std::uint64_t, bool, bool) { return true; });
 }
 
+namespace {
+std::uint64_t AnchFnv(const float* data, std::size_t floats) {
+  std::uint64_t h = 1469598103934665603ULL;
+  for (std::size_t i = 0; i < floats; ++i) {
+    std::uint32_t b;
+    std::memcpy(&b, &data[i], sizeof(b));
+    h = (h ^ b) * 1099511628211ULL;
+  }
+  return h;
+}
+}  // namespace
+
+void Executor::DumpDraftAnchors(const Session& session,
+                                const char* tag) const {
+  if (std::getenv("GUFO_TP_TRACE") == nullptr)
+    return;
+  try {
+    const auto hc = config().HcDim();
+    const std::uint32_t rows = options_.max_speculative;
+    std::vector<float> host(static_cast<std::size_t>(rows) * hc + hc);
+    std::string line = "h=";
+    char piece[32];
+    (void)hipMemcpyAsync(host.data(), session.mtp_.h, hc * sizeof(float),
+                         hipMemcpyDeviceToHost, stream_);
+    (void)hipStreamSynchronize(stream_);
+    std::snprintf(piece, sizeof(piece), "%016llx",
+                  static_cast<unsigned long long>(AnchFnv(host.data(), hc)));
+    line += piece;
+    (void)hipMemcpyAsync(host.data(), session.mtp_.target_hidden,
+                         static_cast<std::size_t>(rows) * hc * sizeof(float),
+                         hipMemcpyDeviceToHost, stream_);
+    (void)hipStreamSynchronize(stream_);
+    line += " ring=";
+    for (std::uint32_t r = 0; r < rows && r < 8; ++r) {
+      std::snprintf(piece, sizeof(piece), "%016llx",
+                    static_cast<unsigned long long>(AnchFnv(
+                        host.data() + static_cast<std::size_t>(r) * hc, hc)));
+      line += piece;
+      if (r + 1 < rows && r + 1 < 8)
+        line += ",";
+    }
+    __half kv[16] = {};
+    const std::size_t kv_dim = model_->mtp().heads.AttentionKvDim();
+    (void)hipMemcpyAsync(kv,
+                         session.mtp_.k_cache +
+                             static_cast<std::size_t>(session.mtp_.position) *
+                                 kv_dim,
+                         sizeof(kv), hipMemcpyDeviceToHost, stream_);
+    (void)hipStreamSynchronize(stream_);
+    std::uint64_t kh = 1469598103934665603ULL;
+    for (std::size_t i = 0; i < 16; ++i) {
+      const std::uint16_t bits = [&] {
+        std::uint16_t v;
+        std::memcpy(&v, &kv[i], sizeof(v));
+        return v;
+      }();
+      kh = (kh ^ bits) * 1099511628211ULL;
+    }
+    std::fprintf(
+        stderr,
+        "[anch] tag=%s pos=%u mtp=%u blocks=%u mtpblocks=%u ctrl_hrow=%d "
+        "resvalid=%d %s kv=%016llx\n",
+        tag, session.position_, session.mtp_.position, session.blocks_,
+        session.mtp_.blocks,
+        control_host_ != nullptr ? control_host_->hidden_row : -2,
+        session.mtp_.residual_valid ? 1 : 0, line.c_str(),
+        static_cast<unsigned long long>(kh));
+    std::fflush(stderr);
+  } catch (...) {
+  }
+}
+
 bool Executor::RestoreSnapshot(Session& session,
                                std::span<const std::uint8_t> payload,
                                SnapshotInfo* info, std::string* error_msg,
