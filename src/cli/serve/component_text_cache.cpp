@@ -1009,6 +1009,14 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     if (reuse && !found.selected)
       common =
           impl_->index.CommonPrefixTokens({impl_->identity, prompt, input});
+    if (std::getenv("GUFO_TIME_TRACE") != nullptr) {
+      std::fprintf(stderr,
+                   "[pool] acquire selected=%d live=%d boundary=%zu busy=?\n",
+                   found.selected ? 1 : 0,
+                   (found.selected && found.selected->live) ? 1 : 0,
+                   found.selected ? found.selected->boundary : 0);
+      std::fflush(stderr);
+    }
     if (found.selected && found.selected->live) {
       const auto location = *found.selected->live;
       auto& selected_entry = *impl_->entries.at(location.slot.value - 1);

@@ -1407,6 +1407,13 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
       position <= impl_->prefill_offset) {
     checkpoint.clear();
   }
+  if (std::getenv("GUFO_TIME_TRACE") != nullptr) {
+    std::fprintf(stderr,
+                 "[pool] commit pos=%zu ckpt=%zu align=%zu cached=%zu\n",
+                 position, checkpoint.size(), impl_->alignment,
+                 impl_->lease->cached_tokens());
+    std::fflush(stderr);
+  }
   CommitMetrics metrics = impl_->snapshot_metrics;
   metrics.snapshot_bytes += impl_->lease->Commit(
       std::move(impl_->snapshot_tokens), std::move(impl_->prompt_snapshot),
