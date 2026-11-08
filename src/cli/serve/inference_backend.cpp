@@ -530,10 +530,13 @@ bool InferenceBackend::load(
     const std::uint32_t tp_world_size = tp_config.world_size;
     const std::uint32_t tp_rank = tp_config.rank;
     const bool has_mtp = true;  // TP2 text production always runs MTP
-    const bool has_vision = false;
     const TextSpeculativeConfig speculative_config{};
     const bool model_yarn = false;
     const auto desc = runner->Descriptor();
+    // The vision encoder sidecar loaded with the model decides both the
+    // served modality and the TP handshake declaration (rank 1 validates
+    // its own against this, so both ranks derive it from the same runner).
+    const bool has_vision = desc.capabilities.supports_vision;
     if (desc.sampling_defaults.has_value()) {
       sampling::ValidateTextSamplingDefaults(*desc.sampling_defaults);
     }
@@ -546,7 +549,7 @@ bool InferenceBackend::load(
             : sampling::PresetDefaults(desc.sampling_preset);
     new_state->sampling_defaults.sampling = sampling::SamplingConfig{};
     new_state->sampling_defaults.supplied = {};
-    new_state->supports_images = false;  // TODO(v0.28 port): descriptor modalities
+    new_state->supports_images = desc.capabilities.supports_vision;
     // runner arrives pre-built from the provider path
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = runner->Descriptor().max_context;

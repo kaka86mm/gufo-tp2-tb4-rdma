@@ -306,6 +306,107 @@ public:
     return std::shared_ptr<void>(std::move(snapshot));
   }
 
+  std::vector<std::uint8_t> EncodePromptContext(
+      const ext::TextPromptContext& context) const override {
+    const auto* image = dynamic_cast<const QwenImageContext*>(&context);
+    if (image == nullptr || image->prompt == nullptr)
+      throw std::invalid_argument("invalid Qwen image prompt context");
+    const auto& prompt = *image->prompt;
+    std::vector<std::uint8_t> bytes;
+    const auto put32 = [&bytes](std::uint32_t value) {
+      for (int i = 3; i >= 0; --i)
+        bytes.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
+    };
+    bytes.push_back(1);  // wire version
+    put32(static_cast<std::uint32_t>(prompt.cache_identity.size()));
+    bytes.insert(bytes.end(), prompt.cache_identity.begin(),
+                 prompt.cache_identity.end());
+    put32(static_cast<std::uint32_t>(prompt.rope.images.size()));
+    for (const auto& grid : prompt.rope.images) {
+      put32(grid.offset);
+      put32(grid.height);
+      put32(grid.width);
+    }
+    put32(static_cast<std::uint32_t>(prompt.images.size()));
+    for (const auto& prepared : prompt.images) {
+      put32(prepared.grid.offset);
+      put32(prepared.grid.height);
+      put32(prepared.grid.width);
+      bytes.insert(bytes.end(), prepared.prefix_identity.begin(),
+                   prepared.prefix_identity.end());
+      const std::uint32_t width =
+          prepared.pixels ? prepared.pixels->width : 0;
+      const std::uint32_t height =
+          prepared.pixels ? prepared.pixels->height : 0;
+      const auto& pixels =
+          prepared.pixels ? prepared.pixels->pixels : std::vector<std::uint8_t>{};
+      if (pixels.size() != std::size_t{width} * height * 3)
+        throw std::invalid_argument("image pixels are not packed RGB8");
+      put32(width);
+      put32(height);
+      put32(static_cast<std::uint32_t>(pixels.size()));
+      bytes.insert(bytes.end(), pixels.begin(), pixels.end());
+    }
+    return bytes;
+  }
+
+  std::shared_ptr<const ext::TextPromptContext> DecodePromptContext(
+      std::span<const std::uint8_t> bytes) const override {
+    if (bytes.empty() || bytes.front() != 1)
+      throw std::invalid_argument("unsupported Qwen image context version");
+    std::size_t at = 1;
+    const auto take = [&](std::size_t count) {
+      if (at + count > bytes.size())
+        throw std::invalid_argument("truncated Qwen image context");
+      const auto first = bytes.begin() + static_cast<std::ptrdiff_t>(at);
+      at += count;
+      return std::vector<std::uint8_t>(first, first + static_cast<std::ptrdiff_t>(count));
+    };
+    const auto take32 = [&]() {
+      const auto raw = take(4);
+      return static_cast<std::uint32_t>(raw[0]) << 24 |
+             static_cast<std::uint32_t>(raw[1]) << 16 |
+             static_cast<std::uint32_t>(raw[2]) << 8 |
+             static_cast<std::uint32_t>(raw[3]);
+    };
+    auto prompt = std::make_shared<models::qwen::vision::Prompt>();
+    prompt->cache_identity = take(take32());
+    const auto grids = take32();
+    for (std::uint32_t i = 0; i < grids; ++i) {
+      models::qwen::vision::ImageGrid grid;
+      grid.offset = take32();
+      grid.height = take32();
+      grid.width = take32();
+      prompt->rope.images.push_back(grid);
+    }
+    const auto images = take32();
+    for (std::uint32_t i = 0; i < images; ++i) {
+      models::qwen::vision::PreparedImage prepared;
+      prepared.grid.offset = take32();
+      prepared.grid.height = take32();
+      prepared.grid.width = take32();
+      const auto identity = take(prepared.prefix_identity.size());
+      std::copy(identity.begin(), identity.end(),
+                prepared.prefix_identity.begin());
+      auto pixels = std::make_shared<core::Image>();
+      pixels->width = take32();
+      pixels->height = take32();
+      pixels->pixels = take(take32());
+      if (pixels->pixels.size() != std::size_t{pixels->width} * pixels->height * 3)
+        throw std::invalid_argument("image context pixels are not RGB8");
+      prepared.pixels = std::move(pixels);
+      prompt->images.push_back(std::move(prepared));
+    }
+    if (at != bytes.size())
+      throw std::invalid_argument("trailing Qwen image context bytes");
+    auto context = std::make_shared<QwenImageContext>();
+    context->cache_identity = prompt->cache_identity;
+    for (const auto& grid : prompt->rope.images)
+      context->cache_prefixes.push_back({grid.offset, {}});
+    context->prompt = std::move(prompt);
+    return context;
+  }
+
   bool FrontierSnapshotMatches(
       const std::shared_ptr<void>& snapshot,
       std::span<const TextRunnerToken> prompt) const override {
