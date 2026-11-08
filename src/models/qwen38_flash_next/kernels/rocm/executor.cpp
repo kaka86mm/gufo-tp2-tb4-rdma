@@ -2779,7 +2779,15 @@ bool Executor::WaitPle(std::string* error_msg) const {
                  prefetch_.pending ? 1 : 0, prefetch_.ready ? 1 : 0);
     std::fflush(stderr);
   }
-  if (ok && prefetch_.claimed != 0) {
+  if (!ok) {
+    // Another lane already consumed this gather: waiting with nothing
+    // pending is vacuously satisfied. The batch path drains the read at
+    // the PLE layer and the speculative lane waits again with emb_row 0,
+    // which the old error treated as a hard failure and killed the pair
+    // under gather-heavy (tool-call) decoding.
+    return true;
+  }
+  if (prefetch_.claimed != 0) {
     FinishPrefetch();
     ok = prefetch_.ready;
     if (std::getenv("GUFO_TP_TRACE") != nullptr) {
@@ -2813,7 +2821,7 @@ bool Executor::WaitPle(std::string* error_msg) const {
     prefetch_.ready = false;
     prefetch_.claimed = 0;
     prefetch_.tail = false;
-  } else if (ok) {
+  } else {
     ok = ngram_->WaitRead();
     if (ok && std::getenv("GUFO_TP_TRACE") != nullptr) {
       static std::uint64_t pg_seq = 0;

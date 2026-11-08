@@ -1607,6 +1607,17 @@ void ParseQwenCalls(
     }
     const auto marker_begin = cursor;
     const auto scan = tokenization::ScanQwenToolCall(text.substr(marker_begin));
+    if (std::getenv("GUFO_TOOL_TRACE") != nullptr) {
+      std::fprintf(stderr,
+                   "[tp] scan matched=%d call=%d native=%d complete=%d "
+                   "unfinished=%d progress=%zu\n",
+                   scan.matched ? 1 : 0, scan.call ? 1 : 0,
+                   scan.call && scan.call->native ? 1 : 0,
+                   scan.call && scan.call->complete ? 1 : 0,
+                   scan.call && scan.call->unfinished ? 1 : 0,
+                   scan.progress);
+      std::fflush(stderr);
+    }
     if (!scan.matched || !scan.call) {
       cursor = marker_begin + scan.progress;
       if (cursor == marker_begin)
@@ -1638,9 +1649,23 @@ void ParseQwenCalls(
         // Recovery resumes after the rejected parameter, not after the call.
         tokenization::ChatMessage::ToolArgument argument;
         if (!InterpretQwenParameter(schema, properties, parameter, &argument)) {
-          cursor = marker_begin + parameter.progress;
-          valid = false;
-          break;
+          if (std::getenv("GUFO_TOOL_TRACE") != nullptr) {
+            std::fprintf(stderr, "[tp] param-reject name=%s len=%zu\n",
+                         parameter.name.c_str(), parameter.value.size());
+            std::fflush(stderr);
+          }
+          if (require_schema) {
+            cursor = marker_begin + parameter.progress;
+            valid = false;
+            break;
+          }
+          // A value neither JSON nor a Python literal parses (abliterated
+          // models mangle parameter JSON): keep it verbatim as a string
+          // argument rather than dropping the whole call, as the classic
+          // server's lenient pass-through did.
+          argument = {.name = parameter.name,
+                      .value = parameter.value,
+                      .is_string = true};
         }
         // Models sometimes repeat a parameter. An identical copy is harmless;
         // conflicting copies leave no safe choice.
@@ -1828,6 +1853,17 @@ ParsedGeneration ParseGeneration(
   const auto markers = markup.markers;
   const auto closers = markup.closers;
   quotes.Reset(raw);
+  if (std::getenv("GUFO_TOOL_TRACE") != nullptr) {
+    std::fprintf(stderr,
+                 "[tp] entry initial=%d tools=%zu choice=%d qwen_calls=%d "
+                 "raw_len=%zu head=%.*s\n",
+                 static_cast<int>(initial_output_state), tools.size(),
+                 static_cast<int>(choice), markup.qwen_calls ? 1 : 0,
+                 raw.size(),
+                 static_cast<int>(std::min<std::size_t>(50, raw.size())),
+                 raw.data());
+    std::fflush(stderr);
+  }
   ParsedGeneration parsed;
   std::string_view content = raw;
   std::string_view reasoning_call_context;
@@ -1931,6 +1967,17 @@ ParsedGeneration ParseGeneration(
 
   quotes.Reset(parsed.text);
   const std::size_t marker = EarliestMarker(parsed.text, markers, quotes);
+  if (std::getenv("GUFO_TOOL_TRACE") != nullptr) {
+    std::fprintf(stderr,
+                 "[tp] gate qwen_calls=%d native=%d tools=%zu choice=%d "
+                 "marker=%zu text_len=%zu head=%.*s\n",
+                 markup.qwen_calls ? 1 : 0, markup.native ? 1 : 0,
+                 tools.size(), static_cast<int>(choice), marker,
+                 parsed.text.size(),
+                 static_cast<int>(std::min<std::size_t>(40, parsed.text.size())),
+                 parsed.text.data());
+    std::fflush(stderr);
+  }
   if (choice != ChatRequest::ToolChoice::kNone && !tools.empty() &&
       marker != std::string_view::npos) {
     if (partial && (unfinished_reasoning_quote || quotes.UnclosedAt(marker)))
@@ -2091,6 +2138,17 @@ ParsedGeneration ParseStructuredGeneration(
   constexpr std::string_view tool_start =
       tokenization::QwenToolSyntax::kCallOpen;
   auto marker = tool_only ? EarliestMarker(content, markers, quotes) : 0;
+  if (std::getenv("GUFO_TOOL_TRACE") != nullptr) {
+    std::fprintf(stderr,
+                 "[tp] struct entry tools=%zu choice=%d qwen_calls=%d "
+                 "tool_only=%d marker=%zu len=%zu head=%.*s\n",
+                 tools.size(), static_cast<int>(choice),
+                 markup.qwen_calls ? 1 : 0, tool_only ? 1 : 0, marker,
+                 content.size(),
+                 static_cast<int>(std::min<std::size_t>(50, content.size())),
+                 content.data());
+    std::fflush(stderr);
+  }
   if (tool_only && choice == ChatRequest::ToolChoice::kRequired &&
       marker == std::string_view::npos) {
     if (const auto held =
@@ -3017,7 +3075,20 @@ HttpResponse NonStreamingResponse(
     const std::shared_ptr<TextGenerationBackend::GenerationRequest>& generation,
     TextGenerationBackend::InitialOutputState initial_output_state) {
   const auto result = generation->Wait();
-  const auto markup = SelectToolMarkup(generation->ToolDialectId());
+  const auto dialect_id = generation->ToolDialectId();
+  if (std::getenv("GUFO_TOOL_TRACE") != nullptr) {
+    std::fprintf(stderr, "[tp] dialect id=%s present=%d qwen=%s json=%s\n",
+                 dialect_id ? dialect_id->c_str() : "<none>",
+                 dialect_id.has_value() ? 1 : 0,
+                 ext::BuiltinToolDialectId(
+                     sampling::JsonConstraint::ToolFormat::kQwen)
+                     .data(),
+                 ext::BuiltinToolDialectId(
+                     sampling::JsonConstraint::ToolFormat::kJson)
+                     .data());
+    std::fflush(stderr);
+  }
+  const auto markup = SelectToolMarkup(dialect_id);
   const auto reasoning = generation->ReasoningDelimiters();
   core::Utf8Decoder decoder;
   const auto decoded = decoder.Push(result.text, true);
@@ -4115,6 +4186,16 @@ HttpResponse HandleOpenAiChat(const HttpRequest& request,
     return std::move(*error);
   }
   try {
+    if (std::getenv("GUFO_TOOL_TRACE") != nullptr) {
+      std::fprintf(stderr,
+                   "[tp] handle tools=%zu choice=%d stream=%d "
+                   "constrained=%d\n",
+                   parsed.chat.tools.size(),
+                   static_cast<int>(parsed.chat.tool_choice),
+                   parsed.stream ? 1 : 0,
+                   parsed.chat.constrained_tools ? 1 : 0);
+      std::fflush(stderr);
+    }
     const auto initial_output_state = backend.initial_output_state(parsed.chat);
     auto generation =
         backend.start_chat(parsed.chat, parsed.max_tokens, parsed.sampling,

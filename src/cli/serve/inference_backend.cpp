@@ -342,8 +342,8 @@ struct InferenceBackend::Impl {
       std::shared_ptr<const TextPromptContext> context, bool return_progress,
       std::optional<sampling::JsonConstraint::ToolFormat> tool_format,
       bool stop_at_eos = true,
-      std::optional<TpConstraintSource> constraint_source =
-          std::nullopt) const {
+      std::optional<TpConstraintSource> constraint_source = std::nullopt,
+      std::string tool_dialect = {}) const {
     if (state->tp_runner == nullptr || state->response_broker == nullptr ||
         state->communicator == nullptr || state->scheduler == nullptr) {
       throw std::logic_error("TP2 rank 0 is not fully configured");
@@ -441,8 +441,8 @@ struct InferenceBackend::Impl {
               .return_progress = return_progress,
           });
       return std::make_shared<ScheduledGenerationRequest>(
-          state, std::move(scheduled), initial, tool_format, std::string(),
-          std::move(tp));
+          state, std::move(scheduled), initial, tool_format,
+          std::move(tool_dialect), std::move(tp));
     } catch (...) {
       // Rank 0 made no model call for the request, so it ends on rank 1 with
       // none either.
@@ -1162,7 +1162,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
         request_start, request.cache_prompt, request.cache_persist,
         prompt->cache_prefix_tokens, std::move(prompt->context),
         request.return_progress, tool_format, true,
-        std::move(constraint_source));
+        std::move(constraint_source), std::move(tool_dialect));
   }
 #endif
   auto scheduled_request = state->scheduler->Submit(
